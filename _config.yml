@@ -1,0 +1,29 @@
+title: LCCC
+description: "Lev's Claude's C Compiler — an optimized fork of CCC with linear-scan register allocation"
+url: "https://levkropp.github.io"
+baseurl: "/lccc"
+repository: levkropp/lccc
+
+markdown: kramdown
+highlighter: rouge
+kramdown:
+  input: GFM
+  syntax_highlighter: rouge
+
+permalink: pretty
+
+exclude:
+  - Cargo.toml
+  - Cargo.lock
+  - target/
+  - ccc/
+  - lccc-improvements/benchmarks/bench/
+  - "*.sh"
+  - "*.rs"
+
+defaults:
+  - scope:
+      path: "docs"
+      type: "pages"
+    values:
+      layout: doc

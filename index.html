@@ -1,0 +1,290 @@
+---
+layout: home
+title: LCCC — Lev's Claude's C Compiler
+---
+
+<!-- ── Nav ──────────────────────────────────────────────────────────────── -->
+<nav class="site-nav">
+  <a class="nav-logo" href="#">lc<span class="accent">cc</span></a>
+  <ul class="nav-links">
+    <li><a href="#why">Why</a></li>
+    <li><a href="#allocator">Allocator</a></li>
+    <li><a href="#benchmarks">Benchmarks</a></li>
+    <li><a href="#install">Install</a></li>
+    <li><a href="/lccc/docs/getting-started">Docs</a></li>
+  </ul>
+  <a class="nav-gh" href="https://github.com/levkropp/lccc" target="_blank" rel="noopener">
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z"/></svg>
+    GitHub
+  </a>
+</nav>
+
+<!-- ── Hero ──────────────────────────────────────────────────────────────── -->
+<header class="hero">
+  <div class="hero-badge">Phase 2 complete · linear-scan allocator active · 500 tests passing</div>
+  <h1><span class="l">l</span><span class="rest">ccc</span></h1>
+  <p class="hero-sub">
+    An optimized fork of <a href="https://github.com/anthropics/claudes-c-compiler" style="color:var(--amber)">CCC</a>
+    — Claude's C Compiler — with a two-pass linear-scan register allocator,
+    targeting x86-64, AArch64, RISC-V 64, and i686.
+  </p>
+  <div class="hero-actions">
+    <a class="btn btn-primary" href="/lccc/docs/getting-started">Get Started</a>
+    <a class="btn btn-secondary" href="https://github.com/levkropp/lccc" target="_blank" rel="noopener">View on GitHub</a>
+  </div>
+</header>
+
+<!-- ── Compiler pipeline diagram ─────────────────────────────────────────── -->
+<div class="diagram-section">
+  <div class="diagram-wrap">
+<pre>
+<span class="c-dim">┌─────────────────────────────────────────────────────────────────────┐</span>
+<span class="c-dim">│</span>  <span class="c-em">C source</span>                                                           <span class="c-dim">│</span>
+<span class="c-dim">│</span>   <span class="c-dim">│</span>  <span class="c-teal">frontend</span>: lex → parse → sema → IR lowering                     <span class="c-dim">│</span>
+<span class="c-dim">│</span>   <span class="c-dim">▼</span>                                                                   <span class="c-dim">│</span>
+<span class="c-dim">│</span>  <span class="c-em">SSA IR</span>                                                              <span class="c-dim">│</span>
+<span class="c-dim">│</span>   <span class="c-dim">│</span>  <span class="c-teal">optimizer</span>: GVN · LICM · IPCP · DCE · const-fold · inline        <span class="c-dim">│</span>
+<span class="c-dim">│</span>   <span class="c-dim">▼</span>                                                                   <span class="c-dim">│</span>
+<span class="c-dim">│</span>  <span class="c-em">Optimized IR</span>                                                        <span class="c-dim">│</span>
+<span class="c-dim">│</span>   <span class="c-dim">│</span>  <span class="c-amb">regalloc</span> <span class="c-dim">(LCCC)</span>: two-pass linear scan over live intervals         <span class="c-dim">│</span>
+<span class="c-dim">│</span>   <span class="c-dim">│</span>    <span class="c-dim">pass 1:</span> <span class="c-amb">callee-saved</span> <span class="c-dim">↔ all eligible values</span>                   <span class="c-dim">│</span>
+<span class="c-dim">│</span>   <span class="c-dim">│</span>    <span class="c-dim">pass 2:</span> <span class="c-teal">caller-saved</span> <span class="c-dim">↔ non-call-spanning unallocated values</span>   <span class="c-dim">│</span>
+<span class="c-dim">│</span>   <span class="c-dim">▼</span>                                                                   <span class="c-dim">│</span>
+<span class="c-dim">│</span>  <span class="c-em">Machine code</span>  <span class="c-dim">x86-64 · AArch64 · RISC-V 64 · i686</span>                 <span class="c-dim">│</span>
+<span class="c-dim">│</span>   <span class="c-dim">│</span>  <span class="c-teal">standalone assembler + linker</span> <span class="c-dim">(no external toolchain)</span>           <span class="c-dim">│</span>
+<span class="c-dim">│</span>   <span class="c-dim">▼</span>                                                                   <span class="c-dim">│</span>
+<span class="c-dim">│</span>  <span class="c-em">ELF executable</span>                                                      <span class="c-dim">│</span>
+<span class="c-dim">└─────────────────────────────────────────────────────────────────────┘</span>
+</pre>
+  </div>
+</div>
+
+<!-- ── Why ───────────────────────────────────────────────────────────────── -->
+<section id="why">
+  <div class="section-label">Motivation</div>
+  <h2>CCC is impressive. LCCC makes it faster.</h2>
+  <p>
+    CCC compiles real projects — SQLite, PostgreSQL, Redis, the Linux kernel — from a
+    zero-dependency Rust codebase with its own assembler and linker. LCCC focuses on
+    closing the performance gap with GCC by improving where CCC leaves the most on the table.
+  </p>
+
+  <div class="cards">
+    <div class="card">
+      <div class="card-icon">⚡</div>
+      <h3>Linear-scan register allocator</h3>
+      <p>Two-pass allocation: callee-saved for all eligible values, then caller-saved for non-call-spanning remainder. Priority-weighted by loop depth.</p>
+    </div>
+    <div class="card">
+      <div class="card-icon">🔩</div>
+      <h3>Drop-in GCC replacement</h3>
+      <p>Same flags, same output ABI. Point <code>CC=lccc</code> at any Makefile. No build system changes required.</p>
+    </div>
+    <div class="card">
+      <div class="card-icon">🏗</div>
+      <h3>Four architectures</h3>
+      <p>x86-64, AArch64, RISC-V 64, i686. The same allocator improvements apply everywhere — architecture-agnostic <code>PhysReg</code> abstraction.</p>
+    </div>
+    <div class="card">
+      <div class="card-icon">🔭</div>
+      <h3>500 tests passing</h3>
+      <p>All upstream unit tests pass. Correctness-first — the allocator inherits CCC's full eligibility filter so no unsafe values reach the register file.</p>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ── Allocator ─────────────────────────────────────────────────────────── -->
+<section id="allocator">
+  <div class="section-label">Phase 2</div>
+  <h2>Two-pass linear scan register allocation</h2>
+  <p>
+    The old CCC allocator uses three greedy phases. LCCC replaces the allocation
+    core with a proper linear scan that processes intervals in order of definition,
+    evicting the lowest-priority live interval when registers are exhausted.
+  </p>
+
+  <div class="code-block">
+    <div class="code-block-header">regalloc — Phase 1: callee-saved linear scan</div>
+    <pre><span class="cm">// All eligible IR values compete for callee-saved registers.</span>
+<span class="cm">// Safe across calls; better coverage than old "call-spanning only" Phase 1.</span>
+<span class="kw">let</span> phase1_intervals = filter_eligible_intervals(&amp;liveness, &amp;eligible);
+<span class="kw">let</span> phase1_ranges    = build_live_ranges(&amp;phase1_intervals, &amp;liveness.block_loop_depth, func);
+<span class="kw">let mut</span> allocator    = LinearScanAllocator::new(phase1_ranges, config.available_regs.clone());
+allocator.run();   <span class="cm">// expire → find_free → evict-or-spill</span></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-block-header">regalloc — Phase 2: caller-saved linear scan</div>
+    <pre><span class="cm">// Unallocated, non-call-spanning values get caller-saved registers.</span>
+<span class="cm">// Caller-saved regs are destroyed by calls, so we must not assign them</span>
+<span class="cm">// to values that cross call boundaries.</span>
+<span class="kw">let</span> phase2_intervals = liveness.intervals.iter()
+    .filter(|iv| eligible.contains(&amp;iv.value_id))
+    .filter(|iv| !assignments.contains_key(&amp;iv.value_id))
+    .filter(|iv| !spans_any_call(iv, call_points))
+    .collect();
+<span class="kw">let mut</span> caller_alloc = LinearScanAllocator::new(phase2_ranges, config.caller_saved_regs.clone());
+caller_alloc.run();</pre>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ── Benchmarks ────────────────────────────────────────────────────────── -->
+<section id="benchmarks">
+  <div class="section-label">Performance</div>
+  <h2>Benchmark results — LCCC vs CCC vs GCC -O2</h2>
+  <p>
+    Best-of-5 wall-clock time. All outputs are identical. Run with
+    <code>python3 lccc-improvements/benchmarks/bench.py --reps 5</code>.
+  </p>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Benchmark</th>
+          <th>Description</th>
+          <th>LCCC</th>
+          <th>CCC</th>
+          <th>GCC -O2</th>
+          <th>LCCC vs CCC</th>
+          <th>LCCC vs GCC</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>arith_loop</code></td>
+          <td>32-var arithmetic, 10M iters</td>
+          <td class="faster">0.124s</td>
+          <td>0.149s</td>
+          <td class="baseline">0.068s</td>
+          <td class="faster">+20% faster</td>
+          <td class="slower">1.83×</td>
+        </tr>
+        <tr>
+          <td><code>sieve</code></td>
+          <td>Primes to 10M</td>
+          <td class="faster">0.036s</td>
+          <td>0.045s</td>
+          <td class="baseline">0.025s</td>
+          <td class="faster">+25% faster</td>
+          <td class="slower">1.46×</td>
+        </tr>
+        <tr>
+          <td><code>qsort</code></td>
+          <td>Sort 1M integers</td>
+          <td>0.096s</td>
+          <td>0.095s</td>
+          <td class="baseline">0.087s</td>
+          <td class="slower">≈equal</td>
+          <td class="slower">1.10×</td>
+        </tr>
+        <tr>
+          <td><code>fib(40)</code></td>
+          <td>Recursive Fibonacci</td>
+          <td>0.352s</td>
+          <td>0.354s</td>
+          <td class="baseline">0.095s</td>
+          <td class="slower">≈equal</td>
+          <td class="slower">3.70×</td>
+        </tr>
+        <tr>
+          <td><code>matmul</code></td>
+          <td>256×256 double matrix multiply</td>
+          <td>0.028s</td>
+          <td>0.029s</td>
+          <td class="baseline">0.003s</td>
+          <td class="slower">≈equal</td>
+          <td class="slower">7.91×</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p style="margin-top:1rem">
+    The largest gains are on register-pressure code. The matmul gap is GCC's AVX2
+    auto-vectorization — not addressable by the allocator alone. See the
+    <a href="/lccc/docs/roadmap">roadmap</a> for Phase 3 (SIMD / loop unrolling).
+  </p>
+
+  <div class="badges">
+    <span class="badge badge-amber">✓ all outputs match GCC</span>
+    <span class="badge badge-teal">500 unit tests passing</span>
+    <span class="badge badge-gray">GCC 15.2.0 · Ubuntu</span>
+    <span class="badge badge-gray">x86-64 · -O2</span>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ── Install ───────────────────────────────────────────────────────────── -->
+<section id="install">
+  <div class="section-label">Getting Started</div>
+  <h2>Build LCCC</h2>
+
+  <div class="steps">
+    <div class="step">
+      <div class="step-num">1</div>
+      <div class="step-body">
+        <h4>Clone the repo</h4>
+        <div class="code-block">
+          <div class="code-block-header">shell</div>
+          <pre>git clone --recurse-submodules https://github.com/levkropp/lccc.git
+cd lccc</pre>
+        </div>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">2</div>
+      <div class="step-body">
+        <h4>Build (requires Rust stable)</h4>
+        <div class="code-block">
+          <div class="code-block-header">shell</div>
+          <pre>cargo build --release
+<span class="cm"># Binary at target/release/ccc (x86-64)</span>
+<span class="cm"># Also: ccc-arm, ccc-riscv, ccc-i686</span></pre>
+        </div>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">3</div>
+      <div class="step-body">
+        <h4>Compile a C program</h4>
+        <div class="code-block">
+          <div class="code-block-header">shell</div>
+          <pre>GCC_INC=<span class="st">"-I/usr/lib/gcc/x86_64-linux-gnu/$(gcc -dumpversion)/include"</span>
+./target/release/ccc <span class="kw">$GCC_INC</span> -O2 -o hello hello.c
+./hello</pre>
+        </div>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">4</div>
+      <div class="step-body">
+        <h4>Run the benchmark suite</h4>
+        <div class="code-block">
+          <div class="code-block-header">shell</div>
+          <pre>python3 lccc-improvements/benchmarks/bench.py --reps 5 --md results.md</pre>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="badges" style="margin-top:2rem">
+    <span class="badge badge-amber">Rust stable 2021</span>
+    <span class="badge badge-teal">Linux · x86-64 host</span>
+    <span class="badge badge-gray">MIT OR Apache-2.0 OR BSD-2-Clause</span>
+  </div>
+</section>
+
+<footer>
+  <p>
+    <a href="https://github.com/levkropp/lccc">github.com/levkropp/lccc</a>
+    &nbsp;·&nbsp; MIT OR Apache-2.0 OR BSD-2-Clause (LCCC)
+    &nbsp;·&nbsp; CC0 (CCC-derived code)
+    &nbsp;·&nbsp; <a href="/lccc/docs/getting-started">Documentation</a>
+  </p>
+</footer>

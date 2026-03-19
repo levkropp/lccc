@@ -1,208 +1,227 @@
-# CCC — Claude's C Compiler
+# LCCC — Lev's Claude's C Compiler
 
-A C compiler written entirely from scratch in Rust, targeting x86-64, i686,
-AArch64, and RISC-V 64. Zero compiler-specific dependencies — the frontend,
-SSA-based IR, optimizer, code generator, peephole optimizers, assembler,
-linker, and DWARF debug info generation are all implemented from scratch.
-Claude's C Compiler produces ELF executables without any external toolchain.
+> An optimized fork of [CCC](https://github.com/anthropics/claudes-c-compiler) with a two-pass
+> linear-scan register allocator. **+20–25% faster** on register-pressure code vs upstream.
 
-> Note: With the exception of this one paragraph that was written by a human, 100% of the code and documentation in this repository was written by Claude Opus 4.6. A human guided some of this process by writing test cases that Claude was told to pass, but never interactively pair-programmed with Claude to debug or to provide feedback on code quality. As a result, I do not recommend you use this code! None of it has been validated for correctness. Claude wrote this exclusively on a Linux host; it probably will not work on MacOS/Windows — neither I nor Claude have tried. The docs may be wrong and make claims that are false. See [our blog post](https://anthropic.com/engineering/building-c-compiler) for more detail.
+**[Documentation](https://levkropp.github.io/lccc/)** ·
+**[Benchmarks](#benchmarks)** ·
+**[Getting Started](#getting-started)** ·
+**[Roadmap](#roadmap)**
 
-## Prerequisites
+---
 
-- **Rust** (stable, 2021 edition) — install via [rustup](https://rustup.rs/)
-- **Linux host** — the compiler targets Linux ELF executables and relies on
-  Linux system headers / C runtime libraries (glibc or musl) being installed
-  on the host
-- For cross-compilation targets (ARM, RISC-V, i686), the corresponding
-  cross-compilation sysroots should be installed (e.g.,
-  `aarch64-linux-gnu-gcc`, `riscv64-linux-gnu-gcc`)
+## What is LCCC?
 
-## Building
+CCC (Claude's C Compiler) is a zero-dependency C compiler written entirely in Rust by Claude Opus 4.6,
+capable of compiling real projects — PostgreSQL, SQLite, Redis, the Linux kernel — for x86-64, AArch64,
+RISC-V 64, and i686, with its own assembler and linker.
 
-```bash
-cargo build --release
+LCCC is a performance fork. Phase 2 replaces CCC's three-phase greedy register allocator with a proper
+two-pass linear-scan allocator (Poletto & Sarkar 1999), yielding +20–25% speedups on
+register-pressure code while keeping all 500 upstream tests green.
+
+```
+C source
+  │  frontend: lex → parse → sema → IR lowering
+  ▼
+SSA IR
+  │  optimizer: GVN · LICM · IPCP · DCE · const-fold · inline
+  ▼
+Optimized IR
+  │  regalloc (LCCC): two-pass linear scan over live intervals
+  │    pass 1: callee-saved  ↔ all eligible values
+  │    pass 2: caller-saved  ↔ non-call-spanning unallocated values
+  ▼
+Machine code  (x86-64 · AArch64 · RISC-V 64 · i686)
+  │  standalone assembler + linker (no external toolchain)
+  ▼
+ELF executable
 ```
 
-This produces five binaries in `target/release/`, all compiled from the same
-source. The target architecture is selected by the binary name at runtime:
+---
 
-| Binary | Target |
-|--------|--------|
-| `ccc` | x86-64 (default) |
-| `ccc-x86` | x86-64 |
-| `ccc-arm` | AArch64 |
-| `ccc-riscv` | RISC-V 64 |
-| `ccc-i686` | i686 (32-bit x86) |
+## Benchmarks
 
-## Quick Start
+Best-of-5 wall-clock, Linux x86-64, GCC 15.2.0, `-O2` for all compilers.
+All outputs are byte-identical to GCC.
 
-Compile and run a simple C program:
+| Benchmark | LCCC | CCC | GCC -O2 | vs CCC | vs GCC |
+|-----------|-----:|----:|--------:|:------:|:------:|
+| `arith_loop` — 32-var arithmetic, 10 M iters | **0.124 s** | 0.149 s | 0.068 s | **+20% faster** | 1.83× slower |
+| `sieve` — primes to 10 M | **0.036 s** | 0.045 s | 0.025 s | **+25% faster** | 1.46× slower |
+| `qsort` — sort 1 M integers | 0.096 s | 0.095 s | 0.087 s | ≈ equal | 1.10× slower |
+| `fib(40)` — recursive Fibonacci | 0.352 s | 0.354 s | 0.095 s | ≈ equal | 3.70× slower |
+| `matmul` — 256×256 double | 0.028 s | 0.029 s | 0.003 s | ≈ equal | 7.91× slower |
+
+The gains on `arith_loop` and `sieve` come directly from keeping more loop variables in registers.
+The `matmul` gap is GCC's AVX2 auto-vectorization — a Phase 4 target.
+
+Run the suite yourself:
 
 ```bash
-# Write a test program
-cat > hello.c << 'EOF'
-#include <stdio.h>
-int main(void) {
-    printf("Hello from CCC!\n");
-    return 0;
-}
-EOF
+python3 lccc-improvements/benchmarks/bench.py --reps 5 --md results.md
+```
 
-# Compile and run (x86-64)
-./target/release/ccc -o hello hello.c
+---
+
+## Linear-scan register allocator
+
+CCC's original allocator uses three greedy phases and only considers ~5% of IR values eligible
+(a conservative whitelist). A 32-variable function allocates **0 registers** — every value spills
+to an 11 KB stack frame.
+
+LCCC replaces the allocation core with Poletto & Sarkar linear scan:
+
+**Priority:** `use_count × 10^loop_depth` — values used inside deep loops get priority.
+
+**Spill weight:** `priority / interval_length` — shorter, hotter intervals beat longer, cooler ones.
+
+**Pass 1 — callee-saved registers (all eligible values):**
+
+```rust
+let ranges    = build_live_ranges(&intervals, &loop_depth, func);
+let mut alloc = LinearScanAllocator::new(ranges, config.available_regs.clone());
+alloc.run();  // expire → find_free → evict-lowest-weight-or-spill
+```
+
+**Pass 2 — caller-saved registers (unallocated, non-call-spanning values):**
+
+```rust
+let phase2 = intervals.iter()
+    .filter(|iv| !assignments.contains_key(&iv.value_id))
+    .filter(|iv| !spans_any_call(iv, call_points))
+    .collect();
+let mut caller_alloc = LinearScanAllocator::new(phase2, config.caller_saved_regs.clone());
+caller_alloc.run();
+```
+
+Caller-saved registers are destroyed by calls, so only values whose live range doesn't cross any
+call site are eligible for Pass 2. This is both correct and sufficient — call-heavy code like
+recursive `fib` sees no change, which is expected.
+
+The allocator lives in [`src/backend/live_range.rs`](src/backend/live_range.rs) (796 lines).
+See the [register allocator docs](https://levkropp.github.io/lccc/docs/register-allocator) for
+the full algorithm walk-through.
+
+---
+
+## Getting started
+
+**Prerequisites:** Rust stable (2021 edition), Linux x86-64 host.
+
+```bash
+# Clone
+git clone https://github.com/levkropp/lccc.git
+cd lccc
+
+# Build
+cargo build --release
+# → target/release/ccc       (x86-64)
+# → target/release/ccc-arm   (AArch64)
+# → target/release/ccc-riscv (RISC-V 64)
+# → target/release/ccc-i686  (i686)
+
+# Compile a C file (GCC built-in headers are needed)
+GCC_INC="-I/usr/lib/gcc/x86_64-linux-gnu/$(gcc -dumpversion)/include"
+./target/release/ccc $GCC_INC -O2 -o hello hello.c
 ./hello
 
-# Cross-compile for AArch64 and run under QEMU
-./target/release/ccc-arm -o hello-arm hello.c
-qemu-aarch64 -L /usr/aarch64-linux-gnu ./hello-arm
+# Use as a drop-in GCC replacement
+make CC=/path/to/target/release/ccc
 ```
 
-CCC works as a drop-in GCC replacement. Point your build system at it:
+For cross-compilation targets install the matching sysroot
+(`aarch64-linux-gnu-gcc`, `riscv64-linux-gnu-gcc`).
+
+### GCC-compatible flags
 
 ```bash
-# Build a project with make
-make CC=/path/to/ccc-x86
-
-# Build a project with CMake
-cmake -DCMAKE_C_COMPILER=/path/to/ccc-x86 ..
-
-# Build a project with configure scripts
-./configure CC=/path/to/ccc-x86
+ccc -S input.c                    # emit assembly
+ccc -c input.c                    # compile to object file
+ccc -O2 -o output input.c         # optimize (-O0 through -O3, -Os, -Oz)
+ccc -g -o output input.c          # DWARF debug info
+ccc -DFOO=1 -Iinclude/ input.c    # macros + include paths
+ccc -fPIC -shared -o lib.so lib.c # position-independent code
 ```
 
-## Usage
+Unrecognized flags are silently ignored so `ccc` works as a drop-in in build systems.
 
-```bash
-# Compile and link
-ccc -o output input.c                # x86-64
-ccc-arm -o output input.c            # AArch64
-ccc-riscv -o output input.c          # RISC-V 64
-ccc-i686 -o output input.c           # i686
+### Environment variables
 
-# GCC-compatible flags
-ccc -S input.c                       # Emit assembly
-ccc -c input.c                       # Compile to object file
-ccc -E input.c                       # Preprocess only
-ccc -O2 -o output input.c            # Optimize (accepts -O0 through -O3, -Os, -Oz)
-ccc -g -o output input.c             # DWARF debug info
-ccc -DFOO=1 -Iinclude/ input.c       # Define macros, add include paths
-ccc -Werror -Wall input.c            # Warning control
-ccc -fPIC -shared -o lib.so lib.c    # Position-independent code
-ccc -x c -E -                        # Read from stdin
+| Variable | Effect |
+|----------|--------|
+| `CCC_TIME_PASSES` | Print per-pass timing and change counts to stderr |
+| `CCC_DISABLE_PASSES` | Disable passes by name (comma-separated, or `all`) |
+| `CCC_KEEP_ASM` | Keep intermediate `.s` files next to output |
 
-# Build system integration (reports as GCC 14.2.0 for compatibility)
-ccc -dumpmachine     # x86_64-linux-gnu / aarch64-linux-gnu / riscv64-linux-gnu / i686-linux-gnu
-ccc -dumpversion     # 14
+Pass names: `cfg`, `copyprop`, `narrow`, `simplify`, `constfold`, `gvn`, `licm`,
+`ifconv`, `dce`, `ipcp`, `inline`, `ivsr`, `divconst`.
+
+---
+
+## Project layout
+
+```
+src/
+  frontend/     C source → typed AST (preprocessor, lexer, parser, sema)
+  ir/           Target-independent SSA IR (lowering, mem2reg)
+  passes/       SSA optimization passes (15 passes + shared loop analysis)
+  backend/      IR → assembly → ELF (4 architectures)
+    live_range.rs   ← LCCC: LiveRange, LinearScanAllocator
+    regalloc.rs     ← LCCC: two-pass linear scan activation
+  common/       Shared types, symbol table, diagnostics
+  driver/       CLI parsing, pipeline orchestration
+
+include/        Bundled C headers (SSE–AVX-512, AES-NI, FMA, SHA, BMI2; NEON)
+tests/          Integration tests (main.c + expected output per directory)
+
+lccc-improvements/
+  benchmarks/           bench.py runner + 5 C benchmark sources
+  register-allocation/  Phase 1 analysis docs (design, integration points)
+
+docs/           Jekyll documentation site source
 ```
 
-The compiler accepts most GCC flags. Unrecognized flags (e.g., architecture-
-specific `-m` flags, unknown `-f` flags) are silently ignored so `ccc` can
-serve as a drop-in GCC replacement in build systems.
+---
 
-### Assembler and Linker Modes
+## Roadmap
 
-By default, the compiler uses its **builtin assembler and linker** for all
-four architectures. No external toolchain is required. You can verify this
-with `--version`, which shows `Backend: standalone` when using the builtin
-tools.
+| Phase | Description | Status | Expected gain |
+|-------|-------------|--------|---------------|
+| 1 | Register allocator analysis & design | ✅ Complete | (prerequisite) |
+| 2 | Linear-scan register allocator | ✅ Complete | **+20–25% on reg-pressure code** |
+| 3 | Loop unrolling & branch optimization | Planned | ~1.5–2× on loop-heavy code |
+| 4 | SIMD / auto-vectorization (AVX2) | Planned | ~4–8× on FP-heavy code |
+| 5 | Profile-guided optimization (PGO) | Planned | ~1.2–1.5× general |
 
-To build with optional GCC fallback support (e.g., for debugging), enable
-Cargo features at compile time:
+The goal is not to beat GCC — it's to make CCC-compiled programs fast enough for real systems
+software, targeting within ~1.5× of GCC on typical workloads.
 
-```bash
-# Build with GCC assembler and linker fallback
-cargo build --release --features gcc_assembler,gcc_linker
-
-# Build with GCC fallback for -m16 boot code only
-cargo build --release --features gcc_m16
-```
-
-| Feature | Description |
-|---------|-------------|
-| `gcc_assembler` | Use GCC as the assembler instead of the builtin |
-| `gcc_linker` | Use GCC as the linker instead of the builtin |
-| `gcc_m16` | Use GCC for `-m16` (16-bit real mode boot code) |
-
-When compiled with GCC fallback features enabled, `--version` shows which
-components use GCC (e.g., `Backend: gcc_assembler, gcc_linker`).
-
-## Status
-
-The compiler can build real-world C codebases across all four architectures,
-including the Linux kernel. Projects that compile and pass their test suites
-include PostgreSQL (all 237 regression tests), SQLite, QuickJS, zlib, Lua,
-libsodium, libpng, jq, libjpeg-turbo, mbedTLS, libuv, Redis, libffi, musl,
-TCC, and DOOM — all using the fully standalone assembler and linker with no
-external toolchain. Over 150 additional projects have also been built
-successfully, including FFmpeg (all 7331 FATE checkasm tests on x86-64 and
-AArch64), GNU coreutils, Busybox, CPython, QEMU, and LuaJIT.
-
-### Known Limitations
-
-- **Optimization levels**: All levels (`-O0` through `-O3`, `-Os`, `-Oz`) run
-  the same optimization pipeline. Separate tiers will be added as the compiler
-  matures.
-- **Long double**: x86 80-bit extended precision is supported via x87 FPU
-  instructions. On ARM/RISC-V, `long double` is IEEE binary128 via
-  compiler-rt/libgcc soft-float libcalls.
-- **Complex numbers**: `_Complex` arithmetic has some edge-case failures.
-- **GNU extensions**: Partial `__attribute__` support. NEON intrinsics are
-  partially implemented (core 128-bit operations work).
-- **Atomics**: `_Atomic` is parsed but treated as the underlying type (the
-  qualifier is not tracked through the type system).
+---
 
 ## Testing
 
-The compiler has two kinds of tests:
-
-**Unit tests** (in-source `#[test]` functions for individual passes and modules):
-
 ```bash
+# Unit tests (500 pass)
+cargo test --lib
+
+# Integration tests
 cargo test --release
+
+# Benchmark suite
+python3 lccc-improvements/benchmarks/bench.py --reps 5
 ```
 
-**Integration tests** (end-to-end compilation tests in `tests/`). Each test is
-a directory containing a `main.c` source file and expected output files:
+---
 
-```
-tests/
-  some-test-name/
-    main.c              # C source to compile
-    expected.stdout     # Expected stdout (if any)
-    expected.ret        # Expected exit code (if any)
-    expected.skip.arm   # Skip marker for specific architectures (optional)
-```
+## Licensing
 
-Tests are run by compiling `main.c` with `ccc`, executing the resulting binary,
-and comparing stdout and the exit code against the expected files.
+LCCC uses a dual-license model to separate original contributions from CCC-derived code.
 
-## Environment Variables
+**LCCC contributions** (new files, regalloc changes, benchmarks, docs) —
+MIT OR Apache-2.0 OR BSD-2-Clause (your choice). See `LICENSE-MIT`, `LICENSE-APACHE`, `LICENSE-BSD`.
 
-| Variable | Purpose |
-|----------|---------|
-| `CCC_TIME_PHASES` | Print per-phase compilation timing to stderr |
-| `CCC_TIME_PASSES` | Print per-pass optimization timing and change counts to stderr |
-| `CCC_DISABLE_PASSES` | Disable specific optimization passes (comma-separated, or `all`) |
-| `CCC_KEEP_ASM` | Preserve intermediate `.s` files next to output |
-| `CCC_ASM_DEBUG` | Dump preprocessed assembly to `/tmp/asm_debug_<name>.s` |
+**CCC-derived code** (frontend, SSA IR, optimizer, backends, assembler, linker) —
+CC0 1.0 Universal (public domain). CCC was released as CC0 by Anthropic.
 
-## Project Organization
-
-```
-src/                Compiler source code (Rust)
-  frontend/         C source -> typed AST (preprocessor, lexer, parser, sema)
-  ir/               Target-independent SSA IR (lowering, mem2reg)
-  passes/           SSA optimization passes (15 passes + shared loop analysis)
-  backend/          IR -> assembly -> machine code -> ELF (4 architectures)
-  common/           Shared types, symbol table, diagnostics
-  driver/           CLI parsing, pipeline orchestration
-
-include/            Bundled C headers (x86 SIMD: SSE through AVX-512, AES-NI, FMA, SHA, BMI2; ARM NEON)
-tests/              Compiler tests (each test is a directory with main.c and expected output)
-ideas/              Future work proposals and improvement notes
-```
-
-Each `src/` subdirectory has its own `README.md` with detailed design
-documentation. For the full architecture, compilation pipeline data flow,
-and key design decisions, see [DESIGN_DOC.md](DESIGN_DOC.md).
+See [`LICENSING.md`](LICENSING.md) for the full breakdown and per-file guidance.
