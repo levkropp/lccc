@@ -1,0 +1,106 @@
+---
+layout: doc
+title: Optimization Passes
+description: The CCC/LCCC optimizer pass pipeline — what runs, in what order, and why.
+prev_page:
+  title: Register Allocator
+  url: /docs/register-allocator
+next_page:
+  title: Benchmarks
+  url: /docs/benchmarks
+---
+
+# Optimization Passes
+{:.doc-subtitle}
+LCCC inherits CCC's full optimizer. All optimization levels (`-O0` through `-O3`, `-Os`, `-Oz`) run the same pipeline — by design.
+
+## Why One Pipeline?
+
+Having separate optimization tiers creates distinct code paths through the optimizer. Bugs that only appear at `-O2` can hide for months if most testing uses `-O0`. CCC and LCCC prioritize correctness over partial speedups: by always running all passes, every test exercises the full optimizer, and divergences are caught early.
+
+The `-O` flags still control the `__OPTIMIZE__` and `__OPTIMIZE_SIZE__` preprocessor macros, which some projects (like the Linux kernel) use for conditional compilation.
+
+## Pass Order
+
+The optimizer runs up to three full iterations. Each iteration runs this pipeline:
+
+```
+1.  CFG simplification      — remove dead blocks, thread jump chains, simplify branches
+2.  Copy propagation        — replace uses of copies with original values
+2a. Division-by-constant    — replace idiv/div with multiply-shift (iter 0 only)
+2b. Integer narrowing       — shrink operation widths (e.g. i64 add → i32 add)
+3.  Algebraic simplification — strength reduction, identity removal
+4.  Constant folding        — evaluate constant expressions at compile time
+5.  GVN + LICM + IVSR       — shared CFG analysis (computed once per function):
+    ├── GVN                 — global value numbering / CSE across dominated blocks
+    ├── LICM                — loop-invariant code motion
+    └── IVSR                — induction variable strength reduction
+7.  If-conversion           — convert branch+phi diamonds to cmov/Select
+8.  Copy propagation        — clean up copies created by GVN, simplify, LICM
+9.  Dead code elimination   — remove dead instructions (excluded from convergence check)
+10. CFG simplification      — clean up after DCE empties blocks
+10.5 IPCP                   — interprocedural constant propagation (all iterations)
+```
+
+**Phase 0** (before the loop): function inlining, followed by mem2reg and an initial constant-fold/copy-prop round.
+
+**Phase 11** (after the loop): dead static function elimination — removes `static inline` functions that became unreferenced after inlining.
+
+## Convergence
+
+Iterations stop when:
+- No pass made any change (fixpoint reached), **or**
+- This iteration made fewer than 1/20th the changes of the first iteration (diminishing returns).
+
+DCE changes are excluded from the convergence check because DCE's large removal counts inflate the first-iteration baseline and cause premature exit.
+
+## Pass Interactions
+
+The passes form a dependency graph. LCCC uses a `should_run!` macro to skip passes when their upstream passes made no changes in the previous iteration:
+
+| Pass | Only re-runs if... |
+|------|-------------------|
+| CFG simplify | constfold changed (constant branches) or DCE changed (empty blocks) |
+| Copy prop | CFG, GVN, LICM, or if-convert changed |
+| Simplify | Copy prop or narrowing changed |
+| Constfold | Copy prop, narrowing, simplify, or if-convert changed |
+| GVN | CFG, copy prop, or simplify changed |
+| LICM | CFG, copy prop, or GVN changed |
+| DCE | GVN, LICM, if-convert, or copy prop2 changed |
+
+## Key Passes
+
+### GVN (Global Value Numbering)
+
+Eliminates redundant computations across basic blocks. If two blocks both compute `a + b` where `a` and `b` have the same value, GVN replaces the second with a copy of the first. Operates on `BinOp`, `UnaryOp`, `Cmp`, `Cast`, `GetElementPtr`, and `Load` instructions within the dominator tree.
+
+GVN, LICM, and IVSR share a single `CfgAnalysis` (dominator tree + loop nesting) per function per iteration, saving significant compile time on large translation units.
+
+### LICM (Loop-Invariant Code Motion)
+
+Hoists computations out of loops when their operands don't change within the loop. Identifies natural loops via the dominator tree, then moves invariant instructions to loop preheaders. Critical for inner-loop performance on code like matrix multiply.
+
+### IPCP (Interprocedural Constant Propagation)
+
+When a function is always called with the same constant argument, IPCP specializes the function for that constant and folds the resulting dead branches. Important for Linux kernel code (`IS_ENABLED()`, `cpucap_is_possible()` chains) where `static inline` wrappers gate large blocks of dead code.
+
+### Division-by-Constant
+
+Replaces `idiv`/`div` instructions (20–90 cycle latency on modern CPUs) with multiply-and-shift sequences. Runs only on the first iteration, before narrowing and constant folding can further simplify the expanded sequence. Disabled on i686 where 64-bit multiply overflow semantics differ.
+
+## Disabling Passes
+
+For debugging, individual passes can be disabled:
+
+```bash
+CCC_DISABLE_PASSES="gvn,licm" ./target/release/ccc input.c -o output
+CCC_DISABLE_PASSES="all"      ./target/release/ccc input.c -o output
+```
+
+Pass names: `cfg`, `copyprop`, `narrow`, `simplify`, `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `inline`, `ivsr`, `divconst`.
+
+Timing data is available via:
+
+```bash
+CCC_TIME_PASSES=1 ./target/release/ccc input.c -o output 2>&1 | grep PASS
+```

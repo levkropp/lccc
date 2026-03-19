@@ -1,8 +1,38 @@
+# Rust build artifacts
 /target/
-Cargo.lock
+**/*.rs.bk
+
+# CCC submodule build
+/ccc/target/
+
+# Jekyll build output
+/_site/
+/.jekyll-cache/
+/.sass-cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Compiled / binary
 *.o
-*.s
-*.core
-a.out
-dump.rdb
-core
+*.a
+*.so
+*.dylib
+
+# Benchmark / test output
+/test-results/
+/tmp-results/
+/tmp/
+*.log
+*.png
+*.pdf
+
+# Misc
+.tmp
+.env
