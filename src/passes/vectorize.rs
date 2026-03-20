@@ -55,9 +55,18 @@
 //!    - `addpd`: packed add with C[i][j*2]
 //!    - `movupd`: store 2 results back
 //!
+//! ## Remainder Loops
+//!
+//! Remainder loops are automatically inserted to handle cases where N is not divisible by the vector width:
+//! - AVX2 (4-wide): Handles N % 4 ∈ {1, 2, 3} with scalar remainder loop
+//! - SSE2 (2-wide): Handles N % 2 = 1 with scalar remainder loop
+//!
+//! Example for N=255 with AVX2:
+//! - Vectorized loop: 63 iterations processing indices [0..251] (4 elements each)
+//! - Remainder loop: 3 iterations processing indices [252, 253, 254] (scalar)
+//!
 //! ## Limitations
 //!
-//! - Remainder loop not yet implemented (N must be divisible by 4 for AVX2, 2 for SSE2)
 //! - Only handles matmul-style patterns (load, multiply, add, store)
 //! - Requires innermost loop with IV-based indexing
 //!
@@ -68,11 +77,11 @@
 //! - `LCCC_DEBUG_VECTORIZE=1`: Enable debug output for vectorization pass
 
 use crate::common::fx_hash::FxHashSet;
-use crate::common::types::IrType;
+use crate::common::types::{AddressSpace, IrType};
 use crate::ir::analysis::CfgAnalysis;
 use crate::ir::instruction::{BasicBlock, BlockId, Instruction, Operand, Terminator, Value};
 use crate::ir::intrinsics::IntrinsicOp;
-use crate::ir::ops::IrBinOp;
+use crate::ir::ops::{IrBinOp, IrCmpOp};
 use crate::ir::reexports::{IrConst, IrFunction};
 use crate::passes::loop_analysis;
 
@@ -686,6 +695,275 @@ fn verify_gep_pattern(block: &BasicBlock, gep_val: Value, iv: Value) -> Option<(
     }
 }
 
+/// Extract base pointers for C and B arrays from the pattern's GEP values.
+/// Returns (c_base, a_ptr, b_base) for use in remainder loop.
+fn extract_base_pointers(
+    func: &IrFunction,
+    pattern: &VectorizablePattern,
+) -> (Value, Value, Value) {
+    let mut c_base = None;
+    let mut b_base = None;
+
+    // Scan all loop blocks to find GEP instructions that define c_gep and b_gep
+    for &block_idx in &pattern.loop_blocks {
+        let block = &func.blocks[block_idx];
+        for inst in &block.instructions {
+            if let Instruction::GetElementPtr { dest, base, .. } = inst {
+                if *dest == pattern.c_gep {
+                    c_base = Some(*base);
+                }
+                if *dest == pattern.b_gep {
+                    b_base = Some(*base);
+                }
+            }
+        }
+    }
+
+    let c_base = c_base.expect("Could not find C array base pointer");
+    let b_base = b_base.expect("Could not find B array base pointer");
+
+    (c_base, pattern.a_ptr, b_base)
+}
+
+/// Insert remainder loop to handle N % vec_width elements after vectorized loop.
+///
+/// Creates new CFG structure:
+/// [vec_header] ⇄ [vec_body] → [vec_latch] → [vec_exit]
+///                                             ↓
+///                                    [remainder_header] ⇄ [remainder_body] → [remainder_latch]
+///                                             ↓
+///                                          [exit]
+///
+/// Returns the number of changes made (typically 4 for the 4 new blocks).
+fn insert_remainder_loop(
+    func: &mut IrFunction,
+    pattern: &VectorizablePattern,
+    vec_width: usize,
+    next_val_id: &mut u32,
+    next_label: &mut u32,
+) -> usize {
+    let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
+
+    // Extract base pointers for arrays
+    let (c_base, a_ptr, b_base) = extract_base_pointers(func, pattern);
+
+    // Allocate new block IDs
+    let vec_exit_label = BlockId(*next_label);
+    *next_label += 1;
+    let remainder_header_label = BlockId(*next_label);
+    *next_label += 1;
+    let remainder_body_label = BlockId(*next_label);
+    *next_label += 1;
+    let remainder_latch_label = BlockId(*next_label);
+    *next_label += 1;
+
+    // Allocate new value IDs
+    let j_rem_start = Value(*next_val_id);
+    *next_val_id += 1;
+    let j_rem_iv = Value(*next_val_id);
+    *next_val_id += 1;
+    let j_rem_iv_next = Value(*next_val_id);
+    *next_val_id += 1;
+    let j_rem_cmp = Value(*next_val_id);
+    *next_val_id += 1;
+    let j_rem_cast = Value(*next_val_id);
+    *next_val_id += 1;
+    let j_rem_offset = Value(*next_val_id);
+    *next_val_id += 1;
+    let c_rem_gep = Value(*next_val_id);
+    *next_val_id += 1;
+    let b_rem_gep = Value(*next_val_id);
+    *next_val_id += 1;
+    let c_rem_load = Value(*next_val_id);
+    *next_val_id += 1;
+    let a_rem_load = Value(*next_val_id);
+    *next_val_id += 1;
+    let b_rem_load = Value(*next_val_id);
+    *next_val_id += 1;
+    let mul_result = Value(*next_val_id);
+    *next_val_id += 1;
+    let add_result = Value(*next_val_id);
+    *next_val_id += 1;
+
+    if debug {
+        eprintln!("[VEC] Creating remainder loop blocks...");
+        eprintln!("[VEC]   vec_exit (BlockId({}))", vec_exit_label.0);
+        eprintln!("[VEC]   remainder_header (BlockId({}))", remainder_header_label.0);
+        eprintln!("[VEC]   remainder_body (BlockId({}))", remainder_body_label.0);
+        eprintln!("[VEC]   remainder_latch (BlockId({}))", remainder_latch_label.0);
+    }
+
+    // Step 1: Modify vectorized header to exit to vec_exit instead of original exit
+    // Find the header block and change its false_label (exit branch) to vec_exit
+    let header_block = &mut func.blocks[pattern.header_idx];
+    if let Terminator::CondBranch { true_label: _, false_label, .. } = &mut header_block.terminator {
+        if debug {
+            eprintln!("[VEC]   Redirecting header exit {} → {}", false_label, vec_exit_label);
+        }
+        *false_label = vec_exit_label;
+    }
+
+    // Step 2: Create vec_exit block
+    // Computes j_rem_start = j_vec_final * vec_width
+    let vec_exit_block = BasicBlock {
+        label: vec_exit_label,
+        instructions: vec![
+            Instruction::BinOp {
+                dest: j_rem_start,
+                op: IrBinOp::Mul,
+                lhs: Operand::Value(pattern.iv),  // Final value of vectorized IV
+                rhs: Operand::Const(IrConst::I32(vec_width as i32)),
+                ty: IrType::I32,
+            },
+        ],
+        terminator: Terminator::Branch(remainder_header_label),
+        source_spans: vec![],
+    };
+
+    // Step 3: Create remainder_header block
+    // Phi node for remainder IV and comparison
+    let remainder_header_block = BasicBlock {
+        label: remainder_header_label,
+        instructions: vec![
+            Instruction::Phi {
+                dest: j_rem_iv,
+                ty: IrType::I32,
+                incoming: vec![
+                    (Operand::Value(j_rem_start), vec_exit_label),
+                    (Operand::Value(j_rem_iv_next), remainder_latch_label),
+                ],
+            },
+            Instruction::Cmp {
+                dest: j_rem_cmp,
+                op: IrCmpOp::Slt,  // Signed less-than
+                lhs: Operand::Value(j_rem_iv),
+                rhs: pattern.limit,  // Original N
+                ty: IrType::I32,
+            },
+        ],
+        terminator: Terminator::CondBranch {
+            cond: Operand::Value(j_rem_cmp),
+            true_label: remainder_body_label,
+            false_label: BlockId(pattern.exit_idx as u32),
+        },
+        source_spans: vec![],
+    };
+
+    // Step 4: Create remainder_body block
+    // Scalar FMA: C[i][j] += A[i][k] * B[k][j]
+    let remainder_body_block = BasicBlock {
+        label: remainder_body_label,
+        instructions: vec![
+            // Cast j to i64
+            Instruction::Cast {
+                dest: j_rem_cast,
+                src: Operand::Value(j_rem_iv),
+                from_ty: IrType::I32,
+                to_ty: IrType::I64,
+            },
+            // Compute byte offset: j * 8
+            Instruction::BinOp {
+                dest: j_rem_offset,
+                op: IrBinOp::Mul,
+                lhs: Operand::Value(j_rem_cast),
+                rhs: Operand::Const(IrConst::I64(8)),
+                ty: IrType::I64,
+            },
+            // GEP for C[i][j]
+            Instruction::GetElementPtr {
+                dest: c_rem_gep,
+                base: c_base,
+                offset: Operand::Value(j_rem_offset),
+                ty: IrType::F64,  // Element type, not pointer type
+            },
+            // GEP for B[k][j]
+            Instruction::GetElementPtr {
+                dest: b_rem_gep,
+                base: b_base,
+                offset: Operand::Value(j_rem_offset),
+                ty: IrType::F64,  // Element type, not pointer type
+            },
+            // Load C[i][j]
+            Instruction::Load {
+                dest: c_rem_load,
+                ptr: c_rem_gep,
+                ty: IrType::F64,
+                seg_override: AddressSpace::Default,
+            },
+            // Load A[i][k]
+            Instruction::Load {
+                dest: a_rem_load,
+                ptr: a_ptr,
+                ty: IrType::F64,
+                seg_override: AddressSpace::Default,
+            },
+            // Load B[k][j]
+            Instruction::Load {
+                dest: b_rem_load,
+                ptr: b_rem_gep,
+                ty: IrType::F64,
+                seg_override: AddressSpace::Default,
+            },
+            // Multiply A * B
+            Instruction::BinOp {
+                dest: mul_result,
+                op: IrBinOp::Mul,  // Type-generic multiply, determined by ty field
+                lhs: Operand::Value(a_rem_load),
+                rhs: Operand::Value(b_rem_load),
+                ty: IrType::F64,
+            },
+            // Add C + (A * B)
+            Instruction::BinOp {
+                dest: add_result,
+                op: IrBinOp::Add,  // Type-generic add, determined by ty field
+                lhs: Operand::Value(c_rem_load),
+                rhs: Operand::Value(mul_result),
+                ty: IrType::F64,
+            },
+            // Store result back to C[i][j]
+            Instruction::Store {
+                val: Operand::Value(add_result),
+                ptr: c_rem_gep,
+                ty: IrType::F64,
+                seg_override: AddressSpace::Default,
+            },
+        ],
+        terminator: Terminator::Branch(remainder_latch_label),
+        source_spans: vec![],
+    };
+
+    // Step 5: Create remainder_latch block
+    // Increment j and loop back
+    let remainder_latch_block = BasicBlock {
+        label: remainder_latch_label,
+        instructions: vec![
+            Instruction::BinOp {
+                dest: j_rem_iv_next,
+                op: IrBinOp::Add,
+                lhs: Operand::Value(j_rem_iv),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::I32,
+            },
+        ],
+        terminator: Terminator::Branch(remainder_header_label),
+        source_spans: vec![],
+    };
+
+    // Step 6: Add all new blocks to the function
+    func.blocks.push(vec_exit_block);
+    func.blocks.push(remainder_header_block);
+    func.blocks.push(remainder_body_block);
+    func.blocks.push(remainder_latch_block);
+
+    if debug {
+        eprintln!("[VEC] Remainder phi: [(Value({}), BlockId({})), (Value({}), BlockId({}))]",
+            j_rem_start.0, vec_exit_label.0, j_rem_iv_next.0, remainder_latch_label.0);
+        eprintln!("[VEC] Transformation complete: 4 blocks added");
+    }
+
+    4  // 4 new blocks added
+}
+
 /// Transform the loop to use FmaF64x2 intrinsics.
 fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) -> usize {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
@@ -1136,11 +1414,20 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
         // The old load/mul/add instructions are now dead. DCE will remove them.
     }
 
-    // Step 4: Create remainder loop blocks for odd N
-    // TODO: This is complex and requires careful CFG manipulation
-    // For now, we'll skip this and only vectorize loops with even N
-    // The plan mentions this should be implemented, but let's test the basic
-    // transformation first before adding the remainder loop
+    // Step 4: Create remainder loop blocks for N % 2 != 0
+    {
+        let remainder_changes = insert_remainder_loop(
+            func,
+            pattern,
+            2,  // SSE2 vector width
+            &mut next_val_id,
+            &mut next_label,
+        );
+        changes += remainder_changes;
+        if debug {
+            eprintln!("[VEC]   Added remainder loop: {} blocks created", remainder_changes / 4);
+        }
+    }
 
     // Update the function's next_value_id
     func.next_value_id = next_val_id;
@@ -1570,6 +1857,21 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
         }
 
         // The old load/mul/add instructions are now dead. DCE will remove them.
+    }
+
+    // Step 4: Create remainder loop blocks for N % 4 != 0
+    {
+        let remainder_changes = insert_remainder_loop(
+            func,
+            pattern,
+            4,  // AVX2 vector width
+            &mut next_val_id,
+            &mut next_label,
+        );
+        changes += remainder_changes;
+        if debug {
+            eprintln!("[VEC]   Added remainder loop: {} blocks created", remainder_changes / 4);
+        }
     }
 
     // Update the function's next_value_id
