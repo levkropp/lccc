@@ -2,7 +2,8 @@
 
 > An optimized fork of [CCC](https://github.com/anthropics/claudes-c-compiler) with a two-pass
 > linear-scan register allocator, phi-copy stack coalescing, loop unrolling, FP intrinsic
-> lowering, FP peephole optimization, and AVX2 auto-vectorization with remainder loops. **+42% faster** on register-pressure code, **~2× of GCC** on matrix multiply (was 6.0×).
+> lowering, FP peephole optimization, AVX2 auto-vectorization with remainder loops, and x86-64
+> indexed addressing modes. **+42% faster** on register-pressure code, **~2× of GCC** on matrix multiply (was 6.0×).
 
 **[Documentation](https://levkropp.github.io/lccc/)** ·
 **[Benchmarks](#benchmarks)** ·
@@ -349,8 +350,9 @@ docs/           Jekyll documentation site source
 | 6 | SSE2 auto-vectorization (2-wide) | ✅ Complete | **~2× on matmul-style FP loops** |
 | 7a | AVX2 vectorization (4-wide) | ✅ Complete | **~2× additional on matmul vs SSE2** |
 | 7b | Remainder loop handling | ✅ Complete | **Production-ready vectorization for any N** |
+| 9 | Indexed addressing modes (SIB) | ✅ Complete | **75% reduction in array access instructions** |
+| 9b | IVSR integration (loop-based arrays) | Planned | +5–10% on array-heavy loops |
 | 8 | Better function inlining | Planned | ~1.8× on fib(40) |
-| 9 | Loop strength reduction | Planned | Eliminate redundant addressing |
 | 10 | Profile-guided optimization (PGO) | Planned | ~1.2–1.5× general |
 
 The goal is not to beat GCC — it's to make CCC-compiled programs fast enough for real systems
