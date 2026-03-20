@@ -17,9 +17,24 @@ exclude:
   - Cargo.lock
   - target/
   - ccc/
-  - lccc-improvements/benchmarks/bench/
+  - lccc-improvements/
   - "*.sh"
   - "*.rs"
+  - "*.c"
+  - "*.s"
+  - "*.ir"
+  - "*.exe"
+  - "*.out"
+  - .claude/
+  - bench_*
+  - test_*
+  - a.out
+  - DESIGN_DOC.md
+  - LICENSING.md
+  - NEXT_STEPS.md
+  - PHASE_7A_COMPLETE.md
+  - VECTORIZATION_SUCCESS.md
+  - results.md
 
 defaults:
   - scope:
