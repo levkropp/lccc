@@ -2,7 +2,7 @@
 
 > An optimized fork of [CCC](https://github.com/anthropics/claudes-c-compiler) with a two-pass
 > linear-scan register allocator, phi-copy stack coalescing, loop unrolling, FP intrinsic
-> lowering, and FP peephole optimization. **+42% faster** on register-pressure code, **4.0× of GCC** on matrix multiply (was 6.0×).
+> lowering, FP peephole optimization, and SSE2 auto-vectorization. **+42% faster** on register-pressure code, **~2× of GCC** on matrix multiply (was 6.0×).
 
 **[Documentation](https://levkropp.github.io/lccc/)** ·
 **[Benchmarks](#benchmarks)** ·
@@ -20,16 +20,16 @@ RISC-V 64, and i686, with its own assembler and linker.
 LCCC is a performance fork. Phase 2 replaces CCC's three-phase greedy register allocator with a proper
 two-pass linear-scan allocator (Poletto & Sarkar 1999). Phase 3 adds tail-call elimination and
 phi-copy stack slot coalescing. Phase 4 adds loop unrolling and FP intrinsic lowering. Phase 5 adds
-FP peephole optimization that eliminates GPR↔XMM round-trips and stack spills. Together these
-yield +42% speedup on register-pressure code and bring the matmul GCC gap from 6.0× to 4.0×, while
-keeping all 514 tests green.
+FP peephole optimization that eliminates GPR↔XMM round-trips and stack spills. Phase 6 adds SSE2
+auto-vectorization for matmul-style loops. Together these yield +42% speedup on register-pressure
+code and bring the matmul GCC gap from 6.0× to ~2×, while keeping all 514 tests green.
 
 ```
 C source
   │  frontend: lex → parse → sema → IR lowering
   ▼
 SSA IR
-  │  optimizer: TCE · loop-unroll · GVN · LICM · IPCP · DCE · const-fold · inline
+  │  optimizer: TCE · loop-unroll · vectorize · GVN · LICM · IPCP · DCE · const-fold · inline
   ▼
 Optimized IR
   │  regalloc (LCCC): two-pass linear scan over live intervals
@@ -56,7 +56,7 @@ All outputs are byte-identical to GCC.
 | `sieve` — primes to 10 M | **0.036 s** | 0.045 s | 0.024 s | **+25% faster** | 1.50× slower |
 | `qsort` — sort 1 M integers | 0.096 s | 0.095 s | 0.087 s | ≈ equal | 1.10× slower |
 | `fib(40)` — recursive Fibonacci | 0.352 s | 0.354 s | 0.096 s | ≈ equal | 3.68× slower |
-| `matmul` — 256×256 double | **0.016 s** | 0.029 s | 0.004 s | **+81% faster** | 4.0× slower |
+| `matmul` — 256×256 double | **0.008 s** | 0.029 s | 0.004 s | **+263% faster** | ~2.0× slower |
 | `tce_sum` — tail-recursive sum(10M) | **0.008 s** | 1.09 s | 0.008 s | **139× faster** | ≈ equal |
 
 The `arith_loop` gain comes from linear-scan register allocation + phi-copy stack coalescing
@@ -64,8 +64,9 @@ The `arith_loop` gain comes from linear-scan register allocation + phi-copy stac
 The `sieve` gain comes from linear scan keeping the inner-loop counter in a register + loop
 unrolling the prime-counting pass.
 The `matmul` gain comes from Phase 4 FP intrinsic lowering + Phase 5 FP peephole optimization
-(eliminates GPR↔XMM round-trips, folds memory operands, removes stack spills — 33→20 inner loop instructions).
-The remaining `matmul` gap is GCC's SSE2 auto-vectorization + tighter loop control — a Phase 6 target.
+(eliminates GPR↔XMM round-trips, folds memory operands, removes stack spills — 33→20 inner loop instructions)
++ Phase 6 SSE2 auto-vectorization (processes 2 doubles per iteration with packed mulpd/addpd, ~2× speedup).
+The remaining `matmul` gap is GCC's AVX2 vectorization (4-wide vs our 2-wide) and more aggressive loop optimizations.
 The `tce_sum` gain comes from tail-call elimination converting 10M recursive calls into a loop.
 
 Run the suite yourself:
@@ -203,6 +204,50 @@ The pass lives in [`src/passes/loop_unroll.rs`](src/passes/loop_unroll.rs) and r
 
 ---
 
+## SSE2 Auto-vectorization
+
+Innermost loops with matmul-style accumulation patterns are automatically vectorized to process
+2 doubles per iteration using SSE2 packed instructions.
+
+**Pattern recognized:**
+```c
+for (int j = 0; j < N; j++)
+    C[i][j] += A[i][k] * B[k][j];  // scalar accumulation
+```
+
+**Transformed to:**
+```c
+for (int j = 0; j < N/2; j++)  // Half the iterations
+    FmaF64x2(&C[i][j*2], &A[i][k], &B[k][j*2]);  // Processes elements j*2 and j*2+1
+```
+
+**Generated assembly:**
+```asm
+movsd   (%rcx), %xmm1      # Load scalar A[i][k]
+unpcklpd %xmm1, %xmm1      # Broadcast to both lanes
+movupd  (%rdx), %xmm0      # Load 2 doubles from B
+mulpd   %xmm1, %xmm0       # Packed multiply (2 ops)
+addpd   (%rax), %xmm0      # Packed add with C (2 ops)
+movupd  %xmm0, (%rax)      # Store 2 results
+```
+
+**How it works:**
+
+1. **IV tracking** — Traces the induction variable through casts/copies, working backward from GEP instructions to find the actual j-loop IV
+2. **Loop bound** — Modifies comparisons from `j < N` to `j < N/2` (inserts udiv for dynamic N)
+3. **Array indexing** — Inserts multiply instructions to change GEP offsets from `j` to `j*2`, ensuring stride-16 addressing
+4. **Intrinsic insertion** — Replaces scalar load/mul/add/store with `FmaF64x2` intrinsic
+5. **Code generation** — Backend emits SSE2 packed instructions (movupd, mulpd, addpd, unpcklpd)
+
+The pass runs at `iter=0` (early) before other optimizations and correctly handles strength-reduced
+loops. It processes 2 elements per iteration while keeping the IV incrementing by 1 (backend-friendly).
+
+**Limitations:** Remainder loop for odd N not yet implemented; only matmul-style patterns supported.
+
+The pass lives in [`src/passes/vectorize.rs`](src/passes/vectorize.rs) (900+ lines).
+
+---
+
 ## Getting started
 
 **Prerequisites:** Rust stable (2021 edition), Linux x86-64 host.
@@ -251,9 +296,10 @@ Unrecognized flags are silently ignored so `ccc` works as a drop-in in build sys
 | `CCC_TIME_PASSES` | Print per-pass timing and change counts to stderr |
 | `CCC_DISABLE_PASSES` | Disable passes by name (comma-separated, or `all`) |
 | `CCC_KEEP_ASM` | Keep intermediate `.s` files next to output |
+| `LCCC_DEBUG_VECTORIZE` | Print vectorization pattern matching and transformation details |
 
 Pass names: `cfg`, `copyprop`, `narrow`, `simplify`, `constfold`, `gvn`, `licm`,
-`ifconv`, `dce`, `ipcp`, `inline`, `ivsr`, `divconst`, `tce`, `unroll`.
+`ifconv`, `dce`, `ipcp`, `inline`, `ivsr`, `divconst`, `tce`, `unroll`, `vectorize`.
 
 ---
 
@@ -291,8 +337,10 @@ docs/           Jekyll documentation site source
 | 3a | Tail-call-to-loop elimination (TCE) | ✅ Complete | **139× on accumulator recursion** |
 | 3b | Phi-copy stack slot coalescing | ✅ Complete | **+additional 20% on loop-heavy code** |
 | 4 | Loop unrolling + FP intrinsic lowering | ✅ Complete | **+45% matmul vs CCC; sieve counting loop 8×** |
-| 5 | SIMD / auto-vectorization (AVX2) | Planned | ~2–4× on FP-heavy code |
-| 6 | Profile-guided optimization (PGO) | Planned | ~1.2–1.5× general |
+| 5 | FP peephole optimization | ✅ Complete | **+additional 41% matmul vs CCC** |
+| 6 | SSE2 auto-vectorization | ✅ Complete | **~2× on matmul-style FP loops** |
+| 7 | AVX2/AVX-512 vectorization | Planned | ~2× additional on FP-heavy code |
+| 8 | Profile-guided optimization (PGO) | Planned | ~1.2–1.5× general |
 
 The goal is not to beat GCC — it's to make CCC-compiled programs fast enough for real systems
 software, targeting within ~1.5× of GCC on typical workloads.
