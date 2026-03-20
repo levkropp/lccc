@@ -392,6 +392,338 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
     changed
 }
 
+// ── FP XMM↔GPR round-trip elimination ────────────────────────────────────────
+//
+// float_ops.rs emits FP binops as:
+//   movq -N(%rbp), %rax    ; load lhs into GPR
+//   movq %rax, %xmm0       ; shuttle to XMM ← wasteful
+//   movq -M(%rbp), %rcx    ; load rhs into GPR
+//   movq %rcx, %xmm1       ; shuttle to XMM ← wasteful
+//   mulsd %xmm1, %xmm0     ; actual operation
+//   movq %xmm0, %rax       ; result back to GPR ← wasteful
+//   movq %rax, -P(%rbp)    ; store
+//
+// This pass eliminates the GPR intermediaries:
+//   LoadRbp{rax,Q}  + "movq %rax, %xmm0"  → "movsd -N(%rbp), %xmm0"
+//   LoadRbp{rcx,Q}  + "movq %rcx, %xmm1"  → "movsd -M(%rbp), %xmm1"
+//   "movq %xmm0,%rax" + StoreRbp{rax,Q}   → "movsd %xmm0, -P(%rbp)"
+//
+// This reduces 7 instructions to 4 (then fold_fp_memory_operands reduces to 3).
+
+pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut changed = false;
+    let len = store.len();
+    let mut i = 0;
+
+    while i < len {
+        if infos[i].is_nop() { i += 1; continue; }
+
+        // Pattern A: LoadRbp{rax(0) or rcx(1), Q} then "movq %gpr, %xmmN"
+        if let LineKind::LoadRbp { reg: load_reg, offset, size: MoveSize::Q } = infos[i].kind {
+            if load_reg <= 1 {
+                let mut j = i + 1;
+                while j < len && j < i + 4 && infos[j].is_nop() { j += 1; }
+                if j < len && !infos[j].is_nop() {
+                    let line_j = infos[j].trimmed(store.get(j));
+                    let (expected, xmm_str) = if load_reg == 0 {
+                        ("movq %rax, %xmm0", "%xmm0")
+                    } else {
+                        ("movq %rcx, %xmm1", "%xmm1")
+                    };
+                    if line_j == expected {
+                        let new_text = format!("    movsd {}(%rbp), {}", offset, xmm_str);
+                        replace_line(store, &mut infos[i], i, new_text);
+                        mark_nop(&mut infos[j]);
+                        changed = true;
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Pattern B: "movq %xmm0, %rax" then StoreRbp{rax, Q}
+        if let LineKind::Other { dest_reg: 0 } = infos[i].kind {
+            let line_i = infos[i].trimmed(store.get(i));
+            if line_i == "movq %xmm0, %rax" {
+                let mut j = i + 1;
+                while j < len && j < i + 4 && infos[j].is_nop() { j += 1; }
+                if j < len {
+                    if let LineKind::StoreRbp { reg: 0, offset, size: MoveSize::Q } = infos[j].kind {
+                        let mut k = j + 1;
+                        while k < len && infos[k].is_nop() { k += 1; }
+                        if !rax_is_live_at(store, infos, k, len) {
+                            let new_text = format!("    movsd %xmm0, {}(%rbp)", offset);
+                            mark_nop(&mut infos[i]);
+                            replace_line(store, &mut infos[j], j, new_text);
+                            changed = true;
+                            i = j + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pattern E: StoreRbp{rax, O} immediately followed by "movq %rax, %xmmN"
+        // The stack store is dead (value used from %rax directly). NOP it so
+        // Pattern D can fire on the adjacent movq-from-ptr + movq-to-xmm.
+        if let LineKind::StoreRbp { reg: 0, offset, size: MoveSize::Q } = infos[i].kind {
+            let mut j = i + 1;
+            while j < len && j < i + 4 && infos[j].is_nop() { j += 1; }
+            if j < len {
+                let line_j = infos[j].trimmed(store.get(j));
+                if line_j == "movq %rax, %xmm0" || line_j == "movq %rax, %xmm1" {
+                    // Verify stack slot O is not read between j+1 and block end.
+                    if rbp_offset_dead_after(store, infos, j + 1, len, offset as i64) {
+                        mark_nop(&mut infos[i]);
+                        changed = true;
+                        // Don't advance i past j; let Pattern D fire next iteration.
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Pattern D: "movq (%<ptr>), %rax" immediately followed by
+        // "movq %rax, %xmmN" → "movsd (%<ptr>), %xmmN".
+        // Fires after Pattern E removes the intervening dead StoreRbp.
+        if let LineKind::Other { dest_reg: 0 } = infos[i].kind {
+            let line_i = infos[i].trimmed(store.get(i));
+            if line_i.starts_with("movq (%") && line_i.ends_with("), %rax") {
+                let mut j = i + 1;
+                while j < len && j < i + 4 && infos[j].is_nop() { j += 1; }
+                if j < len {
+                    let line_j = infos[j].trimmed(store.get(j));
+                    let xmm = if line_j == "movq %rax, %xmm0" {
+                        Some("%xmm0")
+                    } else if line_j == "movq %rax, %xmm1" {
+                        Some("%xmm1")
+                    } else {
+                        None
+                    };
+                    if let Some(xmm_str) = xmm {
+                        // Extract pointer register from "movq (%<ptr>), %rax"
+                        let ptr_reg = &line_i[7..line_i.len() - 7]; // strip "movq (%" and "), %rax"
+                        let mut k = j + 1;
+                        while k < len && infos[k].is_nop() { k += 1; }
+                        if !rax_is_live_at(store, infos, k, len) {
+                            let new_text = format!("    movsd (%{}), {}", ptr_reg, xmm_str);
+                            replace_line(store, &mut infos[i], i, new_text);
+                            mark_nop(&mut infos[j]);
+                            changed = true;
+                            i = j + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pattern F: "movq %xmm0, %rax" + "movq %rax, %<gprA>" +
+        //            "movq %<gprB>, %rcx" + "movq %<gprA>, (%rcx)"
+        //          → "movsd %xmm0, (%<gprB>)" + NOP the rest.
+        // This folds the 4-instruction store-through-pointer chain.
+        if let LineKind::Other { dest_reg: 0 } = infos[i].kind {
+            let line_i = infos[i].trimmed(store.get(i));
+            if line_i == "movq %xmm0, %rax" {
+                // Find J: "movq %rax, %<gprA>"
+                let mut j = i + 1;
+                while j < len && j < i + 4 && infos[j].is_nop() { j += 1; }
+                if j < len {
+                    let line_j = infos[j].trimmed(store.get(j));
+                    if line_j.starts_with("movq %rax, %") && !line_j.ends_with("%xmm0") {
+                        let gpr_a = &line_j[12..]; // "movq %rax, %" is 12 chars
+                        // Find K: "movq %<gprB>, %rcx"
+                        let mut k = j + 1;
+                        while k < len && k < j + 4 && infos[k].is_nop() { k += 1; }
+                        if k < len {
+                            let line_k = infos[k].trimmed(store.get(k));
+                            if line_k.starts_with("movq %") && line_k.ends_with(", %rcx") {
+                                let gpr_b = &line_k[6..line_k.len() - 6]; // strip "movq %" and ", %rcx"
+                                // Find L: "movq %<gprA>, (%rcx)"
+                                let mut l = k + 1;
+                                while l < len && l < k + 4 && infos[l].is_nop() { l += 1; }
+                                if l < len {
+                                    let expected_l = format!("movq %{}, (%rcx)", gpr_a);
+                                    let line_l = infos[l].trimmed(store.get(l));
+                                    if line_l == expected_l {
+                                        // Check rax not live after J, gprA not live after L.
+                                        let mut after_j = j + 1;
+                                        while after_j < len && infos[after_j].is_nop() { after_j += 1; }
+                                        if !rax_is_live_at(store, infos, after_j, len) {
+                                            let new_text = format!("    movsd %xmm0, (%{})", gpr_b);
+                                            replace_line(store, &mut infos[i], i, new_text);
+                                            mark_nop(&mut infos[j]);
+                                            mark_nop(&mut infos[k]);
+                                            mark_nop(&mut infos[l]);
+                                            changed = true;
+                                            i = l + 1;
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        i += 1;
+    }
+    changed
+}
+
+/// Returns true if %rax is live (potentially read) at instruction index `at`.
+/// Conservative: treats "movq %<non-rax>, %rax" as a pure write (not live).
+fn rax_is_live_at(store: &LineStore, infos: &[LineInfo], at: usize, len: usize) -> bool {
+    if at >= len {
+        return false;
+    }
+    match infos[at].kind {
+        // LoadRbp{reg:0} is "movq -N(%rbp), %rax" — unconditional write.
+        LineKind::LoadRbp { reg: 0, .. } => false,
+        // Other{dest_reg:0}: %rax is the destination. If text is "movq <src>, %rax"
+        // and <src> doesn't mention %rax, it's a pure write → not live.
+        LineKind::Other { dest_reg: 0 } => {
+            let t = infos[at].trimmed(store.get(at));
+            if t.starts_with("movq ") && t.ends_with(", %rax") {
+                // Check if source (between "movq " and ", %rax") contains %rax.
+                let src = &t[5..t.len() - 6];
+                src.contains("%rax")
+            } else {
+                t.contains("%rax")
+            }
+        }
+        _ => infos[at].trimmed(store.get(at)).contains("%rax"),
+    }
+}
+
+/// Returns true if the rbp offset `offset` is dead (not read before being
+/// written or before a control-flow boundary) starting at instruction `start`.
+/// Scans up to 32 instructions forward; stops at any jump/call.
+fn rbp_offset_dead_after(
+    store: &LineStore,
+    infos: &[LineInfo],
+    start: usize,
+    len: usize,
+    offset: i64,
+) -> bool {
+    let offset_str = format!("{}(%rbp)", offset);
+    let mut i = start;
+    let mut count = 0;
+    while i < len && count < 32 {
+        if infos[i].is_nop() { i += 1; continue; }
+        let t = infos[i].trimmed(store.get(i));
+        // Stop at control-flow instructions.
+        if t.starts_with('j') || t.starts_with("call") || t.starts_with("ret") {
+            return true; // Reached block boundary without a read → dead.
+        }
+        // If this is a write to the same offset (StoreRbp), it's dead from here.
+        if let LineKind::StoreRbp { offset: o, .. } = infos[i].kind {
+            if i64::from(o) == offset { return true; }
+        }
+        // If text contains the offset string (potential read), not dead.
+        if t.contains(&offset_str) {
+            return false;
+        }
+        i += 1;
+        count += 1;
+    }
+    true // Ran out of instructions without a read → dead.
+}
+
+// ── rcx address-register copy elimination (Pattern G) ────────────────────────
+//
+// LCCC's codegen always copies the pointer into %rcx before a memory op:
+//   movq %<ptr>, %rcx
+//   movq (%rcx), %rax   OR   movsd (%rcx), %xmmN
+//
+// When %rcx is dead after the dereference we can fold to:
+//   movq (%<ptr>), %rax   OR   movsd (%<ptr>), %xmmN
+//
+pub(super) fn eliminate_rcx_address_copy(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+
+    while i < len {
+        if infos[i].is_nop() { i += 1; continue; }
+
+        // Match: "movq %<gpr>, %rcx" (any GPR → rcx, rcx = family 1)
+        if let LineKind::Other { dest_reg: 1 } = infos[i].kind {
+            let line_i = infos[i].trimmed(store.get(i));
+            if line_i.starts_with("movq %") && line_i.ends_with(", %rcx") {
+                let src_reg = &line_i[6..line_i.len() - 6]; // between "movq %" and ", %rcx"
+                // src_reg must not be "rcx" itself (no-op move) and must be a plain GPR
+                if src_reg != "rcx" && !src_reg.contains('(') && !src_reg.contains('$') {
+                    let mut j = i + 1;
+                    while j < len && j < i + 4 && infos[j].is_nop() { j += 1; }
+                    if j < len {
+                        let line_j = infos[j].trimmed(store.get(j));
+
+                        // Sub-pattern G1: movq (%rcx), %rax → movq (%<src>), %rax
+                        if line_j == "movq (%rcx), %rax" {
+                            let mut k = j + 1;
+                            while k < len && infos[k].is_nop() { k += 1; }
+                            if !rcx_is_live_at(store, infos, k, len) {
+                                let new = format!("    movq (%{}), %rax", src_reg);
+                                mark_nop(&mut infos[i]);
+                                replace_line(store, &mut infos[j], j, new);
+                                changed = true;
+                                i = j + 1;
+                                continue;
+                            }
+                        }
+
+                        // Sub-pattern G2: movsd (%rcx), %xmmN → movsd (%<src>), %xmmN
+                        if line_j.starts_with("movsd (%rcx), %xmm") {
+                            let xmm = &line_j[18..]; // after "movsd (%rcx), "
+                            let mut k = j + 1;
+                            while k < len && infos[k].is_nop() { k += 1; }
+                            if !rcx_is_live_at(store, infos, k, len) {
+                                let new = format!("    movsd (%{}), {}", src_reg, xmm);
+                                mark_nop(&mut infos[i]);
+                                replace_line(store, &mut infos[j], j, new);
+                                changed = true;
+                                i = j + 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        i += 1;
+    }
+    changed
+}
+
+fn rcx_is_live_at(store: &LineStore, infos: &[LineInfo], at: usize, len: usize) -> bool {
+    if at >= len { return false; }
+    match infos[at].kind {
+        // LoadRbp loads into a GP reg — doesn't use %rcx as address
+        LineKind::LoadRbp { .. } => false,
+        LineKind::Other { dest_reg: 1 } => {
+            // rcx is the destination. "movq <src>, %rcx" is a pure write if src ≠ %rcx.
+            let t = infos[at].trimmed(store.get(at));
+            if t.starts_with("movq ") && t.ends_with(", %rcx") {
+                let src = &t[5..t.len() - 6];
+                src.contains("%rcx")
+            } else {
+                t.contains("%rcx")
+            }
+        }
+        _ => infos[at].trimmed(store.get(at)).contains("%rcx"),
+    }
+}
+
 // ── Movq + extension/truncation fusion ───────────────────────────────────────
 //
 // Fuses `movq %REG, %rax` followed by a cast instruction into a single

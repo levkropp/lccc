@@ -69,6 +69,13 @@ pub enum IntrinsicOp {
     /// args[0] = input float value; dest = |x|
     FabsF32,
     FabsF64,
+    /// Packed double FMA for vectorized matmul inner loop.
+    /// Computes: *dest_ptr[0..2] += broadcast(*args[0]) * *args[1][0..2]
+    /// dest_ptr: pointer to 2×F64 accumulator (read+write, 16 bytes)
+    /// args[0]: pointer to scalar F64 (broadcast to both SSE lanes)
+    /// args[1]: pointer to 2×F64 (one SSE register worth)
+    /// NOT pure: modifies memory at dest_ptr.
+    FmaF64x2,
     /// AES-NI: aesenc (single round encrypt)
     /// args[0] = state ptr, args[1] = round key ptr; dest_ptr = result ptr
     Aesenc128,

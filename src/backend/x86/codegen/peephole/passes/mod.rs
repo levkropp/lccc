@@ -69,6 +69,11 @@ pub fn peephole_optimize(asm: String) -> String {
         let local_changed = local_patterns::combined_local_pass(&mut store, &mut infos);
         changed |= local_changed;
         changed |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos);
+        // Eliminate FP XMM↔GPR round-trips, then fold the resulting movsd loads
+        // into subsequent FP operations as memory operands.
+        changed |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
+        changed |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos);
+        changed |= local_patterns::eliminate_rcx_address_copy(&mut store, &mut infos);
         if local_changed || pass_count == 0 {
             changed |= push_pop::eliminate_push_pop_pairs(&store, &mut infos);
             changed |= push_pop::eliminate_binop_push_pop_pattern(&mut store, &mut infos);
@@ -96,6 +101,9 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 = false;
             changed2 |= local_patterns::combined_local_pass(&mut store, &mut infos);
             changed2 |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos);
+            changed2 |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
+            changed2 |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos);
+            changed2 |= local_patterns::eliminate_rcx_address_copy(&mut store, &mut infos);
             changed2 |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);
             changed2 |= dead_code::eliminate_dead_stores(&store, &mut infos);
             changed2 |= memory_fold::fold_memory_operands(&mut store, &mut infos);
@@ -114,6 +122,9 @@ pub fn peephole_optimize(asm: String) -> String {
             changed3 = false;
             changed3 |= local_patterns::combined_local_pass(&mut store, &mut infos);
             changed3 |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos);
+            changed3 |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
+            changed3 |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos);
+            changed3 |= local_patterns::eliminate_rcx_address_copy(&mut store, &mut infos);
             changed3 |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);
             changed3 |= dead_code::eliminate_dead_stores(&store, &mut infos);
             changed3 |= memory_fold::fold_memory_operands(&mut store, &mut infos);
@@ -145,6 +156,45 @@ pub fn peephole_optimize(asm: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_fp_xmm_roundtrip_load_rax() {
+        let asm = "    movq -32(%rbp), %rax\n    movq %rax, %xmm0\n".to_string();
+        let result = peephole_optimize(asm);
+        eprintln!("fp_roundtrip result: {:?}", result);
+        assert!(result.contains("movsd -32(%rbp), %xmm0"),
+            "should eliminate rax roundtrip: {}", result);
+        assert!(!result.contains("movq %rax, %xmm0"),
+            "movq rax->xmm should be gone: {}", result);
+    }
+
+    #[test]
+    fn test_fp_xmm_roundtrip_load_rcx() {
+        let asm = "    movq -40(%rbp), %rcx\n    movq %rcx, %xmm1\n".to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("movsd -40(%rbp), %xmm1"),
+            "should eliminate rcx roundtrip: {}", result);
+    }
+
+    #[test]
+    fn test_fp_xmm_roundtrip_store() {
+        let asm = "    movq %xmm0, %rax\n    movq %rax, -48(%rbp)\n".to_string();
+        let result = peephole_optimize(asm);
+        eprintln!("fp_store result: {:?}", result);
+        assert!(result.contains("movsd %xmm0, -48(%rbp)"),
+            "should eliminate store roundtrip: {}", result);
+    }
+
+    #[test]
+    fn test_fp_memory_fold_mulsd() {
+        let asm = [
+            "    movsd -40(%rbp), %xmm1",
+            "    mulsd %xmm1, %xmm0",
+        ].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(result.contains("mulsd -40(%rbp), %xmm0"),
+            "should fold movsd+mulsd: {}", result);
+    }
 
     #[test]
     fn test_redundant_store_load() {

@@ -25,6 +25,7 @@ pub(crate) mod loop_analysis;
 pub(crate) mod narrow;
 mod resolve_asm;
 pub(crate) mod simplify;
+pub(crate) mod loop_unroll;
 pub(crate) mod tail_call_elim;
 
 use crate::ir::analysis::CfgAnalysis;
@@ -192,6 +193,7 @@ struct DisabledPasses {
     ifconv: bool,
     dce: bool,
     ipcp: bool,
+    unroll: bool,
 }
 
 impl DisabledPasses {
@@ -207,6 +209,7 @@ impl DisabledPasses {
             ifconv: disabled.contains("ifconv"),
             dce: disabled.contains("dce"),
             ipcp: disabled.contains("ipcp"),
+            unroll: disabled.contains("unroll"),
         }
     }
 }
@@ -380,7 +383,17 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
             total_changes_excl_dce += n;
         }
 
-        // Phase 2b: Integer narrowing
+        // Phase 2b: Loop unrolling — iter 0 only, before GVN/LICM so that
+        // subsequent passes can optimize the unrolled copies.
+        // Pass name for CCC_DISABLE_PASSES: "unroll"
+        if iter == 0 && !dis.unroll {
+            let n = timed_pass!("loop_unroll",
+                run_on_visited(module, &dirty, &mut changed, loop_unroll::unroll_loops));
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Phase 2c: Integer narrowing
         // Upstream: copy_prop (propagated values expose narrowing)
         if !dis.narrow && should_run!(2, 1) {
             let n = timed_pass!("narrow", run_on_visited(module, &dirty, &mut changed, narrow::narrow_function));

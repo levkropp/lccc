@@ -559,6 +559,23 @@ impl X86Codegen {
                     self.emit_sse_shuffle_imm_128(dptr, args, inst);
                 }
             }
+            IntrinsicOp::FmaF64x2 => {
+                // dest_ptr[0..2] += broadcast(args[0]) * args[1][0..2]
+                // args[0] = A pointer (scalar F64, broadcast to both lanes)
+                // args[1] = B pointer (2×F64)
+                // dest_ptr = C pointer (read+write, 2×F64)
+                if let Some(c_ptr) = dest_ptr {
+                    self.operand_to_reg(&args[0], "rcx");      // A ptr → %rcx
+                    self.operand_to_reg(&args[1], "rdx");      // B ptr → %rdx
+                    self.value_to_reg(c_ptr, "rax");           // C ptr → %rax
+                    self.state.emit("    movsd (%rcx), %xmm1");       // xmm1 = A scalar
+                    self.state.emit("    unpcklpd %xmm1, %xmm1");     // xmm1 = {A, A}
+                    self.state.emit("    movupd (%rdx), %xmm0");      // xmm0 = {B[j], B[j+1]}
+                    self.state.emit("    mulpd %xmm1, %xmm0");        // xmm0 = {A*Bj, A*Bj1}
+                    self.state.emit("    addpd (%rax), %xmm0");       // xmm0 += {C[j], C[j+1]}
+                    self.state.emit("    movupd %xmm0, (%rax)");      // store back
+                }
+            }
         }
     }
 }
