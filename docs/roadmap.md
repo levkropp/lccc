@@ -12,17 +12,19 @@ next_page:
 
 # Roadmap
 {:.doc-subtitle}
-LCCC improves CCC in five phases. Phase 2 is complete.
+LCCC improves CCC in six phases. Phases 1–3 are complete.
 
 ## Status Overview
 
-| Phase | Name | Status | Expected gain |
-|-------|------|--------|---------------|
+| Phase | Name | Status | Result |
+|-------|------|--------|--------|
 | 1 | Register allocator analysis & design | ✅ Complete | (prerequisite) |
 | 2 | Linear scan register allocator | ✅ Complete | **+20–25% on register-pressure code** |
-| 3 | Loop unrolling & branch optimization | 🔲 Planned | ~1.5–2× on loop-heavy code |
-| 4 | SIMD / auto-vectorization | 🔲 Planned | ~4–8× on FP-heavy code |
-| 5 | Profile-guided optimization (PGO) | 🔲 Planned | ~1.2–1.5× general |
+| 3a | Tail-call-to-loop elimination (TCE) | ✅ Complete | **139× on accumulator recursion** |
+| 3b | Phi-copy stack slot coalescing | ✅ Complete | **+19% additional on loop-heavy code** |
+| 4 | Loop unrolling & branch optimization | 🔲 Planned | ~1.5–2× on loop-heavy code |
+| 5 | SIMD / auto-vectorization | 🔲 Planned | ~4–8× on FP-heavy code |
+| 6 | Profile-guided optimization (PGO) | 🔲 Planned | ~1.2–1.5× general |
 
 ---
 
@@ -47,7 +49,7 @@ LCCC improves CCC in five phases. Phase 2 is complete.
 
 **Goal:** Replace the three-phase greedy allocator with a proper linear scan.
 
-**What changed** (`ccc/src/backend/`):
+**What changed** (`src/backend/`):
 - `live_range.rs` — new: `LiveRange`, `ActiveInterval`, `LinearScanAllocator` (796 lines)
 - `regalloc.rs` — `allocate_registers()` now runs two-pass linear scan
 
@@ -59,13 +61,71 @@ LCCC improves CCC in five phases. Phase 2 is complete.
 5. Second pass: assign caller-saved registers to unallocated non-call-spanning values
 
 **Results:**
-- `arith_loop` (32 vars): 0.124s vs 0.149s — **+20% faster** than CCC
-- `sieve`: 0.036s vs 0.045s — **+25% faster** than CCC
-- 500 unit tests pass; all benchmark outputs identical to GCC
+- `arith_loop` (32 vars): 0.124s vs 0.149s — **+20% faster** than CCC (before Phase 3b)
+- `sieve`: 0.037s vs 0.044s — **+19% faster** than CCC
+- 500 upstream tests pass; all benchmark outputs identical to GCC
 
 ---
 
-## Phase 3 — Loop Optimizations (Planned)
+## Phase 3a — Tail-Call Elimination (Complete)
+
+**Goal:** Convert self-recursive tail calls to back-edge branches, eliminating stack frames
+for accumulator-style recursive functions.
+
+**What changed** (`src/passes/`):
+- `tail_call_elim.rs` — new: `tail_calls_to_loops()` pass (747 lines)
+- `mod.rs` — TCE runs once after inlining, before the main optimization loop
+
+**Algorithm:** A tail call is a recursive call whose result is returned immediately with no
+further computation. TCE converts it to a loop by:
+1. Inserting a loop header block with one Phi per parameter
+2. Renaming parameter references in the body to use the Phi outputs
+3. Replacing the tail call + return with assignments to the Phi inputs + unconditional branch
+
+The resulting loop is then optimized by LICM, IVSR, and GVN in the normal pipeline.
+
+**Results:**
+- `tce_sum`: 0.008s vs 1.09s — **139× faster** than CCC (matches GCC exactly)
+- Zero regressions on 508 unit tests
+
+**Pass name:** `tce` (disable with `CCC_DISABLE_PASSES=tce`)
+
+---
+
+## Phase 3b — Phi-Copy Stack Slot Coalescing (Complete)
+
+**Goal:** Eliminate the redundant stack-to-stack copies that phi elimination creates for
+spilled loop variables.
+
+**Root cause:** When CCC's phi elimination lowers SSA phi nodes to Copy instructions, each
+loop variable `%i` gets a separate copy per predecessor:
+- Entry: `%i = Copy 0`
+- Backedge: `%i = Copy %i_next`
+
+Because `%i` is now "multi-defined", the existing copy coalescing refused to share slots
+between `%i` and `%i_next`. This produced ~20 redundant `movq mem, %rax; movq %rax, mem`
+pairs per iteration in a 32-variable loop.
+
+**Fix:** For the phi-copy pattern — where `%i_next` is defined and killed in the backedge
+block (sole use = the Copy), and `%i` is used in other blocks (the loop header) — alias in
+the *reversed* direction: `%i_next` borrows `%i`'s wider-live slot. The backedge copy
+becomes a same-slot no-op and is dropped by `generate_copy`.
+
+The key insight: `%i` being multi-defined only means it's the slot *owner* (written in
+multiple predecessors). The *aliased* value `%i_next` is always single-defined, making the
+alias safe.
+
+**What changed** (`src/backend/stack_layout/copy_coalescing.rs`):
+- Moved `multi_def_values.contains(&d)` check from the early combined guard to after the
+  phi-copy pattern branch — multi-def is fine for the slot owner, never for the aliased value
+
+**Results:**
+- `arith_loop`: 0.124s → **0.104s** (+19% additional speedup on top of Phase 2)
+- Combined Phase 2+3b vs CCC: **+41% faster** on the 32-variable loop benchmark
+
+---
+
+## Phase 4 — Loop Optimizations (Planned)
 
 **Goal:** Close the gap on loop-heavy integer code via unrolling and branch-prediction-aware transforms.
 
@@ -76,7 +136,6 @@ LCCC improves CCC in five phases. Phase 2 is complete.
 - **Branch-to-cmov** — extend if-conversion to more patterns
 
 **Expected impact:**
-- `fib(40)`: currently 3.70× slower than GCC; loop-based fib variant could reach ~1.5×
 - `arith_loop`: could reach ~1.2× with 4× unroll reducing loop overhead
 - `sieve` inner loop: unrolling eliminates ~25% of branch mispredictions
 
@@ -84,11 +143,11 @@ LCCC improves CCC in five phases. Phase 2 is complete.
 
 ---
 
-## Phase 4 — SIMD / Auto-Vectorization (Planned)
+## Phase 5 — SIMD / Auto-Vectorization (Planned)
 
 **Goal:** Emit AVX2/SSE4 instructions for vectorizable inner loops.
 
-**Current gap:** `matmul` is 7.91× slower than GCC because GCC emits `vfmadd231pd` (AVX2 FMA, 4 doubles/cycle) while LCCC emits scalar `mulsd`/`addsd` (1 double/cycle).
+**Current gap:** `matmul` is 7.84× slower than GCC because GCC emits `vfmadd231pd` (AVX2 FMA, 4 doubles/cycle) while LCCC emits scalar `mulsd`/`addsd` (1 double/cycle).
 
 **Techniques:**
 - **SLP vectorization** — pack scalar ops in a basic block into SIMD ops
@@ -97,11 +156,11 @@ LCCC improves CCC in five phases. Phase 2 is complete.
 
 **Implementation target:** new `passes/vectorize.rs`, extended x86/ARM/RISC-V backends
 
-**Estimated gain:** 4–8× on FP-heavy code; closes the matmul gap from 7.91× to ~1.5–2×
+**Estimated gain:** 4–8× on FP-heavy code; closes the matmul gap from 7.84× to ~1.5–2×
 
 ---
 
-## Phase 5 — Profile-Guided Optimization (Planned)
+## Phase 6 — Profile-Guided Optimization (Planned)
 
 **Goal:** Use runtime profiles to guide inlining, block layout, and register allocation priorities.
 
@@ -117,13 +176,13 @@ LCCC improves CCC in five phases. Phase 2 is complete.
 
 ## Remaining Gap to GCC
 
-Even after all five phases, some gaps will remain:
+Even after all six phases, some gaps will remain:
 
 | Source | Gap | Addressable? |
 |--------|-----|-------------|
-| SIMD vectorization | 4–8× on FP loops | Phase 4 |
-| Loop unrolling | 1.3–2× on tight loops | Phase 3 |
-| Graph-coloring register allocation | ~1.1× on register-pressure code | Future Phase 6 |
+| SIMD vectorization | 4–8× on FP loops | Phase 5 |
+| Loop unrolling | 1.3–2× on tight loops | Phase 4 |
+| Graph-coloring register allocation | ~1.1× on register-pressure code | Future Phase 7 |
 | Link-time optimization (LTO) | ~1.1× general | Future |
 | Whole-program devirtualization | negligible for C | N/A |
 

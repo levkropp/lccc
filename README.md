@@ -1,7 +1,7 @@
 # LCCC — Lev's Claude's C Compiler
 
 > An optimized fork of [CCC](https://github.com/anthropics/claudes-c-compiler) with a two-pass
-> linear-scan register allocator. **+20–25% faster** on register-pressure code vs upstream.
+> linear-scan register allocator and phi-copy stack coalescing. **+30–40% faster** on register-pressure code vs upstream.
 
 **[Documentation](https://levkropp.github.io/lccc/)** ·
 **[Benchmarks](#benchmarks)** ·
@@ -17,8 +17,9 @@ capable of compiling real projects — PostgreSQL, SQLite, Redis, the Linux kern
 RISC-V 64, and i686, with its own assembler and linker.
 
 LCCC is a performance fork. Phase 2 replaces CCC's three-phase greedy register allocator with a proper
-two-pass linear-scan allocator (Poletto & Sarkar 1999), yielding +20–25% speedups on
-register-pressure code while keeping all 500 upstream tests green.
+two-pass linear-scan allocator (Poletto & Sarkar 1999). Phase 3 adds tail-call elimination and
+phi-copy stack slot coalescing, together yielding +30–40% speedups on
+register-pressure code while keeping all 508 upstream tests green.
 
 ```
 C source
@@ -47,14 +48,17 @@ All outputs are byte-identical to GCC.
 
 | Benchmark | LCCC | CCC | GCC -O2 | vs CCC | vs GCC |
 |-----------|-----:|----:|--------:|:------:|:------:|
-| `arith_loop` — 32-var arithmetic, 10 M iters | **0.124 s** | 0.149 s | 0.068 s | **+20% faster** | 1.83× slower |
-| `sieve` — primes to 10 M | **0.036 s** | 0.045 s | 0.025 s | **+25% faster** | 1.46× slower |
-| `qsort` — sort 1 M integers | 0.096 s | 0.095 s | 0.087 s | ≈ equal | 1.10× slower |
-| `fib(40)` — recursive Fibonacci | 0.352 s | 0.354 s | 0.095 s | ≈ equal | 3.70× slower |
-| `matmul` — 256×256 double | 0.028 s | 0.029 s | 0.003 s | ≈ equal | 7.91× slower |
+| `arith_loop` — 32-var arithmetic, 10 M iters | **0.104 s** | 0.147 s | 0.068 s | **+41% faster** | 1.53× slower |
+| `sieve` — primes to 10 M | **0.037 s** | 0.044 s | 0.024 s | **+19% faster** | 1.54× slower |
+| `qsort` — sort 1 M integers | 0.098 s | 0.096 s | 0.087 s | ≈ equal | 1.13× slower |
+| `fib(40)` — recursive Fibonacci | 0.352 s | 0.355 s | 0.096 s | ≈ equal | 3.67× slower |
+| `matmul` — 256×256 double | 0.027 s | 0.029 s | 0.003 s | ≈ equal | 7.84× slower |
 | `tce_sum` — tail-recursive sum(10M) | **0.008 s** | 1.09 s | 0.008 s | **139× faster** | ≈ equal |
 
-The gains on `arith_loop` and `sieve` come directly from keeping more loop variables in registers.
+The gain on `arith_loop` comes from two sources: linear-scan register allocation keeps more loop
+variables in registers, and phi-copy stack coalescing eliminates ~20 redundant stack-to-stack
+copies per iteration (from phi elimination's double-slot pattern).
+The `sieve` gain comes from linear scan keeping the inner-loop counter in a register.
 The `tce_sum` gain comes from tail-call elimination: LCCC converts the 10M recursive calls into a
 loop, matching GCC. CCC executes 10M actual stack frames.
 The `matmul` gap is GCC's AVX2 auto-vectorization — a Phase 4 target.
@@ -128,6 +132,33 @@ resulting loop. On `sum(10000000, 0)`: LCCC finishes in 8 ms; CCC takes 1.09 s.
 
 The pass lives in [`src/passes/tail_call_elim.rs`](src/passes/tail_call_elim.rs) and runs once
 after inlining, before the main optimization loop.
+
+---
+
+## Phi-copy stack slot coalescing
+
+When CCC's phi elimination lowers SSA phi nodes to Copy instructions, it creates a
+"double-slot" problem for spilled loop variables: both the phi destination (`%i`) and
+its backedge update (`%i_next`) get separate stack slots, with the loop body copying
+one to the other on every iteration.
+
+For a 32-variable loop at `-O2`, this produces ~20 redundant stack-to-stack copies per
+iteration (`movq mem, %rax; movq %rax, mem`), adding measurable overhead.
+
+**Root cause:** standard copy coalescing refused to merge these because `%i` is
+multi-defined (phi elimination creates one `Copy { dest: %i, src: ... }` per predecessor
+block), and `%i_next` is used in a different block than where the copy appears.
+
+**Fix:** For the phi-copy pattern — where `%i_next` is defined and consumed in the same
+backedge block (sole use = the copy), but `%i` is used cross-block — alias in the
+*reversed* direction: `%i_next` borrows `%i`'s slot. Since `%i_next`'s only use is the
+copy, and `%i`'s slot is already live across all of `%i`'s uses (including other blocks),
+this is safe. The backedge copy becomes a same-slot no-op and is dropped by the code
+generator (`generate_copy` checks `dest_slot == src_slot`).
+
+Result on `arith_loop` (32 spilled variables): 0.124 s → 0.104 s (**+19% additional speedup**).
+
+The analysis lives in [`src/backend/stack_layout/copy_coalescing.rs`](src/backend/stack_layout/copy_coalescing.rs).
 
 ---
 
@@ -217,9 +248,10 @@ docs/           Jekyll documentation site source
 | 1 | Register allocator analysis & design | ✅ Complete | (prerequisite) |
 | 2 | Linear-scan register allocator | ✅ Complete | **+20–25% on reg-pressure code** |
 | 3a | Tail-call-to-loop elimination (TCE) | ✅ Complete | **139× on accumulator recursion** |
-| 3b | Loop unrolling | Planned | ~1.5–2× on loop-heavy code |
-| 4 | SIMD / auto-vectorization (AVX2) | Planned | ~4–8× on FP-heavy code |
-| 5 | Profile-guided optimization (PGO) | Planned | ~1.2–1.5× general |
+| 3b | Phi-copy stack slot coalescing | ✅ Complete | **+additional 20% on loop-heavy code** |
+| 4 | Loop unrolling | Planned | ~1.5–2× on loop-heavy code |
+| 5 | SIMD / auto-vectorization (AVX2) | Planned | ~4–8× on FP-heavy code |
+| 6 | Profile-guided optimization (PGO) | Planned | ~1.2–1.5× general |
 
 The goal is not to beat GCC — it's to make CCC-compiled programs fast enough for real systems
 software, targeting within ~1.5× of GCC on typical workloads.
@@ -229,7 +261,7 @@ software, targeting within ~1.5× of GCC on typical workloads.
 ## Testing
 
 ```bash
-# Unit tests (500 pass)
+# Unit tests (508 pass)
 cargo test --lib
 
 # Integration tests

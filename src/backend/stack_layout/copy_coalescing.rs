@@ -55,13 +55,15 @@ pub(super) fn build_copy_alias_map(
 
     // Collect Copy instructions eligible for aliasing.
     let mut raw_aliases: Vec<(u32, u32)> = Vec::new();
-    for block in &func.blocks {
+    for (blk_idx, block) in func.blocks.iter().enumerate() {
         for inst in &block.instructions {
             if let Instruction::Copy { dest, src: Operand::Value(src_val) } = inst {
                 let d = dest.0;
                 let s = src_val.0;
-                // Exclude multi-def values and register-assigned values.
-                if multi_def_values.contains(&d) || multi_def_values.contains(&s) {
+                // Never alias a multi-defined source (the aliased value must be
+                // single-def; multi-def values have complex liveness that makes
+                // slot sharing unsafe).
+                if multi_def_values.contains(&s) {
                     continue;
                 }
                 if reg_assigned.contains_key(&d) || reg_assigned.contains_key(&s) {
@@ -71,15 +73,41 @@ pub(super) fn build_copy_alias_map(
                 if use_count.get(&s).copied().unwrap_or(0) != 1 {
                     continue;
                 }
-                // Only coalesce if dest's uses are in the same block as source's definition.
-                // Cross-block aliasing is unsafe: the root's liveness interval doesn't
-                // account for the alias's uses in other blocks.
-                if let Some(&src_def_blk) = def_block.get(&s) {
-                    if let Some(dest_use_blocks) = use_blocks_map.get(&d) {
-                        if dest_use_blocks.iter().any(|&b| b != src_def_blk) {
-                            continue;
-                        }
-                    }
+
+                let src_def_blk = def_block.get(&s).copied();
+                let src_in_copy_block = src_def_blk == Some(blk_idx);
+                let dest_cross_block = use_blocks_map.get(&d)
+                    .map(|blks| blks.iter().any(|&b| b != blk_idx))
+                    .unwrap_or(false);
+
+                if src_in_copy_block && dest_cross_block {
+                    // Phi-copy pattern: src is defined and killed in this block
+                    // (sole use = this copy), but dest is used in other blocks.
+                    //
+                    // dest may be multi-defined (phi elimination creates one Copy
+                    // per predecessor that defines the phi dest). That's fine here
+                    // because dest is the slot OWNER (root), not the aliased value.
+                    // All definitions of dest write to the same slot, making the
+                    // backedge copy a same-slot no-op.
+                    //
+                    // Reversed aliasing (src → dest) is safe: src gets dest's slot,
+                    // which is already live across all of dest's uses. After aliasing,
+                    // the copy becomes a same-slot no-op (skipped by generate_copy).
+                    // This eliminates the double-slot pattern that arises from phi
+                    // elimination in loops with spilled variables.
+                    raw_aliases.push((s, d)); // src uses dest's (wider-live) slot
+                    continue;
+                }
+
+                // Standard same-block coalescing: dest uses src's slot.
+                // Dest must not be multi-defined (would make slot-sharing unsafe
+                // for the standard direction), and dest's uses must all be in the
+                // same block as source's definition.
+                if multi_def_values.contains(&d) {
+                    continue;
+                }
+                if dest_cross_block {
+                    continue;
                 }
                 raw_aliases.push((d, s));
             }

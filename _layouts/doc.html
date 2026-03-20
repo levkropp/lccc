@@ -48,6 +48,13 @@
       </ul>
     </div>
     <div class="sidebar-group">
+      <div class="sidebar-group-title">Updates</div>
+      <ul class="sidebar-nav">
+        <li><a href="{{ '/updates/phase3-tce-and-phi-coalescing' | relative_url }}"
+               {% if page.url contains 'phase3' %}class="active"{% endif %}>Phase 3: TCE + Phi Coalescing</a></li>
+      </ul>
+    </div>
+    <div class="sidebar-group">
       <div class="sidebar-group-title">Performance</div>
       <ul class="sidebar-nav">
         <li><a href="{{ '/docs/benchmarks' | relative_url }}"
