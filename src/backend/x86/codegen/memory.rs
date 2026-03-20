@@ -1,11 +1,191 @@
 //! X86Codegen: memory operations (load, store, memcpy, GEP, stack).
 
-use crate::ir::reexports::{IrConst, Operand, Value};
+use crate::ir::reexports::{IrConst, IrBinOp, Instruction, Operand, Value};
 use crate::common::types::{AddressSpace, IrType};
 use crate::backend::state::{StackSlot, SlotAddr};
 use super::emit::{X86Codegen, phys_reg_name};
 
 impl X86Codegen {
+    /// Try to emit a store using x86-64 SIB indexed addressing mode.
+    /// Returns true if successful, false to fall back to normal codegen.
+    ///
+    /// Detects patterns like: `store val, (base + index*scale)` where:
+    /// - base is in a register
+    /// - index is in a register
+    /// - scale is 1, 2, 4, or 8
+    ///
+    /// Emits: `mov %src, (%base_reg,%index_reg,scale)`
+    fn try_emit_indexed_store(&mut self, val: &Operand, ptr: &Value, ty: IrType) -> bool {
+        // Check if ptr is defined by a GEP instruction
+        let gep_inst = match self.get_defining_instruction(ptr.0) {
+            Some(inst) => inst,
+            None => return false,
+        };
+
+        let (gep_base, gep_offset) = match gep_inst {
+            Instruction::GetElementPtr { base, offset, .. } => (base, offset),
+            _ => return false,
+        };
+
+        // Check if offset is a Value (not a constant - those are handled by existing GEP folding)
+        let offset_val = match gep_offset {
+            Operand::Value(v) => v,
+            _ => return false,
+        };
+
+        // Check if offset is defined by a multiply or shift (i*scale pattern)
+        let (index_val, scale) = match self.get_defining_instruction(offset_val.0) {
+            Some(Instruction::BinOp { op: IrBinOp::Mul, lhs: Operand::Value(idx), rhs: Operand::Const(c), .. }) => {
+                // Pattern: index * const
+                let scale_val = match c.to_i64() {
+                    Some(v) => v,
+                    None => return false,
+                };
+                if !Self::is_valid_sib_scale(scale_val) {
+                    return false;
+                }
+                (idx, scale_val)
+            }
+            Some(Instruction::BinOp { op: IrBinOp::Shl, lhs: Operand::Value(idx), rhs: Operand::Const(c), .. }) => {
+                // Pattern: index << shift_amount (equivalent to index * 2^shift)
+                let shift = match c.to_i64() {
+                    Some(v) if v >= 0 && v <= 3 => v,  // shift of 0-3 gives scale of 1,2,4,8
+                    _ => return false,
+                };
+                let scale_val = 1i64 << shift;
+                (idx, scale_val)
+            }
+            _ => return false,
+        };
+
+        // Check if base and index both have register assignments
+        let base_reg = match self.reg_assignments.get(&gep_base.0) {
+            Some(&reg) => phys_reg_name(reg),
+            None => return false,
+        };
+
+        let index_reg = match self.reg_assignments.get(&index_val.0) {
+            Some(&reg) => phys_reg_name(reg),
+            None => return false,
+        };
+
+        // Load the value to be stored into the accumulator/xmm register
+        self.operand_to_rax(val);
+
+        // Determine store instruction and source register based on type
+        let (store_instr, src_reg) = match ty {
+            IrType::F64 => {
+                // Convert from rax to xmm0
+                self.state.emit("    movq %rax, %xmm0");
+                ("movsd", "%xmm0")
+            }
+            IrType::F32 => {
+                // Convert from rax to xmm0
+                self.state.emit("    movd %eax, %xmm0");
+                ("movss", "%xmm0")
+            }
+            IrType::I64 | IrType::U64 => ("movq", "%rax"),
+            IrType::I32 | IrType::U32 => ("movl", "%eax"),
+            IrType::I16 | IrType::U16 => ("movw", "%ax"),
+            IrType::I8 | IrType::U8 => ("movb", "%al"),
+            _ => return false,  // Unsupported type for indexed addressing
+        };
+
+        // Emit indexed store: movX %src, (%base,%index,scale)
+        self.state.emit_fmt(format_args!(
+            "    {} {}, (%{},%{},{})",
+            store_instr, src_reg, base_reg, index_reg, scale
+        ));
+
+        true
+    }
+
+    /// Try to emit a load using x86-64 SIB indexed addressing mode.
+    /// Returns true if successful, false to fall back to normal codegen.
+    ///
+    /// Detects patterns like: `load (base + index*scale)` where:
+    /// - base is in a register
+    /// - index is in a register
+    /// - scale is 1, 2, 4, or 8
+    ///
+    /// Emits: `mov (%base_reg,%index_reg,scale), %dest`
+    fn try_emit_indexed_load(&mut self, dest: &Value, ptr: &Value, ty: IrType) -> bool {
+        // Check if ptr is defined by a GEP instruction
+        let gep_inst = match self.get_defining_instruction(ptr.0) {
+            Some(inst) => inst,
+            None => return false,
+        };
+
+        let (gep_base, gep_offset) = match gep_inst {
+            Instruction::GetElementPtr { base, offset, .. } => (base, offset),
+            _ => return false,
+        };
+
+        // Check if offset is a Value (not a constant - those are handled by existing GEP folding)
+        let offset_val = match gep_offset {
+            Operand::Value(v) => v,
+            _ => return false,
+        };
+
+        // Check if offset is defined by a multiply or shift (i*scale pattern)
+        let (index_val, scale) = match self.get_defining_instruction(offset_val.0) {
+            Some(Instruction::BinOp { op: IrBinOp::Mul, lhs: Operand::Value(idx), rhs: Operand::Const(c), .. }) => {
+                // Pattern: index * const
+                let scale_val = match c.to_i64() {
+                    Some(v) => v,
+                    None => return false,
+                };
+                if !Self::is_valid_sib_scale(scale_val) {
+                    return false;
+                }
+                (idx, scale_val)
+            }
+            Some(Instruction::BinOp { op: IrBinOp::Shl, lhs: Operand::Value(idx), rhs: Operand::Const(c), .. }) => {
+                // Pattern: index << shift_amount (equivalent to index * 2^shift)
+                let shift = match c.to_i64() {
+                    Some(v) if v >= 0 && v <= 3 => v,  // shift of 0-3 gives scale of 1,2,4,8
+                    _ => return false,
+                };
+                let scale_val = 1i64 << shift;
+                (idx, scale_val)
+            }
+            _ => return false,
+        };
+
+        // Check if base and index both have register assignments
+        let base_reg = match self.reg_assignments.get(&gep_base.0) {
+            Some(&reg) => phys_reg_name(reg),
+            None => return false,
+        };
+
+        let index_reg = match self.reg_assignments.get(&index_val.0) {
+            Some(&reg) => phys_reg_name(reg),
+            None => return false,
+        };
+
+        // Determine load instruction and destination register based on type
+        let (load_instr, dest_reg) = match ty {
+            IrType::F64 => ("movsd", "%xmm0"),
+            IrType::F32 => ("movss", "%xmm0"),
+            IrType::I64 | IrType::U64 => ("movq", "%rax"),
+            IrType::I32 | IrType::U32 => ("movl", "%eax"),
+            IrType::I16 | IrType::U16 => ("movzwl", "%eax"),
+            IrType::I8 | IrType::U8 => ("movzbl", "%eax"),
+            _ => return false,  // Unsupported type for indexed addressing
+        };
+
+        // Emit indexed load: movX (%base,%index,scale), %dest
+        self.state.emit_fmt(format_args!(
+            "    {} (%{},%{},{}), {}",
+            load_instr, base_reg, index_reg, scale, dest_reg
+        ));
+
+        // Update register cache
+        self.state.reg_cache.set_acc(dest.0, false);
+
+        true
+    }
+
     // ---- Store/Load overrides ----
 
     pub(super) fn emit_store_impl(&mut self, val: &Operand, ptr: &Value, ty: IrType) {
@@ -37,6 +217,14 @@ impl X86Codegen {
             }
             return;
         }
+
+        // Try indexed addressing mode first (Phase 9 optimization)
+        if self.try_emit_indexed_store(val, ptr, ty) {
+            // Indexed addressing succeeded - we're done!
+            return;
+        }
+
+        // Fall back to default store logic
         crate::backend::traits::emit_store_default(self, val, ptr, ty);
     }
 
@@ -49,6 +237,16 @@ impl X86Codegen {
             }
             return;
         }
+
+        // Try indexed addressing mode first (Phase 9 optimization)
+        if self.try_emit_indexed_load(dest, ptr, ty) {
+            // Indexed addressing succeeded - we're done!
+            // The accumulator already holds dest's value (cache updated in try_emit_indexed_load)
+            self.store_rax_to(dest);
+            return;
+        }
+
+        // Fall back to default load logic
         crate::backend::traits::emit_load_default(self, dest, ptr, ty);
     }
 

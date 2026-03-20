@@ -10,6 +10,9 @@ use super::emit::{X86Codegen, X86_CALLEE_SAVED, X86_CALLER_SAVED, phys_reg_name,
 
 impl X86Codegen {
     pub(super) fn calculate_stack_space_impl(&mut self, func: &IrFunction) -> i64 {
+        // Store function pointer for indexed addressing detection
+        self.current_func = Some(func as *const IrFunction);
+
         // Track variadic function info
         self.is_variadic = func.is_variadic;
         // Count named params using the shared ABI classification, so this

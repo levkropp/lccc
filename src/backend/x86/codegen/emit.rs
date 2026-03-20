@@ -189,6 +189,8 @@ pub struct X86Codegen {
     /// Whether SSE is disabled (-mno-sse). When true, variadic prologues skip
     /// XMM saves and va_start sets fp_offset to overflow immediately.
     pub(super) no_sse: bool,
+    /// Current function being generated (needed for indexed addressing detection).
+    pub(super) current_func: Option<*const IrFunction>,
 }
 
 impl X86Codegen {
@@ -208,6 +210,7 @@ impl X86Codegen {
             reg_assignments: FxHashMap::default(),
             used_callee_saved: Vec::new(),
             no_sse: false,
+            current_func: None,
         }
     }
 
@@ -495,6 +498,39 @@ impl X86Codegen {
         }
         // After storing to dest, %rax still holds dest's value
         self.state.reg_cache.set_acc(dest.0, false);
+    }
+
+    /// Check if a scale value is valid for x86-64 SIB (Scale-Index-Base) encoding.
+    /// Valid scales are 1, 2, 4, or 8 (encoded in 2 bits).
+    pub(super) fn is_valid_sib_scale(scale: i64) -> bool {
+        matches!(scale, 1 | 2 | 4 | 8)
+    }
+
+    /// Helper function to get the instruction that defines a value.
+    /// Returns None if the value isn't defined by an instruction in the current function.
+    pub(super) fn get_defining_instruction(&self, val_id: u32) -> Option<&crate::ir::reexports::Instruction> {
+        let func_ptr = self.current_func?;
+        let func = unsafe { &*func_ptr };
+
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                use crate::ir::reexports::Instruction;
+                let dest_id = match inst {
+                    Instruction::BinOp { dest, .. } => Some(dest.0),
+                    Instruction::UnaryOp { dest, .. } => Some(dest.0),
+                    Instruction::Cast { dest, .. } => Some(dest.0),
+                    Instruction::GetElementPtr { dest, .. } => Some(dest.0),
+                    Instruction::Load { dest, .. } => Some(dest.0),
+                    Instruction::Cmp { dest, .. } => Some(dest.0),
+                    _ => None,
+                };
+
+                if dest_id == Some(val_id) {
+                    return Some(inst);
+                }
+            }
+        }
+        None
     }
 
     /// Load an operand directly into %rcx, avoiding the push/pop pattern.
