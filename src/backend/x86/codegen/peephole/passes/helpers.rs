@@ -97,9 +97,13 @@ pub(super) fn has_implicit_reg_usage(trimmed: &str) -> bool {
     if nb.len() < 3 {
         return false;
     }
-    (nb[0] == b'd' && nb[1] == b'i' && nb[2] == b'v') || // div, divl, divq
+    // Integer div/mul use implicit rax:rdx. Exclude SSE variants (divsd/mulsd/etc.)
+    // which start with div[sp] or mul[sp] — these have no implicit register usage.
+    (nb[0] == b'd' && nb[1] == b'i' && nb[2] == b'v'
+        && !(nb.len() > 3 && (nb[3] == b's' || nb[3] == b'p'))) || // div, divl, divq (not divsd/divpd)
     (nb[0] == b'i' && nb[1] == b'd' && nb[2] == b'i') || // idiv
-    (nb[0] == b'm' && nb[1] == b'u' && nb[2] == b'l') || // mul, mulq
+    (nb[0] == b'm' && nb[1] == b'u' && nb[2] == b'l'
+        && !(nb.len() > 3 && (nb[3] == b's' || nb[3] == b'p'))) || // mul, mulq (not mulsd/mulpd)
     trimmed.starts_with("cltq") || // sign-extend eax -> rax (implicit read+write rax)
     trimmed.starts_with("cbw") ||  // sign-extend al -> ax (implicit read+write rax)
     trimmed.starts_with("cqto") || trimmed.starts_with("cdq") ||
