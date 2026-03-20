@@ -27,6 +27,7 @@ mod resolve_asm;
 pub(crate) mod simplify;
 pub(crate) mod loop_unroll;
 pub(crate) mod tail_call_elim;
+pub(crate) mod vectorize;
 
 use crate::ir::analysis::CfgAnalysis;
 use crate::ir::reexports::{IrFunction, IrModule};
@@ -393,6 +394,16 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
             total_changes_excl_dce += n;
         }
 
+        // Phase 2b-vec: SSE2 vectorization — iter 0 only, EARLY in pipeline.
+        // Run before GVN/LICM/etc to catch IR in simpler state.
+        // Pass name for CCC_DISABLE_PASSES: "vectorize"
+        if iter == 0 && !disabled.contains("vectorize") {
+            let n = timed_pass!("vectorize",
+                run_on_visited(module, &dirty, &mut changed, vectorize::vectorize_function));
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
         // Phase 2c: Integer narrowing
         // Upstream: copy_prop (propagated values expose narrowing)
         if !dis.narrow && should_run!(2, 1) {
@@ -511,6 +522,7 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
             total_changes += ipcp_changes;
             total_changes_excl_dce += ipcp_changes;
         }
+
 
         if iter == 0 {
             iter0_total_changes = total_changes_excl_dce;

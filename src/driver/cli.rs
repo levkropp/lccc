@@ -89,9 +89,9 @@ impl Driver {
                     // Meson detects GCC by checking for "Free Software Foundation"
                     // in the --version output. We claim GCC 14.2.0 compatibility
                     // (matching our __GNUC__/__GNUC_MINOR__/__GNUC_PATCHLEVEL__).
-                    println!("ccc (Claude's C Compiler, GCC-compatible) 14.2.0");
+                    println!("lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0");
                     println!("GCC is maintained by the Free Software Foundation, Inc.");
-                    println!("This program was written by Claude Opus 4.6;");
+                    println!("This program is a fork of CCC (written by Claude Opus 4.6);");
                     println!("It is not intended for production use.");
                     // Show which GCC fallback features are enabled (if any)
                     let mut features = Vec::new();
@@ -112,7 +112,7 @@ impl Driver {
                     return Ok(true);
                 }
                 "-v" if args.len() == 2 => {
-                    println!("ccc (Claude's C Compiler, GCC-compatible) 14.2.0");
+                    println!("lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0");
                     println!("Target: {}", target.triple());
                     return Ok(true);
                 }
