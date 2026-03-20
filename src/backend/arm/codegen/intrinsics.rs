@@ -274,7 +274,7 @@ impl ArmCodegen {
             | IntrinsicOp::Pinsrd128 | IntrinsicOp::Pextrd128
             | IntrinsicOp::Pinsrb128 | IntrinsicOp::Pextrb128
             | IntrinsicOp::Pinsrq128 | IntrinsicOp::Pextrq128
-            | IntrinsicOp::FmaF64x2 => {
+            | IntrinsicOp::FmaF64x2 | IntrinsicOp::FmaF64x4 => {
                 // x86-only: zero dest if present
                 if let Some(dptr) = dest_ptr {
                     if let Some(slot) = self.state.get_slot(dptr.0) {

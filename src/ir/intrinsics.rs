@@ -76,6 +76,13 @@ pub enum IntrinsicOp {
     /// args[1]: pointer to 2×F64 (one SSE register worth)
     /// NOT pure: modifies memory at dest_ptr.
     FmaF64x2,
+    /// Packed double FMA for AVX2 4-wide vectorized loops.
+    /// Computes: *dest_ptr[0..4] += broadcast(*args[0]) * *args[1][0..4]
+    /// dest_ptr: pointer to 4×F64 accumulator (read+write, 32 bytes)
+    /// args[0]: pointer to scalar F64 (broadcast to all 4 lanes)
+    /// args[1]: pointer to 4×F64 source vector
+    /// NOT pure: modifies memory at dest_ptr.
+    FmaF64x4,
     /// AES-NI: aesenc (single round encrypt)
     /// args[0] = state ptr, args[1] = round key ptr; dest_ptr = result ptr
     Aesenc128,

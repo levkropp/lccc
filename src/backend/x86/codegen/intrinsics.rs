@@ -576,6 +576,25 @@ impl X86Codegen {
                     self.state.emit("    movupd %xmm0, (%rax)");      // store back
                 }
             }
+            IntrinsicOp::FmaF64x4 => {
+                // dest_ptr[0..4] += broadcast(args[0]) * args[1][0..4]
+                // args[0] = A pointer (scalar F64, broadcast to all 4 lanes)
+                // args[1] = B pointer (4×F64)
+                // dest_ptr = C pointer (read+write, 4×F64)
+                if let Some(c_ptr) = dest_ptr {
+                    self.operand_to_reg(&args[0], "rcx");      // A ptr → %rcx
+                    self.operand_to_reg(&args[1], "rdx");      // B ptr → %rdx
+                    self.value_to_reg(c_ptr, "rax");           // C ptr → %rax
+
+                    // AVX2 instructions (VEX-encoded, 256-bit ymm registers)
+                    self.state.emit("    movsd (%rcx), %xmm1");          // Load A scalar (64-bit)
+                    self.state.emit("    vbroadcastsd %xmm1, %ymm1");    // Broadcast to {A, A, A, A}
+                    self.state.emit("    vmovupd (%rdx), %ymm0");        // Load 4 doubles unaligned
+                    self.state.emit("    vmulpd %ymm1, %ymm0, %ymm0");   // ymm0 = A * {B[j..j+3]}
+                    self.state.emit("    vaddpd (%rax), %ymm0, %ymm0");  // ymm0 += {C[j..j+3]}
+                    self.state.emit("    vmovupd %ymm0, (%rax)");        // Write 4 results back
+                }
+            }
         }
     }
 }
