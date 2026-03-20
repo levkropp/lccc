@@ -13,6 +13,9 @@ impl X86Codegen {
         // Store function pointer for indexed addressing detection
         self.current_func = Some(func as *const IrFunction);
 
+        // Analyze IVSR patterns for Phase 9b indexed addressing optimization
+        self.analyze_ivsr_pointers(func);
+
         // Track variadic function info
         self.is_variadic = func.is_variadic;
         // Count named params using the shared ABI classification, so this
