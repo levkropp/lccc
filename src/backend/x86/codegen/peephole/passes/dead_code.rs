@@ -14,7 +14,7 @@ use super::helpers::*;
 // ── Dead register move elimination ──────────────────────────────────────────
 
 /// Maximum forward scan window for dead register move detection.
-const DEAD_MOVE_WINDOW: usize = 24;
+const DEAD_MOVE_WINDOW: usize = 48;
 
 pub(super) fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
     let mut changed = false;
@@ -67,6 +67,75 @@ pub(super) fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]
             }
 
             if infos[j].is_barrier() {
+                // For unconditional Jmp: follow the target and continue scanning.
+                // If the register is overwritten before being read at the target,
+                // it's dead in the current block. This handles loop back-edges.
+                if infos[j].kind == LineKind::Jmp {
+                    let jmp_text = infos[j].trimmed(store.get(j));
+                    if jmp_text.starts_with("jmp ") {
+                        let target = &jmp_text[4..]; // e.g., ".LBB9"
+                        let target_label = format!("{}:", target);
+                        // Find the label in the infos array.
+                        for lbl in 0..len {
+                            if infos[lbl].kind == LineKind::Label {
+                                let lbl_text = infos[lbl].trimmed(store.get(lbl));
+                                if lbl_text == target_label {
+                                    // Continue scanning from just after the label.
+                                    // Follow through CondJmp fall-throughs (the
+                                    // register must be dead on ALL successor paths).
+                                    let mut m = lbl + 1;
+                                    let scan_end2 = (m + DEAD_MOVE_WINDOW).min(len);
+                                    let mut found_dead = false;
+                                    while m < scan_end2 {
+                                        if infos[m].is_nop() { m += 1; continue; }
+                                        if infos[m].is_barrier() {
+                                            // CondJmp: continue scanning the fall-through.
+                                            if infos[m].kind == LineKind::CondJmp {
+                                                m += 1;
+                                                continue;
+                                            }
+                                            // Label: skip it and keep scanning.
+                                            if infos[m].kind == LineKind::Label {
+                                                m += 1;
+                                                continue;
+                                            }
+                                            break;
+                                        }
+                                        let writes = get_dest_reg(&infos[m]) == dst_reg;
+                                        let refs = infos[m].reg_refs & dst_mask != 0;
+                                        if writes {
+                                            // Check if pure write (not read-modify-write).
+                                            // reg_refs includes dest, so refs can be true
+                                            // even for pure writes like "movq %r8, %rcx".
+                                            let also_reads = if !refs {
+                                                false
+                                            } else {
+                                                match infos[m].kind {
+                                                    LineKind::LoadRbp { .. } | LineKind::Pop { .. } => false,
+                                                    _ => {
+                                                        let t = infos[m].trimmed(store.get(m));
+                                                        if let Some(cp) = t.rfind(", %") {
+                                                            let src = &t[..cp];
+                                                            REG_NAMES.iter().any(|row|
+                                                                src.contains(row[dst_reg as usize])
+                                                            )
+                                                        } else { true }
+                                                    }
+                                                }
+                                            };
+                                            if !also_reads { found_dead = true; }
+                                            break;
+                                        }
+                                        if refs { break; } // read before write → not dead
+                                        m += 1;
+                                    }
+                                    dead = found_dead;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
                 break;
             }
 

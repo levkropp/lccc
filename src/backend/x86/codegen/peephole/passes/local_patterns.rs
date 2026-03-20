@@ -801,6 +801,230 @@ pub(super) fn eliminate_fp_spill_around_load(
     changed
 }
 
+// ── Loop-invariant FP stack promotion ────────────────────────────────────────
+//
+// Promotes a loop-invariant `movsd -O(%rbp), %xmm0` to a register:
+//   Preheader: movq %rax, -O(%rbp) → movq %rax, %xmm2
+//   Loop body: movsd -O(%rbp), %xmm0 → movapd %xmm2, %xmm0
+//
+// Conditions:
+//   - The inner loop has a back-edge jmp to a label above
+//   - -O(%rbp) is not written inside the loop body
+//   - xmm2 is not used inside the loop body
+//   - The preheader (block before loop header) stores to -O(%rbp)
+//
+pub(super) fn promote_loop_invariant_fp_load(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    let mut changed = false;
+
+    // Find loop back-edges: jmp to a label that appears before the jmp.
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() { i += 1; continue; }
+        if infos[i].kind != LineKind::Jmp { i += 1; continue; }
+        let jmp_text = infos[i].trimmed(store.get(i));
+        if !jmp_text.starts_with("jmp ") { i += 1; continue; }
+        let target = &jmp_text[4..];
+        let target_label = format!("{}:", target);
+
+        // Find the target label (must be before the jmp = back-edge).
+        let mut header_pos = None;
+        for lbl in 0..i {
+            if infos[lbl].kind == LineKind::Label {
+                if infos[lbl].trimmed(store.get(lbl)) == target_label {
+                    header_pos = Some(lbl);
+                    break;
+                }
+            }
+        }
+        let header = match header_pos {
+            Some(h) => h,
+            None => { i += 1; continue; }
+        };
+
+        // Loop body is [header..=i]. Find movsd -O(%rbp), %xmm0 in body.
+        let mut body_start = header;
+        // Skip past header's condition check to the body label.
+        for pos in header + 1..i {
+            if infos[pos].kind == LineKind::Label {
+                body_start = pos;
+                break;
+            }
+        }
+
+        // Scan body for "movsd -O(%rbp), %xmm0" candidates.
+        for pos in body_start + 1..i {
+            if infos[pos].is_nop() { continue; }
+            let t = infos[pos].trimmed(store.get(pos));
+            if !t.starts_with("movsd ") || !t.ends_with(", %xmm0") { continue; }
+            // Check it's a stack load: "movsd -N(%rbp), %xmm0"
+            let src = &t[6..t.len() - 7]; // between "movsd " and ", %xmm0"
+            if !src.ends_with("(%rbp)") { continue; }
+            let offset_str = src.to_string();
+
+            // Check -O(%rbp) is NOT written in the loop body [body_start..=i].
+            let mut written_in_body = false;
+            for chk in body_start + 1..i {
+                if infos[chk].is_nop() { continue; }
+                if let LineKind::StoreRbp { offset: o, .. } = infos[chk].kind {
+                    let s = format!("{}(%rbp)", o);
+                    if s == offset_str { written_in_body = true; break; }
+                }
+                // Also check text for movsd stores to this offset.
+                let ct = infos[chk].trimmed(store.get(chk));
+                if ct.ends_with(&offset_str) && ct.starts_with("movsd ") {
+                    written_in_body = true; break;
+                }
+            }
+            if written_in_body { continue; }
+
+            // Check xmm2 is not used anywhere in [header..=i].
+            let mut xmm2_used = false;
+            for chk in header..=i {
+                if infos[chk].is_nop() { continue; }
+                let ct = infos[chk].trimmed(store.get(chk));
+                if ct.contains("%xmm2") { xmm2_used = true; break; }
+            }
+            if xmm2_used { continue; }
+
+            // Find preheader store: "movq %rax, -O(%rbp)" just before the header.
+            // Scan backward from header for a StoreRbp to the same offset.
+            let mut preheader_store = None;
+            let mut ph = if header > 0 { header - 1 } else { 0 };
+            let mut ph_count = 0;
+            while ph_count < 20 {
+                if infos[ph].is_nop() {
+                    if ph == 0 { break; }
+                    ph -= 1;
+                    continue;
+                }
+                if infos[ph].kind == LineKind::Label { break; } // hit another label
+                if let LineKind::StoreRbp { reg: 0, offset: o, .. } = infos[ph].kind {
+                    let s = format!("{}(%rbp)", o);
+                    if s == offset_str {
+                        preheader_store = Some(ph);
+                        break;
+                    }
+                }
+                if ph == 0 { break; }
+                ph -= 1;
+                ph_count += 1;
+            }
+
+            if let Some(ph_pos) = preheader_store {
+                // Replace preheader store: "movq %rax, -O(%rbp)" → "movq %rax, %xmm2"
+                let new_ph = "    movq %rax, %xmm2".to_string();
+                replace_line(store, &mut infos[ph_pos], ph_pos, new_ph);
+                // Replace body load: "movsd -O(%rbp), %xmm0" → "movapd %xmm2, %xmm0"
+                let new_body = "    movapd %xmm2, %xmm0".to_string();
+                replace_line(store, &mut infos[pos], pos, new_body);
+                changed = true;
+                break; // Only promote one per loop for now.
+            }
+        }
+
+        i += 1;
+    }
+    changed
+}
+
+// ── Copy + operation fusion ──────────────────────────────────────────────────
+//
+// Fuses a register copy with the following operation that reads and writes
+// the destination, when the copy is the sole producer:
+//
+//   movq %A, %B  +  leaq disp(%B), %B   →  leaq disp(%A), %B    (copy+lea)
+//   movq %A, %B  +  addq $imm, %B        →  leaq imm(%A), %B     (copy+add)
+//   movq %A, %B  +  shlq $N, %B          →  leaq (,%A,2^N), %B   (copy+shl, N=1..3)
+//
+// The addq→leaq rewrite drops flags. We verify the next non-NOP instruction
+// sets its own flags (doesn't consume ours) before applying.
+//
+pub(super) fn fuse_copy_and_operation(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+
+    while i < len {
+        if infos[i].is_nop() { i += 1; continue; }
+
+        // Match: "movq %<src>, %<dst>" where src != dst, both are GP regs.
+        if let LineKind::Other { dest_reg } = infos[i].kind {
+            if dest_reg > 15 { i += 1; continue; }
+            let line_i = infos[i].trimmed(store.get(i));
+            if !line_i.starts_with("movq %") { i += 1; continue; }
+
+            // Parse "movq %<src>, %<dst>"
+            if let Some(comma) = line_i.find(", %") {
+                let src_reg = &line_i[6..comma]; // after "movq %"
+                let dst_reg_str = &line_i[comma + 3..]; // after ", %"
+                if src_reg == dst_reg_str || src_reg.contains('(') { i += 1; continue; }
+
+                let mut j = i + 1;
+                while j < len && j < i + 4 && infos[j].is_nop() { j += 1; }
+                if j >= len { i += 1; continue; }
+                let line_j = infos[j].trimmed(store.get(j));
+
+                // Sub-pattern: leaq disp(%<dst>), %<dst> → leaq disp(%<src>), %<dst>
+                let lea_prefix = format!("leaq ");
+                let lea_base = format!("(%{}), %{}", dst_reg_str, dst_reg_str);
+                if line_j.starts_with(&lea_prefix) && line_j.ends_with(&format!("), %{}", dst_reg_str)) &&
+                   line_j.contains(&format!("(%{})", dst_reg_str))
+                {
+                    let new_text = format!("    {}", line_j.replace(
+                        &format!("(%{})", dst_reg_str),
+                        &format!("(%{})", src_reg),
+                    ));
+                    mark_nop(&mut infos[i]);
+                    replace_line(store, &mut infos[j], j, new_text);
+                    changed = true;
+                    i = j + 1;
+                    continue;
+                }
+
+                // Sub-pattern: addq $imm, %<dst> → leaq imm(%<src>), %<dst>
+                // Only if flags are not consumed by the next instruction.
+                let add_suffix = format!(", %{}", dst_reg_str);
+                if line_j.starts_with("addq $") && line_j.ends_with(&add_suffix) {
+                    let imm_str = &line_j[6..line_j.len() - add_suffix.len()]; // between "addq $" and ", %dst"
+                    // Check flags safety: next instruction must not read flags.
+                    let mut k = j + 1;
+                    while k < len && infos[k].is_nop() { k += 1; }
+                    let flags_safe = if k >= len { true } else {
+                        let next = infos[k].trimmed(store.get(k));
+                        // Instructions that consume flags: jCC, setCC, adcq, sbbq, cmovc, etc.
+                        // Conservative: if next instruction starts with any of these, bail.
+                        !(next.starts_with("ja") || next.starts_with("jb") ||
+                          next.starts_with("je") || next.starts_with("jn") ||
+                          next.starts_with("jg") || next.starts_with("jl") ||
+                          next.starts_with("js") || next.starts_with("jo") ||
+                          next.starts_with("jc") || next.starts_with("jp") ||
+                          next.starts_with("set") || next.starts_with("adc") ||
+                          next.starts_with("sbb") || next.starts_with("cmov"))
+                    };
+                    if flags_safe {
+                        let new_text = format!("    leaq {}(%{}), %{}", imm_str, src_reg, dst_reg_str);
+                        mark_nop(&mut infos[i]);
+                        replace_line(store, &mut infos[j], j, new_text);
+                        changed = true;
+                        i = j + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        i += 1;
+    }
+    changed
+}
+
 /// Returns true if %rax is live (potentially read) at instruction index `at`.
 /// Conservative: treats "movq %<non-rax>, %rax" as a pure write (not live).
 fn rax_is_live_at(store: &LineStore, infos: &[LineInfo], at: usize, len: usize) -> bool {
