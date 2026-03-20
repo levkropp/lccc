@@ -22,6 +22,7 @@ pub(crate) mod ipcp;
 pub(crate) mod iv_strength_reduce;
 pub(crate) mod licm;
 pub(crate) mod loop_analysis;
+pub(crate) mod univsr;
 pub(crate) mod narrow;
 mod resolve_asm;
 pub(crate) mod simplify;
@@ -153,6 +154,19 @@ fn run_gvn_licm_ivsr_shared(
             }
             if n > 0 {
                 ivsr_total += n;
+                if i < changed.len() { changed[i] = true; }
+            }
+
+            // Run Un-IVSR immediately after IVSR to revert pointer IVs
+            // for targets with indexed addressing (x86-64 SIB).
+            // This must run BEFORE phi elimination so we can still detect
+            // the IVSR pointer phi pattern.
+            let t0 = if time_passes { Some(std::time::Instant::now()) } else { None };
+            let n = univsr::run_univsr(func);
+            if let Some(t0) = t0 {
+                eprintln!("[PASS] iter={} un-ivsr (func {}): {:.4}s ({} changes)", iter, func.name, t0.elapsed().as_secs_f64(), n);
+            }
+            if n > 0 {
                 if i < changed.len() { changed[i] = true; }
             }
         }
