@@ -25,8 +25,8 @@ title: LCCC — Lev's Claude's C Compiler
   <p class="hero-sub">
     An optimized fork of <a href="https://github.com/anthropics/claudes-c-compiler" style="color:var(--amber)">CCC</a>
     — Claude's C Compiler — with a two-pass linear-scan register allocator,
-    tail-call elimination, and phi-copy stack coalescing,
-    targeting x86-64, AArch64, RISC-V 64, and i686.
+    tail-call elimination, phi-copy stack coalescing, loop unrolling, and
+    FP intrinsic lowering, targeting x86-64, AArch64, RISC-V 64, and i686.
   </p>
   <div class="hero-actions">
     <a class="btn btn-primary" href="/lccc/docs/getting-started">Get Started</a>
@@ -44,11 +44,11 @@ title: LCCC — Lev's Claude's C Compiler
         </tr>
       </thead>
       <tbody>
-        <tr><td><code>arith_loop</code></td><td class="faster">0.104s</td><td>0.147s</td><td class="faster">+41% faster</td></tr>
-        <tr><td><code>sieve</code></td><td class="faster">0.037s</td><td>0.044s</td><td class="faster">+19% faster</td></tr>
-        <tr><td><code>qsort</code></td><td>0.098s</td><td>0.096s</td><td class="slower">≈equal</td></tr>
-        <tr><td><code>fib(40)</code></td><td>0.352s</td><td>0.355s</td><td class="slower">≈equal</td></tr>
-        <tr><td><code>matmul</code></td><td>0.027s</td><td>0.029s</td><td class="slower">≈equal</td></tr>
+        <tr><td><code>arith_loop</code></td><td class="faster">0.103s</td><td>0.146s</td><td class="faster">+42% faster</td></tr>
+        <tr><td><code>sieve</code></td><td class="faster">0.036s</td><td>0.045s</td><td class="faster">+25% faster</td></tr>
+        <tr><td><code>qsort</code></td><td>0.096s</td><td>0.095s</td><td class="slower">≈equal</td></tr>
+        <tr><td><code>fib(40)</code></td><td>0.352s</td><td>0.354s</td><td class="slower">≈equal</td></tr>
+        <tr><td><code>matmul</code></td><td class="faster">0.020s</td><td>0.029s</td><td class="faster">+45% faster</td></tr>
         <tr><td><code>tce_sum</code></td><td class="faster">0.008s</td><td>1.09s</td><td class="faster">139× faster</td></tr>
       </tbody>
     </table>
@@ -108,8 +108,8 @@ title: LCCC — Lev's Claude's C Compiler
     </div>
     <div class="card">
       <div class="card-icon">🔭</div>
-      <h3>508 tests passing</h3>
-      <p>508 unit tests pass. Correctness-first — all three phases (linear scan, TCE, phi-copy coalescing) maintain byte-identical output to GCC.</p>
+      <h3>514 tests passing</h3>
+      <p>514 unit tests pass. Correctness-first — all four phases (linear scan, TCE, phi-copy coalescing, loop unrolling) maintain byte-identical output to GCC.</p>
     </div>
   </div>
 </section>
@@ -118,12 +118,13 @@ title: LCCC — Lev's Claude's C Compiler
 
 <!-- ── Allocator ─────────────────────────────────────────────────────────── -->
 <section id="allocator">
-  <div class="section-label">Phases 2–3</div>
-  <h2>Two-pass linear scan + tail-call elimination + phi-copy coalescing</h2>
+  <div class="section-label">Phases 2–4</div>
+  <h2>Linear scan · tail-call elim · phi-copy coalescing · loop unrolling · FP intrinsics</h2>
   <p>
     The old CCC allocator uses three greedy phases. LCCC replaces the allocation
     core with a proper linear scan (Phase 2), adds tail-call-to-loop conversion (Phase 3a),
-    and eliminates redundant phi-copy stack slots in loop backedges (Phase 3b).
+    eliminates redundant phi-copy stack slots in loop backedges (Phase 3b),
+    and Phase 4 adds loop unrolling and FP intrinsic lowering.
   </p>
 
   <div class="code-block">
@@ -179,47 +180,47 @@ caller_alloc.run();</pre>
         <tr>
           <td><code>arith_loop</code></td>
           <td>32-var arithmetic, 10M iters</td>
-          <td class="faster">0.104s</td>
-          <td>0.147s</td>
+          <td class="faster">0.103s</td>
+          <td>0.146s</td>
           <td class="baseline">0.068s</td>
-          <td class="faster">+41% faster</td>
-          <td class="slower">1.53×</td>
+          <td class="faster">+42% faster</td>
+          <td class="slower">1.50×</td>
         </tr>
         <tr>
           <td><code>sieve</code></td>
           <td>Primes to 10M</td>
-          <td class="faster">0.037s</td>
-          <td>0.044s</td>
+          <td class="faster">0.036s</td>
+          <td>0.045s</td>
           <td class="baseline">0.024s</td>
-          <td class="faster">+19% faster</td>
-          <td class="slower">1.54×</td>
+          <td class="faster">+25% faster</td>
+          <td class="slower">1.50×</td>
         </tr>
         <tr>
           <td><code>qsort</code></td>
           <td>Sort 1M integers</td>
-          <td>0.098s</td>
           <td>0.096s</td>
+          <td>0.095s</td>
           <td class="baseline">0.087s</td>
           <td class="slower">≈equal</td>
-          <td class="slower">1.13×</td>
+          <td class="slower">1.10×</td>
         </tr>
         <tr>
           <td><code>fib(40)</code></td>
           <td>Recursive Fibonacci</td>
           <td>0.352s</td>
-          <td>0.355s</td>
+          <td>0.354s</td>
           <td class="baseline">0.096s</td>
           <td class="slower">≈equal</td>
-          <td class="slower">3.67×</td>
+          <td class="slower">3.68×</td>
         </tr>
         <tr>
           <td><code>matmul</code></td>
           <td>256×256 double matrix multiply</td>
-          <td>0.027s</td>
+          <td class="faster">0.020s</td>
           <td>0.029s</td>
-          <td class="baseline">0.003s</td>
-          <td class="slower">≈equal</td>
-          <td class="slower">7.84×</td>
+          <td class="baseline">0.004s</td>
+          <td class="faster">+45% faster</td>
+          <td class="slower">4.86×</td>
         </tr>
         <tr>
           <td><code>tce_sum</code></td>
@@ -235,14 +236,15 @@ caller_alloc.run();</pre>
   </div>
 
   <p style="margin-top:1rem">
-    The largest gains are on register-pressure code (linear scan + phi-copy coalescing)
-    and tail-recursive code (TCE). The matmul gap is GCC's AVX2 auto-vectorization —
-    a Phase 5 target. See the <a href="/lccc/docs/roadmap">roadmap</a> for what's next.
+    The largest gains are on register-pressure code (linear scan + phi-copy coalescing),
+    tail-recursive code (TCE), and matrix multiply (FP intrinsic lowering, Phase 4).
+    The remaining matmul gap is GCC's AVX2 auto-vectorization — a Phase 5 target.
+    See the <a href="/lccc/docs/roadmap">roadmap</a> for what's next.
   </p>
 
   <div class="badges">
     <span class="badge badge-amber">✓ all outputs match GCC</span>
-    <span class="badge badge-teal">508 unit tests passing</span>
+    <span class="badge badge-teal">514 unit tests passing</span>
     <span class="badge badge-gray">GCC 15.2.0 · Ubuntu</span>
     <span class="badge badge-gray">x86-64 · -O2</span>
   </div>
@@ -253,26 +255,39 @@ caller_alloc.run();</pre>
 <!-- ── Updates ──────────────────────────────────────────────────────────── -->
 <section id="updates">
   <div class="section-label">Latest</div>
-  <h2>What's new in Phase 3</h2>
+  <h2>What's new in Phase 4</h2>
   <p>
-    Phase 3 ships two backend improvements that together bring LCCC to
-    <strong>+41% faster than CCC</strong> on register-pressure loops and
+    Phase 4 ships loop unrolling and FP intrinsic lowering, bringing LCCC to
+    <strong>+42% faster than CCC</strong> on register-pressure loops,
+    <strong>+45% faster</strong> on matrix multiply, and
     <strong>139× faster</strong> on tail-recursive code.
   </p>
   <div class="cards">
     <div class="card">
+      <div class="card-icon">🔃</div>
+      <h3>Loop unrolling</h3>
+      <p>Small inner loops (≤8 body blocks, constant-step IV) are unrolled 2×–8× with intermediate exit checks — no separate cleanup loop needed.</p>
+    </div>
+    <div class="card">
+      <div class="card-icon">🧮</div>
+      <h3>FP intrinsic lowering</h3>
+      <p>SSE2/AVX scalar and packed FP operations are emitted directly. <code>matmul</code>: 0.020 s vs CCC's 0.029 s — 45% faster, now within 5× of GCC's AVX2 vectorization.</p>
+    </div>
+    <div class="card">
       <div class="card-icon">🔁</div>
-      <h3>Tail-call elimination</h3>
-      <p>Self-recursive tail calls become loop back-edges before the optimizer sees them. <code>sum(10M)</code>: 8 ms vs CCC's 1.09 s.</p>
+      <h3>Tail-call elimination (Phase 3a)</h3>
+      <p>Self-recursive tail calls become loop back-edges. <code>sum(10M)</code>: 8 ms vs CCC's 1.09 s.</p>
     </div>
     <div class="card">
       <div class="card-icon">📦</div>
-      <h3>Phi-copy stack coalescing</h3>
-      <p>Phi elimination's double-slot pattern generates ~20 redundant memory copies per loop iteration. Reversed alias direction makes them same-slot no-ops.</p>
+      <h3>Phi-copy coalescing (Phase 3b)</h3>
+      <p>Eliminates ~20 redundant stack-to-stack copies per loop iteration from phi elimination's double-slot pattern.</p>
     </div>
   </div>
   <p style="margin-top:1rem">
-    <a href="/lccc/updates/phase3-tce-and-phi-coalescing">Read the full Phase 3 write-up →</a>
+    <a href="/lccc/updates/phase4-loop-unrolling">Read the Phase 4 write-up →</a>
+    &nbsp;·&nbsp;
+    <a href="/lccc/updates/phase3-tce-and-phi-coalescing">Phase 3 write-up →</a>
   </p>
 </section>
 

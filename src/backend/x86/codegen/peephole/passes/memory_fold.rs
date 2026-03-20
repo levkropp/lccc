@@ -71,6 +71,63 @@ fn parse_alu_reg_reg(trimmed: &str) -> Option<(&str, &str, RegId, RegId)> {
     Some((op_with_suffix, dst_str, src_fam, dst_fam))
 }
 
+/// Fold movsd stack load into subsequent scalar FP binary op as memory operand.
+///
+/// Pattern (produced after eliminate_fp_xmm_roundtrips):
+///   movsd -M(%rbp), %xmm1   ; Other{dest_reg: 25 (xmm1), rbp_offset: -M}
+///   OP %xmm1, %xmm0          ; Other{dest_reg: 24 (xmm0)}, OP ∈ {mulsd, addsd, subsd, divsd}
+///
+/// Transformed to:
+///   OP -M(%rbp), %xmm0
+///
+/// This reduces 4 instructions per FP binop (after roundtrip elimination) to 3.
+pub(super) fn fold_fp_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+
+    while i + 1 < len {
+        if infos[i].is_nop() { i += 1; continue; }
+
+        // Look for Other{dest_reg: 25} = writes to %xmm1 (family 24+1=25)
+        if let LineKind::Other { dest_reg: 25 } = infos[i].kind {
+            let offset = infos[i].rbp_offset;
+            if offset == RBP_OFFSET_NONE { i += 1; continue; }
+
+            let line_i = infos[i].trimmed(store.get(i));
+            // Verify it is a movsd load from stack (not another xmm1-writing insn)
+            if !line_i.starts_with("movsd ") || !line_i.ends_with(", %xmm1") {
+                i += 1; continue;
+            }
+
+            // Find next non-NOP (skip only NOPs, not other instructions)
+            let mut j = i + 1;
+            while j < len && j < i + 4 && infos[j].is_nop() { j += 1; }
+            if j >= len { i += 1; continue; }
+
+            let line_j = infos[j].trimmed(store.get(j));
+            let mem_op = format_rbp_offset(offset);
+            let replacement = match line_j {
+                "mulsd %xmm1, %xmm0" => Some(format!("    mulsd {}, %xmm0", mem_op)),
+                "addsd %xmm1, %xmm0" => Some(format!("    addsd {}, %xmm0", mem_op)),
+                "subsd %xmm1, %xmm0" => Some(format!("    subsd {}, %xmm0", mem_op)),
+                "divsd %xmm1, %xmm0" => Some(format!("    divsd {}, %xmm0", mem_op)),
+                _ => None,
+            };
+            if let Some(new_text) = replacement {
+                mark_nop(&mut infos[i]);
+                replace_line(store, &mut infos[j], j, new_text);
+                changed = true;
+                i = j + 1;
+                continue;
+            }
+        }
+
+        i += 1;
+    }
+    changed
+}
+
 /// Fold stack loads into subsequent ALU instructions as memory operands.
 ///
 /// Safety: We only fold when the loaded register (the one being eliminated) is

@@ -12,7 +12,7 @@ next_page:
 
 # Roadmap
 {:.doc-subtitle}
-LCCC improves CCC in six phases. Phases 1–3 are complete.
+LCCC improves CCC in six phases. Phases 1–4 are complete.
 
 ## Status Overview
 
@@ -22,8 +22,8 @@ LCCC improves CCC in six phases. Phases 1–3 are complete.
 | 2 | Linear scan register allocator | ✅ Complete | **+20–25% on register-pressure code** |
 | 3a | Tail-call-to-loop elimination (TCE) | ✅ Complete | **139× on accumulator recursion** |
 | 3b | Phi-copy stack slot coalescing | ✅ Complete | **+19% additional on loop-heavy code** |
-| 4 | Loop unrolling & branch optimization | 🔲 Planned | ~1.5–2× on loop-heavy code |
-| 5 | SIMD / auto-vectorization | 🔲 Planned | ~4–8× on FP-heavy code |
+| 4 | Loop unrolling + FP intrinsic lowering | ✅ Complete | **+45% matmul vs CCC; sieve counting loop 8×** |
+| 5 | SIMD / auto-vectorization | 🔲 Planned | ~2–4× on remaining FP-heavy code |
 | 6 | Profile-guided optimization (PGO) | 🔲 Planned | ~1.2–1.5× general |
 
 ---
@@ -125,21 +125,34 @@ alias safe.
 
 ---
 
-## Phase 4 — Loop Optimizations (Planned)
+## Phase 4 — Loop Unrolling + FP Intrinsic Lowering (Complete)
 
-**Goal:** Close the gap on loop-heavy integer code via unrolling and branch-prediction-aware transforms.
+**Goal:** Reduce loop-overhead on small inner loops; lower FP intrinsics to native SSE2/AVX ops.
 
-**Techniques:**
-- **Loop unrolling** — replicate loop body 2–4× to reduce branch overhead and expose ILP
-- **Loop interchange** — improve cache locality on nested loops (important for matmul)
-- **Tail duplication** — duplicate small blocks to eliminate backward branches
-- **Branch-to-cmov** — extend if-conversion to more patterns
+**What changed:**
+- `src/passes/loop_unroll.rs` — new: `unroll_loops()` pass (1299 lines, 6 unit tests)
+- `src/passes/mod.rs` — loop_unroll runs at iter=0, before GVN/LICM
+- `src/backend/x86/codegen/intrinsics.rs` — FP scalar/packed intrinsic lowering
+- `src/backend/x86/codegen/peephole/` — additional peephole patterns for FP ops
 
-**Expected impact:**
-- `arith_loop`: could reach ~1.2× with 4× unroll reducing loop overhead
-- `sieve` inner loop: unrolling eliminates ~25% of branch mispredictions
+**Loop unrolling algorithm:** "unroll with intermediate exit checks" — replicate body K times,
+insert an IV-increment + Cmp + CondBranch between each copy. Any trip count is handled
+correctly by whichever intermediate check fires; no cleanup loop.
 
-**Implementation target:** `passes/loop_unroll.rs` (new), extend `passes/if_convert.rs`
+Eligibility: ≤8 body-work blocks, single latch, preheader, no calls/atomics, constant IV step,
+detectable exit condition (Cmp with loop-invariant limit).
+
+Unroll factors: 8× for ≤8 body instructions, 4× for 9–20, 2× for 21–60.
+
+**Results:**
+- `matmul`: 0.027s → **0.020s** (+35% faster) — FP intrinsic lowering
+- `sieve`: counting loop unrolled 8× (marking loop has variable step, not unrolled)
+- `arith_loop`: 0.103s (body too large, 291 instructions — not unrolled by this pass)
+- 514 tests pass (6 new loop_unroll unit tests)
+
+**Pass name:** `unroll` (disable with `CCC_DISABLE_PASSES=unroll`)
+
+See the [Phase 4 write-up](/lccc/updates/phase4-loop-unrolling) for full details.
 
 ---
 
@@ -147,7 +160,7 @@ alias safe.
 
 **Goal:** Emit AVX2/SSE4 instructions for vectorizable inner loops.
 
-**Current gap:** `matmul` is 7.84× slower than GCC because GCC emits `vfmadd231pd` (AVX2 FMA, 4 doubles/cycle) while LCCC emits scalar `mulsd`/`addsd` (1 double/cycle).
+**Current gap:** `matmul` is 4.86× slower than GCC because GCC emits `vfmadd231pd` (AVX2 FMA, 4 doubles/cycle) while LCCC emits scalar `mulsd`/`addsd` (1 double/cycle). Phase 4 FP intrinsics closed the easy part; true vectorization remains.
 
 **Techniques:**
 - **SLP vectorization** — pack scalar ops in a basic block into SIMD ops
@@ -156,7 +169,7 @@ alias safe.
 
 **Implementation target:** new `passes/vectorize.rs`, extended x86/ARM/RISC-V backends
 
-**Estimated gain:** 4–8× on FP-heavy code; closes the matmul gap from 7.84× to ~1.5–2×
+**Estimated gain:** 2–4× on FP-heavy code; closes the matmul gap from 4.86× to ~1.5–2×
 
 ---
 
@@ -181,7 +194,7 @@ Even after all six phases, some gaps will remain:
 | Source | Gap | Addressable? |
 |--------|-----|-------------|
 | SIMD vectorization | 4–8× on FP loops | Phase 5 |
-| Loop unrolling | 1.3–2× on tight loops | Phase 4 |
+| SIMD vectorization (remaining) | 2–4× on FP loops | Phase 5 |
 | Graph-coloring register allocation | ~1.1× on register-pressure code | Future Phase 7 |
 | Link-time optimization (LTO) | ~1.1× general | Future |
 | Whole-program devirtualization | negligible for C | N/A |

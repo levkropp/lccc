@@ -154,6 +154,10 @@ impl I686Codegen {
                 self.state.emit("    fabs");
                 self.emit_f32_store_from_x87(dest);
             }
+            // FmaF64x2 is an x86-64 SSE2 intrinsic; not implemented on i686.
+            IntrinsicOp::FmaF64x2 => {
+                // Not reachable on i686 - emit a no-op placeholder.
+            }
 
             // --- AES-NI ---
             IntrinsicOp::Aesenc128 | IntrinsicOp::Aesenclast128

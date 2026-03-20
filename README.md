@@ -1,7 +1,8 @@
 # LCCC — Lev's Claude's C Compiler
 
 > An optimized fork of [CCC](https://github.com/anthropics/claudes-c-compiler) with a two-pass
-> linear-scan register allocator and phi-copy stack coalescing. **+30–40% faster** on register-pressure code vs upstream.
+> linear-scan register allocator, phi-copy stack coalescing, loop unrolling, and FP intrinsic
+> lowering. **+42% faster** on register-pressure code, **+45% faster** on matrix multiply vs upstream.
 
 **[Documentation](https://levkropp.github.io/lccc/)** ·
 **[Benchmarks](#benchmarks)** ·
@@ -18,15 +19,16 @@ RISC-V 64, and i686, with its own assembler and linker.
 
 LCCC is a performance fork. Phase 2 replaces CCC's three-phase greedy register allocator with a proper
 two-pass linear-scan allocator (Poletto & Sarkar 1999). Phase 3 adds tail-call elimination and
-phi-copy stack slot coalescing, together yielding +30–40% speedups on
-register-pressure code while keeping all 508 upstream tests green.
+phi-copy stack slot coalescing. Phase 4 adds loop unrolling and FP intrinsic lowering, together
+yielding +42% speedup on register-pressure code and +45% on matrix multiply, while keeping all
+514 tests green.
 
 ```
 C source
   │  frontend: lex → parse → sema → IR lowering
   ▼
 SSA IR
-  │  optimizer: GVN · LICM · IPCP · DCE · const-fold · inline
+  │  optimizer: TCE · loop-unroll · GVN · LICM · IPCP · DCE · const-fold · inline
   ▼
 Optimized IR
   │  regalloc (LCCC): two-pass linear scan over live intervals
@@ -48,20 +50,20 @@ All outputs are byte-identical to GCC.
 
 | Benchmark | LCCC | CCC | GCC -O2 | vs CCC | vs GCC |
 |-----------|-----:|----:|--------:|:------:|:------:|
-| `arith_loop` — 32-var arithmetic, 10 M iters | **0.104 s** | 0.147 s | 0.068 s | **+41% faster** | 1.53× slower |
-| `sieve` — primes to 10 M | **0.037 s** | 0.044 s | 0.024 s | **+19% faster** | 1.54× slower |
-| `qsort` — sort 1 M integers | 0.098 s | 0.096 s | 0.087 s | ≈ equal | 1.13× slower |
-| `fib(40)` — recursive Fibonacci | 0.352 s | 0.355 s | 0.096 s | ≈ equal | 3.67× slower |
-| `matmul` — 256×256 double | 0.027 s | 0.029 s | 0.003 s | ≈ equal | 7.84× slower |
+| `arith_loop` — 32-var arithmetic, 10 M iters | **0.103 s** | 0.146 s | 0.068 s | **+42% faster** | 1.50× slower |
+| `sieve` — primes to 10 M | **0.036 s** | 0.045 s | 0.024 s | **+25% faster** | 1.50× slower |
+| `qsort` — sort 1 M integers | 0.096 s | 0.095 s | 0.087 s | ≈ equal | 1.10× slower |
+| `fib(40)` — recursive Fibonacci | 0.352 s | 0.354 s | 0.096 s | ≈ equal | 3.68× slower |
+| `matmul` — 256×256 double | **0.020 s** | 0.029 s | 0.004 s | **+45% faster** | 4.86× slower |
 | `tce_sum` — tail-recursive sum(10M) | **0.008 s** | 1.09 s | 0.008 s | **139× faster** | ≈ equal |
 
-The gain on `arith_loop` comes from two sources: linear-scan register allocation keeps more loop
-variables in registers, and phi-copy stack coalescing eliminates ~20 redundant stack-to-stack
-copies per iteration (from phi elimination's double-slot pattern).
-The `sieve` gain comes from linear scan keeping the inner-loop counter in a register.
-The `tce_sum` gain comes from tail-call elimination: LCCC converts the 10M recursive calls into a
-loop, matching GCC. CCC executes 10M actual stack frames.
-The `matmul` gap is GCC's AVX2 auto-vectorization — a Phase 4 target.
+The `arith_loop` gain comes from linear-scan register allocation + phi-copy stack coalescing
+(eliminates ~20 redundant stack-to-stack copies per iteration).
+The `sieve` gain comes from linear scan keeping the inner-loop counter in a register + loop
+unrolling the prime-counting pass.
+The `matmul` gain comes from Phase 4 FP intrinsic lowering (SSE2/AVX scalar ops emitted directly).
+The remaining `matmul` gap is GCC's AVX2 auto-vectorization — a Phase 5 target.
+The `tce_sum` gain comes from tail-call elimination converting 10M recursive calls into a loop.
 
 Run the suite yourself:
 
@@ -162,6 +164,42 @@ The analysis lives in [`src/backend/stack_layout/copy_coalescing.rs`](src/backen
 
 ---
 
+## Loop unrolling
+
+Small inner loops are unrolled 2×–8× at compile time. The pass uses an **early-exit** strategy
+that handles non-multiple trip counts without a separate cleanup loop:
+
+```
+header:  %iv = phi [init, %iv_next]
+         %cond = cmp %iv, limit
+         branch %cond → exit / body
+
+[original body blocks] → exit_check_1
+
+exit_check_1:  %iv_1 = %iv + step
+               branch cmp(%iv_1, limit) → exit / body_copy_2
+
+[body_copy_2 — all value IDs renamed] → exit_check_2
+...
+exit_check_{K-1} → [body_copy_K] → latch
+
+latch: %iv_next = %iv_{K-1} + step   ← was %iv + step
+       branch header
+```
+
+Each exit check fires as soon as the IV exceeds the limit, so the unrolled loop is correct
+for any trip count — no remainder loop needed.
+
+**Eligibility:** single latch, preheader exists, ≤8 body-work blocks, constant IV step,
+detectable exit condition (Cmp with loop-invariant limit), no calls/atomics in body.
+
+**Unroll factors:** 8× for ≤8 body instructions, 4× for 9–20, 2× for 21–60, skip above 60.
+
+The pass lives in [`src/passes/loop_unroll.rs`](src/passes/loop_unroll.rs) and runs once at
+`iter=0` before GVN/LICM so that subsequent passes can optimize the unrolled copies.
+
+---
+
 ## Getting started
 
 **Prerequisites:** Rust stable (2021 edition), Linux x86-64 host.
@@ -212,7 +250,7 @@ Unrecognized flags are silently ignored so `ccc` works as a drop-in in build sys
 | `CCC_KEEP_ASM` | Keep intermediate `.s` files next to output |
 
 Pass names: `cfg`, `copyprop`, `narrow`, `simplify`, `constfold`, `gvn`, `licm`,
-`ifconv`, `dce`, `ipcp`, `inline`, `ivsr`, `divconst`, `tce`.
+`ifconv`, `dce`, `ipcp`, `inline`, `ivsr`, `divconst`, `tce`, `unroll`.
 
 ---
 
@@ -222,7 +260,7 @@ Pass names: `cfg`, `copyprop`, `narrow`, `simplify`, `constfold`, `gvn`, `licm`,
 src/
   frontend/     C source → typed AST (preprocessor, lexer, parser, sema)
   ir/           Target-independent SSA IR (lowering, mem2reg)
-  passes/       SSA optimization passes (15 passes + shared loop analysis)
+  passes/       SSA optimization passes (16 passes + shared loop analysis)
   backend/      IR → assembly → ELF (4 architectures)
     live_range.rs   ← LCCC: LiveRange, LinearScanAllocator
     regalloc.rs     ← LCCC: two-pass linear scan activation
@@ -233,7 +271,7 @@ include/        Bundled C headers (SSE–AVX-512, AES-NI, FMA, SHA, BMI2; NEON)
 tests/          Integration tests (main.c + expected output per directory)
 
 lccc-improvements/
-  benchmarks/           bench.py runner + 5 C benchmark sources
+  benchmarks/           bench.py runner + 6 C benchmark sources
   register-allocation/  Phase 1 analysis docs (design, integration points)
 
 docs/           Jekyll documentation site source
@@ -249,8 +287,8 @@ docs/           Jekyll documentation site source
 | 2 | Linear-scan register allocator | ✅ Complete | **+20–25% on reg-pressure code** |
 | 3a | Tail-call-to-loop elimination (TCE) | ✅ Complete | **139× on accumulator recursion** |
 | 3b | Phi-copy stack slot coalescing | ✅ Complete | **+additional 20% on loop-heavy code** |
-| 4 | Loop unrolling | Planned | ~1.5–2× on loop-heavy code |
-| 5 | SIMD / auto-vectorization (AVX2) | Planned | ~4–8× on FP-heavy code |
+| 4 | Loop unrolling + FP intrinsic lowering | ✅ Complete | **+45% matmul vs CCC; sieve counting loop 8×** |
+| 5 | SIMD / auto-vectorization (AVX2) | Planned | ~2–4× on FP-heavy code |
 | 6 | Profile-guided optimization (PGO) | Planned | ~1.2–1.5× general |
 
 The goal is not to beat GCC — it's to make CCC-compiled programs fast enough for real systems
