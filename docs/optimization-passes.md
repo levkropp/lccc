@@ -104,3 +104,42 @@ Timing data is available via:
 ```bash
 CCC_TIME_PASSES=1 ./target/release/ccc input.c -o output 2>&1 | grep PASS
 ```
+
+## LCCC-Specific Passes
+
+LCCC adds two optimization passes that run before CCC's main optimizer loop.
+
+### Tail-Call Elimination (`tce`)
+
+Converts self-recursive tail calls to back-edge branches. A tail call is a recursive call whose result is returned immediately — `return f(args)` with no further computation.
+
+```c
+// Before: 10M stack frames
+long sum(int n, long acc) {
+    if (n <= 0) return acc;
+    return sum(n - 1, acc + n);
+}
+
+// After TCE: tight counted loop (identical to GCC output)
+long sum(int n, long acc) {
+loop:
+    if (n <= 0) return acc;
+    acc += n; n -= 1; goto loop;
+}
+```
+
+TCE runs once after inlining, before the main optimization loop, so that LICM, IVSR, and GVN can subsequently optimize the resulting loop.
+
+**Pass name:** `tce` (disable with `CCC_DISABLE_PASSES=tce`)
+
+**Implementation:** [`src/passes/tail_call_elim.rs`](https://github.com/levkropp/lccc/blob/master/src/passes/tail_call_elim.rs)
+
+### Phi-Copy Stack Slot Coalescing (backend)
+
+This is a backend optimization in `src/backend/stack_layout/copy_coalescing.rs`, not a pass in the traditional sense. It runs during stack layout, before code generation.
+
+When CCC's phi elimination lowers SSA phi nodes to Copy instructions, it creates separate stack slots for the phi destination and its backedge update value. For a 32-variable loop, this generates ~20 redundant stack-to-stack `movq` pairs per iteration.
+
+LCCC detects the phi-copy pattern — where the source is defined and killed in the backedge block — and aliases the source to use the phi destination's wider-live slot. The Copy becomes a same-slot no-op and is dropped by `generate_copy`.
+
+**Result:** `arith_loop` (32 variables): 550 → 507 assembly lines; 0.124s → 0.104s.

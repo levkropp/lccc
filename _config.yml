@@ -27,3 +27,8 @@ defaults:
       type: "pages"
     values:
       layout: doc
+  - scope:
+      path: "updates"
+      type: "pages"
+    values:
+      layout: doc
