@@ -2,7 +2,7 @@
 
 > An optimized fork of [CCC](https://github.com/anthropics/claudes-c-compiler) with a two-pass
 > linear-scan register allocator, phi-copy stack coalescing, loop unrolling, FP intrinsic
-> lowering, FP peephole optimization, and SSE2 auto-vectorization. **+42% faster** on register-pressure code, **~2× of GCC** on matrix multiply (was 6.0×).
+> lowering, FP peephole optimization, and AVX2 auto-vectorization. **+42% faster** on register-pressure code, **~1× of GCC** on matrix multiply (was 6.0×).
 
 **[Documentation](https://levkropp.github.io/lccc/)** ·
 **[Benchmarks](#benchmarks)** ·
@@ -21,15 +21,16 @@ LCCC is a performance fork. Phase 2 replaces CCC's three-phase greedy register a
 two-pass linear-scan allocator (Poletto & Sarkar 1999). Phase 3 adds tail-call elimination and
 phi-copy stack slot coalescing. Phase 4 adds loop unrolling and FP intrinsic lowering. Phase 5 adds
 FP peephole optimization that eliminates GPR↔XMM round-trips and stack spills. Phase 6 adds SSE2
-auto-vectorization for matmul-style loops. Together these yield +42% speedup on register-pressure
-code and bring the matmul GCC gap from 6.0× to ~2×, while keeping all 514 tests green.
+auto-vectorization (2-wide) for matmul-style loops. Phase 7 upgrades to AVX2 vectorization (4-wide).
+Together these yield +42% speedup on register-pressure code and bring the matmul GCC gap from 6.0× to ~1×,
+while keeping all 514 tests green.
 
 ```
 C source
   │  frontend: lex → parse → sema → IR lowering
   ▼
 SSA IR
-  │  optimizer: TCE · loop-unroll · vectorize · GVN · LICM · IPCP · DCE · const-fold · inline
+  │  optimizer: TCE · loop-unroll · vectorize(AVX2) · GVN · LICM · IPCP · DCE · const-fold · inline
   ▼
 Optimized IR
   │  regalloc (LCCC): two-pass linear scan over live intervals
@@ -65,8 +66,8 @@ The `sieve` gain comes from linear scan keeping the inner-loop counter in a regi
 unrolling the prime-counting pass.
 The `matmul` gain comes from Phase 4 FP intrinsic lowering + Phase 5 FP peephole optimization
 (eliminates GPR↔XMM round-trips, folds memory operands, removes stack spills — 33→20 inner loop instructions)
-+ Phase 6 SSE2 auto-vectorization (processes 2 doubles per iteration with packed mulpd/addpd, ~2× speedup).
-The remaining `matmul` gap is GCC's AVX2 vectorization (4-wide vs our 2-wide) and more aggressive loop optimizations.
++ Phase 6 SSE2 auto-vectorization (2-wide, ~2× speedup) + Phase 7 AVX2 upgrade (4-wide, ~2× additional speedup).
+The remaining `matmul` gap is GCC's more aggressive loop optimizations (unroll-and-jam, strength reduction).
 The `tce_sum` gain comes from tail-call elimination converting 10M recursive calls into a loop.
 
 Run the suite yourself:
@@ -338,9 +339,12 @@ docs/           Jekyll documentation site source
 | 3b | Phi-copy stack slot coalescing | ✅ Complete | **+additional 20% on loop-heavy code** |
 | 4 | Loop unrolling + FP intrinsic lowering | ✅ Complete | **+45% matmul vs CCC; sieve counting loop 8×** |
 | 5 | FP peephole optimization | ✅ Complete | **+additional 41% matmul vs CCC** |
-| 6 | SSE2 auto-vectorization | ✅ Complete | **~2× on matmul-style FP loops** |
-| 7 | AVX2/AVX-512 vectorization | Planned | ~2× additional on FP-heavy code |
-| 8 | Profile-guided optimization (PGO) | Planned | ~1.2–1.5× general |
+| 6 | SSE2 auto-vectorization (2-wide) | ✅ Complete | **~2× on matmul-style FP loops** |
+| 7a | AVX2 vectorization (4-wide) | ✅ Complete | **~2× additional on matmul vs SSE2** |
+| 7b | Remainder loop handling | Planned | Support N not divisible by 4 |
+| 8 | Better function inlining | Planned | ~1.8× on fib(40) |
+| 9 | Loop strength reduction | Planned | Eliminate redundant addressing |
+| 10 | Profile-guided optimization (PGO) | Planned | ~1.2–1.5× general |
 
 The goal is not to beat GCC — it's to make CCC-compiled programs fast enough for real systems
 software, targeting within ~1.5× of GCC on typical workloads.

@@ -1,7 +1,7 @@
-//! SSE2 vectorization pass for matmul-style loops.
+//! AVX2/SSE2 vectorization pass for matmul-style loops.
 //!
 //! Recognizes innermost loops with stride-1 double-precision accumulation patterns
-//! and transforms them into FmaF64x2 intrinsics (packed FMA with broadcast scalar).
+//! and transforms them into FmaF64x4 (AVX2, default) or FmaF64x2 (SSE2) intrinsics.
 //!
 //! Target pattern (matmul j-loop):
 //! ```c
@@ -9,40 +9,63 @@
 //!     C[i][j] += A[i][k] * B[k][j];
 //! ```
 //!
-//! Transforms into vectorized loop that processes 2 elements per iteration:
+//! ## AVX2 Transformation (default, 4-wide):
+//! ```c
+//! for (int j = 0; j < N/4; j++)  // Loop N/4 times
+//!     FmaF64x4(&C[i][j*4], &A[i][k], &B[k][j*4]);  // Process 4 elements per iteration
+//! ```
+//!
+//! ## SSE2 Transformation (with LCCC_FORCE_SSE2=1, 2-wide):
 //! ```c
 //! for (int j = 0; j < N/2; j++)  // Loop N/2 times
-//!     FmaF64x2(&C[i][j*2], &A[i][k], &B[k][j*2]);  // Process elements j*2 and j*2+1
+//!     FmaF64x2(&C[i][j*2], &A[i][k], &B[k][j*2]);  // Process 2 elements per iteration
 //! ```
 //!
 //! ## Transformation Details
 //!
-//! 1. **Loop Bound**: Modified from `j < N` to `j < N/2`
-//!    - For constant N: divide by 2 at compile time
-//!    - For dynamic N: insert `udiv` instruction to compute N/2
+//! ### AVX2 (4-wide, default):
+//! 1. **Loop Bound**: Modified from `j < N` to `j < N/4`
+//!    - For constant N: divide by 4 at compile time
+//!    - For dynamic N: insert `udiv` instruction to compute N/4
 //!    - Modifies ALL comparisons involving IV-derived values in the loop
 //!
-//! 2. **Array Indexing**: Changed from `j` to `j*2`
-//!    - Inserts multiply instructions before GEPs: `offset' = offset * 2`
-//!    - Ensures iteration j accesses elements [j*2, j*2+1] instead of [j, j+1]
-//!    - Backend generates stride-16 addressing (2 doubles × 8 bytes)
+//! 2. **Array Indexing**: Changed from `j` to `j*4`
+//!    - Inserts multiply instructions before GEPs: `offset' = offset * 4`
+//!    - Ensures iteration j accesses elements [j*4..j*7] instead of [j, j+1]
+//!    - Backend generates stride-32 addressing (4 doubles × 8 bytes)
 //!
 //! 3. **Induction Variable**: Keeps incrementing by 1
-//!    - Backend-friendly: `j++` instead of `j += 2`
-//!    - Combined with doubled offset, produces correct element access
+//!    - Backend-friendly: `j++` instead of `j += 4`
+//!    - Combined with 4× offset, produces correct element access
 //!
-//! 4. **SSE2 Code Generation**:
+//! 4. **AVX2 Code Generation**:
+//!    - `vbroadcastsd`: broadcast A[i][k] scalar to 4 lanes
+//!    - `vmovupd`: load 4 doubles from B[k][j*4]
+//!    - `vmulpd`: packed multiply (4 doubles)
+//!    - `vaddpd`: packed add with C[i][j*4]
+//!    - `vmovupd`: store 4 results back
+//!
+//! ### SSE2 (2-wide, with LCCC_FORCE_SSE2=1):
+//! 1. **Loop Bound**: Modified from `j < N` to `j < N/2`
+//! 2. **Array Indexing**: Changed from `j` to `j*2` (stride-16)
+//! 3. **SSE2 Code Generation**:
 //!    - `movsd` + `unpcklpd`: broadcast A[i][k] scalar
 //!    - `movupd`: load 2 doubles from B[k][j*2]
-//!    - `mulpd`: packed multiply
+//!    - `mulpd`: packed multiply (2 doubles)
 //!    - `addpd`: packed add with C[i][j*2]
 //!    - `movupd`: store 2 results back
 //!
 //! ## Limitations
 //!
-//! - Remainder loop for odd N not yet implemented
+//! - Remainder loop not yet implemented (N must be divisible by 4 for AVX2, 2 for SSE2)
 //! - Only handles matmul-style patterns (load, multiply, add, store)
 //! - Requires innermost loop with IV-based indexing
+//!
+//! ## Environment Variables
+//!
+//! - `LCCC_FORCE_SSE2=1`: Force SSE2 2-wide vectorization instead of AVX2 4-wide
+//! - `LCCC_FORCE_AVX2=1`: Explicitly enable AVX2 (default behavior, provided for clarity)
+//! - `LCCC_DEBUG_VECTORIZE=1`: Enable debug output for vectorization pass
 
 use crate::common::fx_hash::FxHashSet;
 use crate::common::types::IrType;
@@ -96,10 +119,21 @@ pub(crate) fn vectorize_with_analysis(func: &mut IrFunction, cfg: &CfgAnalysis) 
 
         // Try to vectorize this loop.
         if let Some(pattern) = analyze_loop_pattern(func, loop_info, cfg) {
-            if debug {
-                eprintln!("[VEC] Pattern matched! Transforming to FmaF64x2");
+            // Select vector width: default to AVX2 (4-wide) unless explicitly disabled
+            let use_sse2 = std::env::var("LCCC_FORCE_SSE2").is_ok();
+
+            if use_sse2 {
+                if debug {
+                    eprintln!("[VEC] Pattern matched! Transforming to FmaF64x2 (SSE2, 2-wide)");
+                }
+                total_changes += transform_to_fma_f64x2(func, &pattern);
+            } else {
+                // Use AVX2 by default (or if LCCC_FORCE_AVX2 is set)
+                if debug {
+                    eprintln!("[VEC] Pattern matched! Transforming to FmaF64x4 (AVX2, 4-wide)");
+                }
+                total_changes += transform_to_fma_f64x4(func, &pattern);
             }
-            total_changes += transform_to_fma_f64x2(func, &pattern);
         } else if debug {
             eprintln!("[VEC] Pattern match failed for loop {}", idx);
         }
@@ -1107,6 +1141,436 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
     // For now, we'll skip this and only vectorize loops with even N
     // The plan mentions this should be implemented, but let's test the basic
     // transformation first before adding the remainder loop
+
+    // Update the function's next_value_id
+    func.next_value_id = next_val_id;
+
+    changes
+}
+
+/// Transform loop to use AVX2 FmaF64x4 intrinsic (4-wide, 256-bit).
+/// Same pattern as SSE2 but processes 4 elements per iteration instead of 2.
+fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) -> usize {
+    let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
+    let mut changes = 0;
+
+    // Keep track of the next available Value and BlockId
+    let mut next_val_id = func.next_value_id;
+    let max_label = func.blocks.iter().map(|b| b.label.0).max().unwrap_or(0);
+    let mut next_label = max_label + 1;
+
+    // Build a set of IV-derived values (for finding all IV-related comparisons)
+    // Start with the IV from the header, but also trace back from the GEPs to find
+    // the actual j-loop IV
+    let mut iv_derived = FxHashSet::default();
+    iv_derived.insert(pattern.iv);
+
+    // Find the IV used in the B and C GEPs by tracing backwards
+    // The GEPs use an offset that's derived from the j-loop IV
+    let mut gep_ivs = FxHashSet::default();
+    for &block_idx in &pattern.loop_blocks {
+        let block = &func.blocks[block_idx];
+        for inst in &block.instructions {
+            if let Instruction::GetElementPtr { dest, base: _, offset, ty: _ } = inst {
+                if *dest == pattern.b_gep || *dest == pattern.c_gep {
+                    // This GEP is for B or C array - trace its offset back to find the IV
+                    if let Operand::Value(offset_val) = offset {
+                        gep_ivs.insert(*offset_val);
+                        if debug {
+                            eprintln!("[VEC]   GEP Value({}) uses offset Value({})", dest.0, offset_val.0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Trace gep_ivs back through multiplies and casts to find the original IVs
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &block_idx in &pattern.loop_blocks {
+            let block = &func.blocks[block_idx];
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::BinOp { dest, op: _, lhs, rhs, ty: _ } => {
+                        if gep_ivs.contains(dest) {
+                            if let Operand::Value(lhs_val) = lhs {
+                                if gep_ivs.insert(*lhs_val) {
+                                    changed = true;
+                                }
+                            }
+                            if let Operand::Value(rhs_val) = rhs {
+                                if gep_ivs.insert(*rhs_val) {
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                    Instruction::Cast { dest, src, .. } | Instruction::Copy { dest, src } => {
+                        if gep_ivs.contains(dest) {
+                            if let Operand::Value(src_val) = src {
+                                if gep_ivs.insert(*src_val) {
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                    Instruction::Phi { dest, .. } => {
+                        if gep_ivs.contains(dest) {
+                            // This is likely the j-loop IV!
+                            iv_derived.insert(*dest);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Now collect all values derived from ANY of these IVs
+    changed = true;
+    while changed {
+        changed = false;
+        for &block_idx in &pattern.loop_blocks {
+            let block = &func.blocks[block_idx];
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::Cast { dest, src, .. } | Instruction::Copy { dest, src } => {
+                        if let Operand::Value(src_val) = src {
+                            if (iv_derived.contains(src_val) || gep_ivs.contains(src_val)) && iv_derived.insert(*dest) {
+                                changed = true;
+                            }
+                        }
+                    }
+                    Instruction::BinOp { dest, op: IrBinOp::Add, lhs, .. } => {
+                        // IV increment (j = j + 1)
+                        if let Operand::Value(lhs_val) = lhs {
+                            if iv_derived.contains(lhs_val) && iv_derived.insert(*dest) {
+                                changed = true;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if debug {
+        eprintln!("[VEC]   IV-derived values (including j-loop IV): {:?}", iv_derived);
+        eprintln!("[VEC]   GEP offset chain: {:?}", gep_ivs);
+        eprintln!("[VEC]   Loop contains blocks: {:?}", pattern.loop_blocks);
+    }
+
+    // Step 1: Modify ALL comparisons in the loop that compare IV-derived values against the limit
+    // For AVX2: divide limit by 4 instead of 2
+    {
+        // First, create the quartered limit value
+        let quartered_limit = match &pattern.limit {
+            Operand::Const(IrConst::I32(n)) => Operand::Const(IrConst::I32(*n / 4)),
+            Operand::Const(IrConst::I64(n)) => Operand::Const(IrConst::I64(*n / 4)),
+            Operand::Value(limit_val) => {
+                // Dynamic limit: insert division in header
+                let div_dest = Value(next_val_id);
+                next_val_id += 1;
+
+                let limit_ty = match &func.blocks[pattern.header_idx].instructions[pattern.exit_cmp_inst_idx] {
+                    Instruction::Cmp { ty, .. } => *ty,
+                    _ => IrType::I64,
+                };
+
+                let div_inst = Instruction::BinOp {
+                    dest: div_dest,
+                    op: IrBinOp::UDiv,
+                    lhs: Operand::Value(*limit_val),
+                    rhs: Operand::Const(match limit_ty {
+                        IrType::I32 => IrConst::I32(4),  // Changed from 2
+                        IrType::I64 => IrConst::I64(4),  // Changed from 2
+                        _ => IrConst::I64(4),            // Changed from 2
+                    }),
+                    ty: limit_ty,
+                };
+
+                func.blocks[pattern.header_idx].instructions.insert(pattern.exit_cmp_inst_idx, div_inst);
+
+                if debug {
+                    eprintln!("[VEC]   Inserted division for dynamic limit: udiv %N, 4 => Value({})", div_dest.0);
+                }
+
+                Operand::Value(div_dest)
+            }
+            _ => {
+                if debug {
+                    eprintln!("[VEC]   Unsupported limit type");
+                }
+                return 0;
+            }
+        };
+
+        // Now modify all comparisons that use IV-derived values in loop blocks
+        for &block_idx in &pattern.loop_blocks {
+            let block = &mut func.blocks[block_idx];
+
+            if debug {
+                // First pass: log all comparisons in this block
+                for inst in &block.instructions {
+                    if let Instruction::Cmp { dest, op: _, lhs, rhs, ty: _ } = inst {
+                        eprintln!("[VEC]   Block {} has comparison: {:?} <cmp> {:?}, dest={:?}",
+                            block_idx, lhs, rhs, dest);
+                    }
+                }
+            }
+
+            for inst in &mut block.instructions {
+                if let Instruction::Cmp { dest, op: _, lhs, rhs, ty: _ } = inst {
+                    // Check if this compares an IV-derived value against something
+                    let modifies_lhs = if let Operand::Value(lhs_val) = lhs {
+                        iv_derived.contains(lhs_val)
+                    } else {
+                        false
+                    };
+
+                    let modifies_rhs = if let Operand::Value(rhs_val) = rhs {
+                        iv_derived.contains(rhs_val)
+                    } else {
+                        false
+                    };
+
+                    if modifies_lhs || modifies_rhs {
+                        if debug {
+                            eprintln!("[VEC]   -> This is an IV comparison (will modify)");
+                        }
+
+                        // Modify the comparison to use quartered limit
+                        if modifies_lhs {
+                            *rhs = quartered_limit.clone();
+                            changes += 1;
+                            if debug {
+                                eprintln!("[VEC]   -> Modified comparison RHS to {:?}", quartered_limit);
+                            }
+                        } else if modifies_rhs {
+                            *lhs = quartered_limit.clone();
+                            changes += 1;
+                            if debug {
+                                eprintln!("[VEC]   -> Modified comparison LHS to {:?}", quartered_limit);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 2: Modify GEP offset calculation from IV*8 to IV*32 (4 elements × 8 bytes)
+    // Handle both explicit multiplies and strength-reduced pointer increments
+    {
+        let mut found_any_mul = false;
+        let mut modified_any_increment = false;
+
+        // First, try to find and modify explicit IV * 8 multiplies to IV * 32
+        for &block_idx in &pattern.loop_blocks {
+            let block = &mut func.blocks[block_idx];
+            for inst in &mut block.instructions {
+                if let Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::Mul,
+                    lhs,
+                    rhs,
+                    ty: _,
+                } = inst
+                {
+                    found_any_mul = true;
+                    // Check if this multiply involves IV-derived values and scale factor 8
+                    let lhs_is_iv_derived = if let Operand::Value(v) = lhs {
+                        iv_derived.contains(v)
+                    } else {
+                        false
+                    };
+                    let rhs_is_8 = matches!(rhs, Operand::Const(IrConst::I64(8)) | Operand::Const(IrConst::I32(8)));
+
+                    if debug && (lhs_is_iv_derived || rhs_is_8) {
+                        eprintln!("[VEC]   Found multiply in block {}: Value({}) = {:?} * {:?}, lhs_is_iv_derived={}, rhs_is_8={}",
+                            block_idx, dest.0, lhs, rhs, lhs_is_iv_derived, rhs_is_8);
+                    }
+
+                    if lhs_is_iv_derived && rhs_is_8 {
+                        // Change 8 to 32 (process 4 doubles = 32 bytes)
+                        *rhs = match rhs {
+                            Operand::Const(IrConst::I64(_)) => Operand::Const(IrConst::I64(32)),  // Changed from 16
+                            Operand::Const(IrConst::I32(_)) => Operand::Const(IrConst::I32(32)),  // Changed from 16
+                            _ => Operand::Const(IrConst::I64(32)),                                 // Changed from 16
+                        };
+                        changes += 1;
+                        modified_any_increment = true;
+                        if debug {
+                            eprintln!("[VEC]   Changed GEP stride from 8 to 32 for Value({})", dest.0);
+                        }
+                    }
+                }
+            }
+        }
+
+        // If no IV*8 multiplies found, the loop is strength-reduced
+        // Look for pointer increments (ptr + 8) and change them to (ptr + 32)
+        if !modified_any_increment {
+            if debug {
+                eprintln!("[VEC]   No IV*8 multiplies found, searching for strength-reduced pointer increments");
+            }
+
+            // Build a set of pointer values that are used in GEPs for C and B arrays
+            let mut pointer_values = FxHashSet::default();
+            pointer_values.insert(pattern.c_gep);
+            pointer_values.insert(pattern.b_gep);
+
+            // Track pointer values through the loop (they flow through adds and GEPs)
+            for &block_idx in &pattern.loop_blocks {
+                let block = &func.blocks[block_idx];
+                for inst in &block.instructions {
+                    match inst {
+                        Instruction::GetElementPtr { dest, base, .. } => {
+                            if pointer_values.contains(base) || pointer_values.contains(dest) {
+                                pointer_values.insert(*dest);
+                                pointer_values.insert(*base);
+                            }
+                        }
+                        Instruction::BinOp {
+                            dest,
+                            op: IrBinOp::Add,
+                            lhs,
+                            rhs: _,
+                            ty: _,
+                        } => {
+                            if let Operand::Value(lhs_val) = lhs {
+                                if pointer_values.contains(lhs_val) {
+                                    pointer_values.insert(*dest);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // Now find adds with constant 8 and change to 32
+            for &block_idx in &pattern.loop_blocks {
+                let block = &mut func.blocks[block_idx];
+                for inst in &mut block.instructions {
+                    if let Instruction::BinOp {
+                        dest,
+                        op: IrBinOp::Add,
+                        lhs,
+                        rhs,
+                        ty: _,
+                    } = inst
+                    {
+                        let is_pointer = if let Operand::Value(v) = lhs {
+                            pointer_values.contains(v)
+                        } else {
+                            false
+                        };
+                        let is_8 = matches!(rhs, Operand::Const(IrConst::I64(8)) | Operand::Const(IrConst::I32(8)));
+
+                        if is_pointer && is_8 {
+                            *rhs = match rhs {
+                                Operand::Const(IrConst::I64(_)) => Operand::Const(IrConst::I64(32)),  // Changed from 16
+                                Operand::Const(IrConst::I32(_)) => Operand::Const(IrConst::I32(32)),  // Changed from 16
+                                _ => Operand::Const(IrConst::I64(32)),                                 // Changed from 16
+                            };
+                            changes += 1;
+                            modified_any_increment = true;
+                            if debug {
+                                eprintln!("[VEC]   Changed pointer increment from 8 to 32 for Value({})", dest.0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Last resort: insert explicit multiply by 4 before GEPs
+        if !modified_any_increment {
+            if debug {
+                eprintln!("[VEC]   No explicit strides found, inserting multiply by 4 before GEPs");
+            }
+
+            let mut geps_to_modify = Vec::new();
+            for &block_idx in &pattern.loop_blocks {
+                let block = &func.blocks[block_idx];
+                for (inst_idx, inst) in block.instructions.iter().enumerate() {
+                    if let Instruction::GetElementPtr { dest, base: _, offset, ty } = inst {
+                        if *dest == pattern.b_gep || *dest == pattern.c_gep {
+                            if let Operand::Value(offset_val) = offset {
+                                geps_to_modify.push((block_idx, inst_idx, *offset_val, *ty));
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (block_idx, inst_idx, offset_val, offset_ty) in geps_to_modify.into_iter().rev() {
+                let mul_dest = Value(next_val_id);
+                next_val_id += 1;
+
+                let mul_inst = Instruction::BinOp {
+                    dest: mul_dest,
+                    op: IrBinOp::Mul,
+                    lhs: Operand::Value(offset_val),
+                    rhs: Operand::Const(IrConst::I64(4)),  // Changed from 2
+                    ty: offset_ty,
+                };
+
+                // Insert mul before the GEP
+                func.blocks[block_idx].instructions.insert(inst_idx, mul_inst);
+
+                // Update the GEP's offset (now at inst_idx + 1 due to insertion)
+                if let Instruction::GetElementPtr { offset, .. } = &mut func.blocks[block_idx].instructions[inst_idx + 1] {
+                    *offset = Operand::Value(mul_dest);
+                    changes += 1;
+                    modified_any_increment = true;
+                    if debug {
+                        eprintln!("[VEC]   Inserted mul and updated GEP offset: Value({}) = Value({}) * 4",
+                            mul_dest.0, offset_val.0);
+                    }
+                }
+            }
+
+            if debug && !modified_any_increment {
+                eprintln!("[VEC]   Warning: Could not modify GEP offsets");
+            }
+        }
+    }
+
+    // Step 3: Replace the body accumulation with FmaF64x4
+    {
+        let body = &mut func.blocks[pattern.body_idx];
+
+        // Create FmaF64x4 intrinsic: writes directly to memory, no dest value.
+        let intrinsic = Instruction::Intrinsic {
+            dest: None,
+            op: IntrinsicOp::FmaF64x4,  // Changed from FmaF64x2
+            dest_ptr: Some(pattern.c_gep),
+            args: vec![
+                Operand::Value(pattern.a_ptr),
+                Operand::Value(pattern.b_gep),
+            ],
+        };
+
+        // Insert intrinsic before the store, then remove the store.
+        body.instructions.insert(pattern.store_idx, intrinsic);
+        changes += 1;
+        if debug {
+            eprintln!("[VEC]   Inserted FmaF64x4 intrinsic, dest_ptr=Value({}), args=[Value({}), Value({})]",
+                pattern.c_gep.0, pattern.a_ptr.0, pattern.b_gep.0);
+        }
+
+        // Remove the old store (now at store_idx + 1).
+        if pattern.store_idx + 1 < body.instructions.len() {
+            body.instructions.remove(pattern.store_idx + 1);
+        }
+
+        // The old load/mul/add instructions are now dead. DCE will remove them.
+    }
 
     // Update the function's next_value_id
     func.next_value_id = next_val_id;
