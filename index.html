@@ -21,7 +21,6 @@ title: LCCC — Lev's Claude's C Compiler
 
 <!-- ── Hero ──────────────────────────────────────────────────────────────── -->
 <header class="hero">
-  <div class="hero-badge">Phase 3 complete · TCE + phi-copy coalescing · 508 tests passing</div>
   <h1><span class="l">l</span><span class="rest">ccc</span></h1>
   <p class="hero-sub">
     An optimized fork of <a href="https://github.com/anthropics/claudes-c-compiler" style="color:var(--amber)">CCC</a>
@@ -32,6 +31,27 @@ title: LCCC — Lev's Claude's C Compiler
   <div class="hero-actions">
     <a class="btn btn-primary" href="/lccc/docs/getting-started">Get Started</a>
     <a class="btn btn-secondary" href="https://github.com/levkropp/lccc" target="_blank" rel="noopener">View on GitHub</a>
+  </div>
+  <!-- ── Mini benchmark table ─────────────────────────────────────────────── -->
+  <div class="mini-bench-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Benchmark</th>
+          <th>LCCC</th>
+          <th>CCC</th>
+          <th>LCCC vs CCC</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td><code>arith_loop</code></td><td class="faster">0.104s</td><td>0.147s</td><td class="faster">+41% faster</td></tr>
+        <tr><td><code>sieve</code></td><td class="faster">0.037s</td><td>0.044s</td><td class="faster">+19% faster</td></tr>
+        <tr><td><code>qsort</code></td><td>0.098s</td><td>0.096s</td><td class="slower">≈equal</td></tr>
+        <tr><td><code>fib(40)</code></td><td>0.352s</td><td>0.355s</td><td class="slower">≈equal</td></tr>
+        <tr><td><code>matmul</code></td><td>0.027s</td><td>0.029s</td><td class="slower">≈equal</td></tr>
+        <tr><td><code>tce_sum</code></td><td class="faster">0.008s</td><td>1.09s</td><td class="faster">139× faster</td></tr>
+      </tbody>
+    </table>
   </div>
 </header>
 
