@@ -9,6 +9,7 @@
 /_site/
 /.jekyll-cache/
 /.sass-cache/
+Gemfile.lock
 
 # IDE
 .vscode/
@@ -24,6 +25,10 @@ Thumbs.db
 *.a
 *.so
 *.dylib
+*.exe
+a.out
+test_*
+bench_*
 
 # Benchmark / test output
 /test-results/
