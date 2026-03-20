@@ -7,8 +7,8 @@ prev_page:
   title: Phase 3 — TCE and Phi-Copy Coalescing
   url: /updates/phase3-tce-and-phi-coalescing
 next_page:
-  title: Benchmarks
-  url: /docs/benchmarks
+  title: Phase 5 — FP Peephole Optimization
+  url: /updates/phase5-fp-peephole
 ---
 
 # Phase 4: Loop Unrolling

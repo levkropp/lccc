@@ -576,6 +576,231 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
     changed
 }
 
+// ── Pointer-deref stack elimination (Pattern H) ─────────────────────────────
+//
+// Matches the common codegen idiom:
+//   movq (%<ptr>), %rax          [I] load through pointer into GPR
+//   movq %rax, -O(%rbp)          [J] spill to stack slot
+//   ... (gap, no write to O(%rbp) or %<ptr>) ...
+//   movsd/mulsd/addsd -O(%rbp)   [K] FP use of the spilled value
+//
+// Folds to:  NOP I, NOP J,  replace O(%rbp) in K with (%<ptr>).
+// This eliminates the GPR round-trip and stack spill.
+//
+pub(super) fn fold_ptr_deref_through_stack(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+
+    while i < len {
+        if infos[i].is_nop() { i += 1; continue; }
+
+        // Match I: "movq (%<ptr>), %rax"
+        if let LineKind::Other { dest_reg: 0 } = infos[i].kind {
+            let line_i = infos[i].trimmed(store.get(i));
+            if line_i.starts_with("movq (%") && line_i.ends_with("), %rax") {
+                let ptr_reg = &line_i[7..line_i.len() - 7]; // between "movq (%" and "), %rax"
+
+                // Match J: immediately adjacent StoreRbp{0, O, Q}
+                let mut j = i + 1;
+                while j < len && j < i + 4 && infos[j].is_nop() { j += 1; }
+                if j >= len { i += 1; continue; }
+                if let LineKind::StoreRbp { reg: 0, offset, size: MoveSize::Q } = infos[j].kind {
+                    let offset_str = format!("{}(%rbp)", offset);
+                    let ptr_mem = format!("(%{})", ptr_reg);
+
+                    // Scan forward from j+1 for first FP use of O(%rbp).
+                    let mut k = j + 1;
+                    let mut ptr_modified = false;
+                    let mut rax_overwritten = false;
+                    let mut count = 0;
+                    let mut found = false;
+
+                    while k < len && count < 20 {
+                        if infos[k].is_nop() { k += 1; continue; }
+                        let t = infos[k].trimmed(store.get(k));
+
+                        // Stop at control flow.
+                        if t.starts_with('j') || t.starts_with("call") || t.starts_with("ret") {
+                            break;
+                        }
+
+                        // Check if ptr register is modified (appears as destination).
+                        let ptr_with_pct = format!("%{}", ptr_reg);
+                        if t.ends_with(&format!(", {}", ptr_with_pct)) {
+                            ptr_modified = true;
+                        }
+
+                        // Check if %rax is read before overwritten (safety for NOP'ing I).
+                        if !rax_overwritten {
+                            match infos[k].kind {
+                                LineKind::LoadRbp { reg: 0, .. } |
+                                LineKind::Other { dest_reg: 0 } => {
+                                    rax_overwritten = true;
+                                }
+                                _ => {
+                                    if t.contains("%rax") || t.contains("%eax") || t.contains("%al") {
+                                        // %rax is read before being overwritten → unsafe.
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Check for StoreRbp writing the same offset → our store is overwritten.
+                        if let LineKind::StoreRbp { offset: o, .. } = infos[k].kind {
+                            if o == offset { break; }
+                        }
+
+                        // Found an FP instruction using O(%rbp) as source operand?
+                        if t.contains(&offset_str) && !ptr_modified {
+                            // Verify it's a source (not dest). StoreRbp is already caught above.
+                            // For movsd/mulsd/addsd/subsd/divsd: the memory operand is the source
+                            // if it comes before the comma.
+                            if (t.starts_with("movsd ") || t.starts_with("mulsd ") ||
+                                t.starts_with("addsd ") || t.starts_with("subsd ") ||
+                                t.starts_with("divsd ")) &&
+                                t.contains(&offset_str)
+                            {
+                                // Check O(%rbp) not read again after K.
+                                if rbp_offset_dead_after(store, infos, k + 1, len, i64::from(offset)) {
+                                    let new_text = format!("    {}", t.replace(&offset_str, &ptr_mem));
+                                    mark_nop(&mut infos[i]);
+                                    mark_nop(&mut infos[j]);
+                                    replace_line(store, &mut infos[k], k, new_text);
+                                    changed = true;
+                                    found = true;
+                                }
+                                break;
+                            }
+                            break; // Unknown instruction using the offset → bail.
+                        }
+
+                        k += 1;
+                        count += 1;
+                    }
+
+                    if found {
+                        i = k + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        i += 1;
+    }
+    changed
+}
+
+// ── FP spill elimination around load (Pattern I) ─────────────────────────────
+//
+// Matches:
+//   movsd %xmm0, O(%rbp)       [I] spill product to stack
+//   ... (gap: address calc, no xmm usage) ...
+//   movsd (%ptr), %xmm0        [K] load C (overwrites xmm0)
+//   addsd O(%rbp), %xmm0       [L] C += spilled product
+//
+// Rewrites to:
+//   (NOP)                       [I] eliminated
+//   ... (gap) ...
+//   movsd (%ptr), %xmm1        [K] load C into xmm1
+//   addsd %xmm1, %xmm0         [L] product + C (register-only)
+//
+// This avoids the stack spill+reload by keeping the product in xmm0 and
+// routing the C load through xmm1 instead.
+//
+pub(super) fn eliminate_fp_spill_around_load(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+
+    while i < len {
+        if infos[i].is_nop() { i += 1; continue; }
+        let line_i = infos[i].trimmed(store.get(i));
+
+        // Match I: "movsd %xmm0, <offset>(%rbp)"
+        if line_i.starts_with("movsd %xmm0, ") && line_i.ends_with("(%rbp)") {
+            let mem_operand = &line_i[13..]; // after "movsd %xmm0, " (13 chars)
+            // Extract numeric offset from e.g. "-48(%rbp)"
+            let paren_pos = mem_operand.find('(');
+            if let Some(pp) = paren_pos {
+                let offset_num: Result<i64, _> = mem_operand[..pp].parse();
+                if let Ok(offset) = offset_num {
+                    // Scan forward for K (load into xmm0) then L (addsd from same slot).
+                    let mut k_pos = 0usize;
+                    let mut l_pos = 0usize;
+                    let mut xmm1_clear = true;
+                    let mut j = i + 1;
+                    let mut count = 0;
+
+                    while j < len && count < 16 {
+                        if infos[j].is_nop() { j += 1; continue; }
+                        let t = infos[j].trimmed(store.get(j));
+                        if t.starts_with('j') || t.starts_with("call") || t.starts_with("ret") { break; }
+                        if t.contains("%xmm1") { xmm1_clear = false; break; }
+
+                        // Find K: "movsd <something>, %xmm0" (load overwriting xmm0)
+                        if k_pos == 0 && t.starts_with("movsd ") && t.ends_with(", %xmm0") {
+                            k_pos = j;
+                        }
+
+                        // Find L: "addsd <offset>(%rbp), %xmm0" (reload from spill slot)
+                        if k_pos > 0 {
+                            let expected_l = format!("addsd {}, %xmm0", mem_operand);
+                            if t == expected_l {
+                                l_pos = j;
+                                break;
+                            }
+                        }
+
+                        j += 1;
+                        count += 1;
+                    }
+
+                    if k_pos > 0 && l_pos > 0 && xmm1_clear {
+                        // Verify the spill slot is dead after L.
+                        if rbp_offset_dead_after(store, infos, l_pos + 1, len, offset) {
+                            // Also verify xmm1 is dead after L.
+                            let mut after_l = l_pos + 1;
+                            while after_l < len && infos[after_l].is_nop() { after_l += 1; }
+                            let xmm1_dead_after = if after_l >= len { true }
+                            else {
+                                let t = infos[after_l].trimmed(store.get(after_l));
+                                !t.contains("%xmm1")
+                            };
+
+                            if xmm1_dead_after {
+                                // NOP I (the spill store).
+                                mark_nop(&mut infos[i]);
+                                // Change K: "movsd ..., %xmm0" → "movsd ..., %xmm1"
+                                let line_k = infos[k_pos].trimmed(store.get(k_pos));
+                                let new_k = format!("    {}", line_k.replace(", %xmm0", ", %xmm1"));
+                                replace_line(store, &mut infos[k_pos], k_pos, new_k);
+                                // Change L: "addsd O(%rbp), %xmm0" → "addsd %xmm1, %xmm0"
+                                let new_l = "    addsd %xmm1, %xmm0".to_string();
+                                replace_line(store, &mut infos[l_pos], l_pos, new_l);
+                                changed = true;
+                                i = l_pos + 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        i += 1;
+    }
+    changed
+}
+
 /// Returns true if %rax is live (potentially read) at instruction index `at`.
 /// Conservative: treats "movq %<non-rax>, %rax" as a pure write (not live).
 fn rax_is_live_at(store: &LineStore, infos: &[LineInfo], at: usize, len: usize) -> bool {

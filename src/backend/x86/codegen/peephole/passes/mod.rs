@@ -74,6 +74,8 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
         changed |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos);
         changed |= local_patterns::eliminate_rcx_address_copy(&mut store, &mut infos);
+        changed |= local_patterns::fold_ptr_deref_through_stack(&mut store, &mut infos);
+        changed |= local_patterns::eliminate_fp_spill_around_load(&mut store, &mut infos);
         if local_changed || pass_count == 0 {
             changed |= push_pop::eliminate_push_pop_pairs(&store, &mut infos);
             changed |= push_pop::eliminate_binop_push_pop_pattern(&mut store, &mut infos);
@@ -104,6 +106,8 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
             changed2 |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos);
             changed2 |= local_patterns::eliminate_rcx_address_copy(&mut store, &mut infos);
+            changed2 |= local_patterns::fold_ptr_deref_through_stack(&mut store, &mut infos);
+            changed2 |= local_patterns::eliminate_fp_spill_around_load(&mut store, &mut infos);
             changed2 |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);
             changed2 |= dead_code::eliminate_dead_stores(&store, &mut infos);
             changed2 |= memory_fold::fold_memory_operands(&mut store, &mut infos);
@@ -125,6 +129,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed3 |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
             changed3 |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos);
             changed3 |= local_patterns::eliminate_rcx_address_copy(&mut store, &mut infos);
+            changed3 |= local_patterns::fold_ptr_deref_through_stack(&mut store, &mut infos);
             changed3 |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);
             changed3 |= dead_code::eliminate_dead_stores(&store, &mut infos);
             changed3 |= memory_fold::fold_memory_operands(&mut store, &mut infos);
