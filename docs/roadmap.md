@@ -12,7 +12,7 @@ next_page:
 
 # Roadmap
 {:.doc-subtitle}
-LCCC improves CCC in six phases. Phases 1–4 are complete.
+LCCC improves CCC in seven phases. Phases 1–5 are complete.
 
 ## Status Overview
 
@@ -23,8 +23,9 @@ LCCC improves CCC in six phases. Phases 1–4 are complete.
 | 3a | Tail-call-to-loop elimination (TCE) | ✅ Complete | **139× on accumulator recursion** |
 | 3b | Phi-copy stack slot coalescing | ✅ Complete | **+19% additional on loop-heavy code** |
 | 4 | Loop unrolling + FP intrinsic lowering | ✅ Complete | **+45% matmul vs CCC; sieve counting loop 8×** |
-| 5 | SIMD / auto-vectorization | 🔲 Planned | ~2–4× on remaining FP-heavy code |
-| 6 | Profile-guided optimization (PGO) | 🔲 Planned | ~1.2–1.5× general |
+| 5 | FP peephole optimization | ✅ Complete | **-41% matmul time (6.0× → 4.0× vs GCC)** |
+| 6 | SIMD / auto-vectorization | 🔲 Planned | ~2–4× on remaining FP-heavy code |
+| 7 | Profile-guided optimization (PGO) | 🔲 Planned | ~1.2–1.5× general |
 
 ---
 

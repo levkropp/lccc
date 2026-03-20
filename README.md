@@ -1,8 +1,8 @@
 # LCCC — Lev's Claude's C Compiler
 
 > An optimized fork of [CCC](https://github.com/anthropics/claudes-c-compiler) with a two-pass
-> linear-scan register allocator, phi-copy stack coalescing, loop unrolling, and FP intrinsic
-> lowering. **+42% faster** on register-pressure code, **+45% faster** on matrix multiply vs upstream.
+> linear-scan register allocator, phi-copy stack coalescing, loop unrolling, FP intrinsic
+> lowering, and FP peephole optimization. **+42% faster** on register-pressure code, **4.0× of GCC** on matrix multiply (was 6.0×).
 
 **[Documentation](https://levkropp.github.io/lccc/)** ·
 **[Benchmarks](#benchmarks)** ·
@@ -19,9 +19,10 @@ RISC-V 64, and i686, with its own assembler and linker.
 
 LCCC is a performance fork. Phase 2 replaces CCC's three-phase greedy register allocator with a proper
 two-pass linear-scan allocator (Poletto & Sarkar 1999). Phase 3 adds tail-call elimination and
-phi-copy stack slot coalescing. Phase 4 adds loop unrolling and FP intrinsic lowering, together
-yielding +42% speedup on register-pressure code and +45% on matrix multiply, while keeping all
-514 tests green.
+phi-copy stack slot coalescing. Phase 4 adds loop unrolling and FP intrinsic lowering. Phase 5 adds
+FP peephole optimization that eliminates GPR↔XMM round-trips and stack spills. Together these
+yield +42% speedup on register-pressure code and bring the matmul GCC gap from 6.0× to 4.0×, while
+keeping all 514 tests green.
 
 ```
 C source
@@ -36,6 +37,7 @@ Optimized IR
   │    pass 2: caller-saved  ↔ non-call-spanning unallocated values
   ▼
 Machine code  (x86-64 · AArch64 · RISC-V 64 · i686)
+  │  peephole: FP round-trip elim · memory fold · spill elim · rcx copy fold
   │  standalone assembler + linker (no external toolchain)
   ▼
 ELF executable
@@ -54,15 +56,16 @@ All outputs are byte-identical to GCC.
 | `sieve` — primes to 10 M | **0.036 s** | 0.045 s | 0.024 s | **+25% faster** | 1.50× slower |
 | `qsort` — sort 1 M integers | 0.096 s | 0.095 s | 0.087 s | ≈ equal | 1.10× slower |
 | `fib(40)` — recursive Fibonacci | 0.352 s | 0.354 s | 0.096 s | ≈ equal | 3.68× slower |
-| `matmul` — 256×256 double | **0.020 s** | 0.029 s | 0.004 s | **+45% faster** | 4.86× slower |
+| `matmul` — 256×256 double | **0.016 s** | 0.029 s | 0.004 s | **+81% faster** | 4.0× slower |
 | `tce_sum` — tail-recursive sum(10M) | **0.008 s** | 1.09 s | 0.008 s | **139× faster** | ≈ equal |
 
 The `arith_loop` gain comes from linear-scan register allocation + phi-copy stack coalescing
 (eliminates ~20 redundant stack-to-stack copies per iteration).
 The `sieve` gain comes from linear scan keeping the inner-loop counter in a register + loop
 unrolling the prime-counting pass.
-The `matmul` gain comes from Phase 4 FP intrinsic lowering (SSE2/AVX scalar ops emitted directly).
-The remaining `matmul` gap is GCC's AVX2 auto-vectorization — a Phase 5 target.
+The `matmul` gain comes from Phase 4 FP intrinsic lowering + Phase 5 FP peephole optimization
+(eliminates GPR↔XMM round-trips, folds memory operands, removes stack spills — 33→20 inner loop instructions).
+The remaining `matmul` gap is GCC's SSE2 auto-vectorization + tighter loop control — a Phase 6 target.
 The `tce_sum` gain comes from tail-call elimination converting 10M recursive calls into a loop.
 
 Run the suite yourself:
