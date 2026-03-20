@@ -52,8 +52,11 @@ All outputs are byte-identical to GCC.
 | `qsort` — sort 1 M integers | 0.096 s | 0.095 s | 0.087 s | ≈ equal | 1.10× slower |
 | `fib(40)` — recursive Fibonacci | 0.352 s | 0.354 s | 0.095 s | ≈ equal | 3.70× slower |
 | `matmul` — 256×256 double | 0.028 s | 0.029 s | 0.003 s | ≈ equal | 7.91× slower |
+| `tce_sum` — tail-recursive sum(10M) | **0.008 s** | 1.09 s | 0.008 s | **139× faster** | ≈ equal |
 
 The gains on `arith_loop` and `sieve` come directly from keeping more loop variables in registers.
+The `tce_sum` gain comes from tail-call elimination: LCCC converts the 10M recursive calls into a
+loop, matching GCC. CCC executes 10M actual stack frames.
 The `matmul` gap is GCC's AVX2 auto-vectorization — a Phase 4 target.
 
 Run the suite yourself:
@@ -102,6 +105,29 @@ recursive `fib` sees no change, which is expected.
 The allocator lives in [`src/backend/live_range.rs`](src/backend/live_range.rs) (796 lines).
 See the [register allocator docs](https://levkropp.github.io/lccc/docs/register-allocator) for
 the full algorithm walk-through.
+
+---
+
+## Tail-call elimination
+
+Self-recursive tail calls are converted to back-edge branches (loops), eliminating stack frame
+overhead for accumulator-style functions. A tail call is a recursive call whose result is returned
+immediately with no further computation.
+
+```c
+// Before TCE: 10M stack frames
+long sum(int n, long acc) {
+    if (n <= 0) return acc;
+    return sum(n - 1, acc + n);  // tail call → loop back-edge
+}
+```
+
+After TCE, the IR grows a loop header with one Phi node per parameter, and the call+return becomes
+an unconditional branch back to the header. Subsequent passes (LICM, IVSR, GVN) then optimize the
+resulting loop. On `sum(10000000, 0)`: LCCC finishes in 8 ms; CCC takes 1.09 s.
+
+The pass lives in [`src/passes/tail_call_elim.rs`](src/passes/tail_call_elim.rs) and runs once
+after inlining, before the main optimization loop.
 
 ---
 
@@ -155,7 +181,7 @@ Unrecognized flags are silently ignored so `ccc` works as a drop-in in build sys
 | `CCC_KEEP_ASM` | Keep intermediate `.s` files next to output |
 
 Pass names: `cfg`, `copyprop`, `narrow`, `simplify`, `constfold`, `gvn`, `licm`,
-`ifconv`, `dce`, `ipcp`, `inline`, `ivsr`, `divconst`.
+`ifconv`, `dce`, `ipcp`, `inline`, `ivsr`, `divconst`, `tce`.
 
 ---
 
@@ -190,7 +216,8 @@ docs/           Jekyll documentation site source
 |-------|-------------|--------|---------------|
 | 1 | Register allocator analysis & design | ✅ Complete | (prerequisite) |
 | 2 | Linear-scan register allocator | ✅ Complete | **+20–25% on reg-pressure code** |
-| 3 | Loop unrolling & branch optimization | Planned | ~1.5–2× on loop-heavy code |
+| 3a | Tail-call-to-loop elimination (TCE) | ✅ Complete | **139× on accumulator recursion** |
+| 3b | Loop unrolling | Planned | ~1.5–2× on loop-heavy code |
 | 4 | SIMD / auto-vectorization (AVX2) | Planned | ~4–8× on FP-heavy code |
 | 5 | Profile-guided optimization (PGO) | Planned | ~1.2–1.5× general |
 
