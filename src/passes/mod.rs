@@ -25,6 +25,7 @@ pub(crate) mod loop_analysis;
 pub(crate) mod narrow;
 mod resolve_asm;
 pub(crate) mod simplify;
+pub(crate) mod tail_call_elim;
 
 use crate::ir::analysis::CfgAnalysis;
 use crate::ir::reexports::{IrFunction, IrModule};
@@ -274,6 +275,14 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
 
     run_inline_phase(module, &disabled);
     constant_fold::resolve_remaining_is_constant(module);
+
+    // Tail-call-to-loop transformation.
+    // Converts self-recursive tail calls into back-edge branches before the
+    // main optimization loop so that LICM, IVSR, and GVN can optimize the
+    // resulting loops (e.g., hoist invariants, reduce induction variables).
+    if !disabled.contains("tce") {
+        module.for_each_function(tail_call_elim::tail_calls_to_loops);
+    }
 
     let iterations = 3;
     let num_funcs = module.functions.len();
