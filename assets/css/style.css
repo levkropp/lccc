@@ -139,6 +139,17 @@ body {
   flex-wrap: wrap;
 }
 
+/* ── Mini benchmark table ────────────────────────────────────────────────── */
+.mini-bench-wrap {
+  max-width: 500px;
+  margin: 2rem auto 0;
+  overflow-x: auto;
+}
+.mini-bench-wrap th,
+.mini-bench-wrap td {
+  text-align: center !important;
+}
+
 /* ── Buttons ─────────────────────────────────────────────────────────────── */
 .btn {
   display: inline-flex;
