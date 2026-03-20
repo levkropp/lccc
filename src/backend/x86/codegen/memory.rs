@@ -9,13 +9,94 @@ impl X86Codegen {
     /// Try to emit a store using x86-64 SIB indexed addressing mode.
     /// Returns true if successful, false to fall back to normal codegen.
     ///
+    /// First tries IVSR pattern detection (Phase 9b), then falls back to
+    /// Phase 9 pattern (GEP with Mul/Shl offset).
+    fn try_emit_indexed_store(&mut self, val: &Operand, ptr: &Value, ty: IrType) -> bool {
+        // Phase 9b: Try IVSR pointer pattern first (most common in loops)
+        if self.try_emit_ivsr_indexed_store(val, ptr, ty) {
+            return true;
+        }
+
+        // Phase 9: Try non-IVSR pattern (explicit multiply/shift)
+        self.try_emit_phase9_indexed_store(val, ptr, ty)
+    }
+
+    /// Try to emit indexed addressing for IVSR-transformed loop pointer stores.
+    fn try_emit_ivsr_indexed_store(&mut self, val: &Operand, ptr: &Value, ty: IrType) -> bool {
+        // Check if ptr is an IVSR pointer phi
+        let ivsr_info = match self.ivsr_pointers.get(&ptr.0) {
+            Some(info) => info.clone(),
+            None => return false,
+        };
+
+        // Find the loop counter associated with this pointer
+        let counter_val = match self.pointer_to_counter.get(&ptr.0) {
+            Some(&counter_id) => Value(counter_id),
+            None => return false,
+        };
+
+        // Check if both base and counter are in registers
+        let base_reg = match self.reg_assignments.get(&ivsr_info.base_ptr.0) {
+            Some(&reg) => phys_reg_name(reg),
+            None => return false,
+        };
+
+        let index_reg = match self.reg_assignments.get(&counter_val.0) {
+            Some(&reg) => phys_reg_name(reg),
+            None => return false,
+        };
+
+        // Verify stride is a valid SIB scale
+        if !Self::is_valid_sib_scale(ivsr_info.stride) {
+            return false;
+        }
+
+        // Load the value to be stored into the accumulator/xmm register
+        self.operand_to_rax(val);
+
+        // Determine store instruction and source register based on type
+        let (store_instr, src_reg) = match ty {
+            IrType::F64 => {
+                // Convert from rax to xmm0
+                self.state.emit("    movq %rax, %xmm0");
+                ("movsd", "%xmm0")
+            }
+            IrType::F32 => {
+                // Convert from rax to xmm0
+                self.state.emit("    movd %eax, %xmm0");
+                ("movss", "%xmm0")
+            }
+            IrType::I64 | IrType::U64 => ("movq", "%rax"),
+            IrType::I32 | IrType::U32 => ("movl", "%eax"),
+            IrType::I16 | IrType::U16 => ("movw", "%ax"),
+            IrType::I8 | IrType::U8 => ("movb", "%al"),
+            _ => return false,
+        };
+
+        // Emit indexed store: movX %src, (%base,%index,scale)
+        if ivsr_info.init_offset == 0 {
+            self.state.emit_fmt(format_args!(
+                "    {} {}, (%{},%{},{})",
+                store_instr, src_reg, base_reg, index_reg, ivsr_info.stride
+            ));
+        } else {
+            self.state.emit_fmt(format_args!(
+                "    {} {}, {}(%{},%{},{})",
+                store_instr, src_reg, ivsr_info.init_offset, base_reg, index_reg, ivsr_info.stride
+            ));
+        }
+
+        true
+    }
+
+    /// Phase 9 indexed addressing: detect GEP with multiply/shift offset for stores.
     /// Detects patterns like: `store val, (base + index*scale)` where:
     /// - base is in a register
     /// - index is in a register
     /// - scale is 1, 2, 4, or 8
     ///
     /// Emits: `mov %src, (%base_reg,%index_reg,scale)`
-    fn try_emit_indexed_store(&mut self, val: &Operand, ptr: &Value, ty: IrType) -> bool {
+    fn try_emit_phase9_indexed_store(&mut self, val: &Operand, ptr: &Value, ty: IrType) -> bool {
         // Check if ptr is defined by a GEP instruction
         let gep_inst = match self.get_defining_instruction(ptr.0) {
             Some(inst) => inst,
@@ -103,13 +184,89 @@ impl X86Codegen {
     /// Try to emit a load using x86-64 SIB indexed addressing mode.
     /// Returns true if successful, false to fall back to normal codegen.
     ///
+    /// First tries IVSR pattern detection (Phase 9b), then falls back to
+    /// Phase 9 pattern (GEP with Mul/Shl offset).
+    fn try_emit_indexed_load(&mut self, dest: &Value, ptr: &Value, ty: IrType) -> bool {
+        // Phase 9b: Try IVSR pointer pattern first (most common in loops)
+        if self.try_emit_ivsr_indexed_load(dest, ptr, ty) {
+            return true;
+        }
+
+        // Phase 9: Try non-IVSR pattern (explicit multiply/shift)
+        self.try_emit_phase9_indexed_load(dest, ptr, ty)
+    }
+
+    /// Try to emit indexed addressing for IVSR-transformed loop pointers.
+    /// Detects pattern: %ptr = Phi(%init, %next) where %next = GEP(%ptr, stride)
+    /// and emits: movX (%base,%counter,scale), %dest
+    fn try_emit_ivsr_indexed_load(&mut self, dest: &Value, ptr: &Value, ty: IrType) -> bool {
+        // Check if ptr is an IVSR pointer phi
+        let ivsr_info = match self.ivsr_pointers.get(&ptr.0) {
+            Some(info) => info.clone(),
+            None => return false,
+        };
+
+        // Find the loop counter associated with this pointer
+        let counter_val = match self.pointer_to_counter.get(&ptr.0) {
+            Some(&counter_id) => Value(counter_id),
+            None => return false,
+        };
+
+        // Check if both base and counter are in registers
+        let base_reg = match self.reg_assignments.get(&ivsr_info.base_ptr.0) {
+            Some(&reg) => phys_reg_name(reg),
+            None => return false,
+        };
+
+        let index_reg = match self.reg_assignments.get(&counter_val.0) {
+            Some(&reg) => phys_reg_name(reg),
+            None => return false,
+        };
+
+        // Verify stride is a valid SIB scale
+        if !Self::is_valid_sib_scale(ivsr_info.stride) {
+            return false;
+        }
+
+        // Determine load instruction and destination register based on type
+        let (load_instr, dest_reg) = match ty {
+            IrType::F64 => ("movsd", "%xmm0"),
+            IrType::F32 => ("movss", "%xmm0"),
+            IrType::I64 | IrType::U64 => ("movq", "%rax"),
+            IrType::I32 | IrType::U32 => ("movl", "%eax"),
+            IrType::I16 | IrType::U16 => ("movzwl", "%eax"),
+            IrType::I8 | IrType::U8 => ("movzbl", "%eax"),
+            _ => return false,
+        };
+
+        // Emit indexed load: movX (%base,%index,scale), %dest
+        // Handle optional displacement for non-zero init_offset
+        if ivsr_info.init_offset == 0 {
+            self.state.emit_fmt(format_args!(
+                "    {} (%{},%{},{}), {}",
+                load_instr, base_reg, index_reg, ivsr_info.stride, dest_reg
+            ));
+        } else {
+            self.state.emit_fmt(format_args!(
+                "    {} {}(%{},%{},{}), {}",
+                load_instr, ivsr_info.init_offset, base_reg, index_reg, ivsr_info.stride, dest_reg
+            ));
+        }
+
+        // Update register cache
+        self.state.reg_cache.set_acc(dest.0, false);
+
+        true
+    }
+
+    /// Phase 9 indexed addressing: detect GEP with multiply/shift offset.
     /// Detects patterns like: `load (base + index*scale)` where:
     /// - base is in a register
     /// - index is in a register
     /// - scale is 1, 2, 4, or 8
     ///
     /// Emits: `mov (%base_reg,%index_reg,scale), %dest`
-    fn try_emit_indexed_load(&mut self, dest: &Value, ptr: &Value, ty: IrType) -> bool {
+    fn try_emit_phase9_indexed_load(&mut self, dest: &Value, ptr: &Value, ty: IrType) -> bool {
         // Check if ptr is defined by a GEP instruction
         let gep_inst = match self.get_defining_instruction(ptr.0) {
             Some(inst) => inst,

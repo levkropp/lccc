@@ -191,6 +191,21 @@ pub struct X86Codegen {
     pub(super) no_sse: bool,
     /// Current function being generated (needed for indexed addressing detection).
     pub(super) current_func: Option<*const IrFunction>,
+    /// IVSR pointer detection results: maps pointer phi value ID to its metadata
+    pub(super) ivsr_pointers: FxHashMap<u32, IvsrPointerInfo>,
+    /// Maps IVSR pointer phi to original loop counter value ID
+    pub(super) pointer_to_counter: FxHashMap<u32, u32>,
+}
+
+/// Information about an IVSR-transformed pointer induction variable
+#[derive(Debug, Clone)]
+pub(super) struct IvsrPointerInfo {
+    pub phi_val: Value,           // The pointer phi node
+    pub base_ptr: Value,          // Original array base
+    pub stride: i64,              // Element size in bytes
+    pub init_offset: i64,         // Initial offset (usually 0)
+    pub header_block: BlockId,    // Loop header containing phi
+    pub backedge_block: BlockId,  // Block with pointer increment
 }
 
 impl X86Codegen {
@@ -211,6 +226,8 @@ impl X86Codegen {
             used_callee_saved: Vec::new(),
             no_sse: false,
             current_func: None,
+            ivsr_pointers: FxHashMap::default(),
+            pointer_to_counter: FxHashMap::default(),
         }
     }
 
@@ -522,6 +539,7 @@ impl X86Codegen {
                     Instruction::GetElementPtr { dest, .. } => Some(dest.0),
                     Instruction::Load { dest, .. } => Some(dest.0),
                     Instruction::Cmp { dest, .. } => Some(dest.0),
+                    Instruction::Phi { dest, .. } => Some(dest.0),
                     _ => None,
                 };
 
@@ -531,6 +549,190 @@ impl X86Codegen {
             }
         }
         None
+    }
+
+    /// Analyze function to detect IVSR pointer patterns.
+    /// Called once before codegen starts.
+    ///
+    /// NOTE: This analysis currently does not find any patterns because phi nodes
+    /// are eliminated before codegen runs. For Phase 9b to work properly, this
+    /// detection would need to run as an IR transformation pass BEFORE phi elimination.
+    /// See docs/phase9b_implementation_notes.md for details.
+    pub(super) fn analyze_ivsr_pointers(&mut self, _func: &IrFunction) {
+        // Disabled: Phi nodes are eliminated before codegen, so this detection
+        // cannot find IVSR patterns. Left in place as infrastructure for future
+        // implementation via IR transformation pass.
+    }
+
+    /// Detect if a phi node matches the IVSR pointer pattern:
+    /// %ptr = Phi(%init_ptr from preheader, %ptr_next from backedge)
+    /// where %ptr_next = GEP(%ptr, const_stride)
+    fn detect_ivsr_pattern(
+        &self,
+        dest: &Value,
+        incoming: &[(Operand, BlockId)],
+        func: &IrFunction,
+        header_block: BlockId,
+    ) -> Option<IvsrPointerInfo> {
+        use crate::ir::reexports::Instruction;
+
+        // Extract the two incoming edges
+        let (init_op, _init_block) = &incoming[0];
+        let (backedge_op, backedge_block) = &incoming[1];
+
+        // Backedge value should be defined by a GEP
+        let backedge_val = match backedge_op {
+            Operand::Value(v) => v,
+            _ => return None,
+        };
+
+        // Find the GEP instruction that defines the backedge value
+        let (gep_base, stride) = self.find_gep_for_ivsr(backedge_val.0, func)?;
+
+        // Verify GEP base is the phi itself (recursive pattern)
+        if gep_base.0 != dest.0 {
+            return None;
+        }
+
+        // Extract base pointer from init value
+        let (base_ptr, init_offset) = self.extract_base_from_init(init_op, func)?;
+
+        Some(IvsrPointerInfo {
+            phi_val: *dest,
+            base_ptr,
+            stride,
+            init_offset,
+            header_block,
+            backedge_block: *backedge_block,
+        })
+    }
+
+    /// Find a GEP instruction that defines a value and extract its base and offset.
+    /// Returns (base, stride) where stride is a constant offset.
+    fn find_gep_for_ivsr(&self, val_id: u32, func: &IrFunction) -> Option<(Value, i64)> {
+        use crate::ir::reexports::Instruction;
+
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::GetElementPtr { dest, base, offset, .. } = inst {
+                    if dest.0 == val_id {
+                        // Extract constant offset
+                        let stride = match offset {
+                            Operand::Const(c) => c.to_i64()?,
+                            _ => return None,
+                        };
+                        return Some((*base, stride));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Extract the base pointer from the init value of an IVSR phi.
+    /// Handles both direct base pointers and GEP-computed init values.
+    fn extract_base_from_init(&self, init_op: &Operand, func: &IrFunction) -> Option<(Value, i64)> {
+        use crate::ir::reexports::Instruction;
+
+        match init_op {
+            Operand::Value(v) => {
+                // Check if init value is a GEP (handles cases like %init = GEP(%arr, 0))
+                for block in &func.blocks {
+                    for inst in &block.instructions {
+                        if let Instruction::GetElementPtr { dest, base, offset, .. } = inst {
+                            if dest.0 == v.0 {
+                                let init_offset = match offset {
+                                    Operand::Const(c) => c.to_i64().unwrap_or(0),
+                                    _ => 0,
+                                };
+                                return Some((*base, init_offset));
+                            }
+                        }
+                    }
+                }
+                // Not a GEP - just a direct pointer value
+                Some((*v, 0))
+            }
+            _ => None,
+        }
+    }
+
+    /// Associate IVSR pointer phis with their corresponding loop counter IVs.
+    fn associate_pointers_with_counters(&mut self, func: &IrFunction) {
+        let ptr_phis: Vec<(u32, BlockId)> = self.ivsr_pointers.iter()
+            .map(|(&id, info)| (id, info.header_block))
+            .collect();
+
+        for (ptr_phi_id, header_block) in ptr_phis {
+            // Find integer IV phi in same header block
+            if let Some(counter_iv) = self.find_counter_in_header(header_block, func) {
+                self.pointer_to_counter.insert(ptr_phi_id, counter_iv.0);
+            }
+        }
+    }
+
+    /// Find an integer induction variable phi in the given header block.
+    fn find_counter_in_header(&self, header: BlockId, func: &IrFunction) -> Option<Value> {
+        use crate::ir::reexports::Instruction;
+
+        let header_block = &func.blocks[header.0 as usize];
+
+        for inst in &header_block.instructions {
+            if let Instruction::Phi { dest, ty, incoming } = inst {
+                // Look for integer phis (I32, I64, U32, U64)
+                if !matches!(ty, IrType::I32 | IrType::I64 | IrType::U32 | IrType::U64) {
+                    continue;
+                }
+
+                // Check if it's incremented in the backedge (simple heuristic)
+                if self.is_induction_variable(dest, incoming, func) {
+                    return Some(*dest);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Check if a phi node is an induction variable (incremented by a constant).
+    fn is_induction_variable(&self, dest: &Value, incoming: &[(Operand, BlockId)], func: &IrFunction) -> bool {
+        use crate::ir::reexports::Instruction;
+
+        if incoming.len() != 2 {
+            return false;
+        }
+
+        // Get the backedge value (typically the second incoming edge)
+        let backedge_val = match &incoming[1].0 {
+            Operand::Value(v) => v,
+            _ => return false,
+        };
+
+        // Check if backedge value is defined by Add/Sub with the phi itself
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::BinOp { dest: bd, op, lhs, rhs, .. } if bd.0 == backedge_val.0 => {
+                        // Check for %i_next = Add(%i, const) or Add(const, %i)
+                        let is_add_or_sub = matches!(op, IrBinOp::Add | IrBinOp::Sub);
+                        if !is_add_or_sub {
+                            return false;
+                        }
+
+                        let has_phi = match (lhs, rhs) {
+                            (Operand::Value(v), Operand::Const(_)) => v.0 == dest.0,
+                            (Operand::Const(_), Operand::Value(v)) => v.0 == dest.0,
+                            _ => false,
+                        };
+
+                        return has_phi;
+                    }
+                    _ => continue,
+                }
+            }
+        }
+
+        false
     }
 
     /// Load an operand directly into %rcx, avoiding the push/pop pattern.
