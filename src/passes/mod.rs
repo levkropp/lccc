@@ -28,6 +28,7 @@ mod resolve_asm;
 pub(crate) mod simplify;
 pub(crate) mod loop_unroll;
 pub(crate) mod tail_call_elim;
+pub(crate) mod recursion_to_iter;
 pub(crate) mod vectorize;
 
 use crate::ir::analysis::CfgAnalysis;
@@ -300,6 +301,12 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
     // resulting loops (e.g., hoist invariants, reduce induction variables).
     if !disabled.contains("tce") {
         module.for_each_function(tail_call_elim::tail_calls_to_loops);
+    }
+
+    // Binary recursion → iterative accumulator (e.g., Fibonacci).
+    // Runs after TCE so it catches patterns TCE can't handle (non-tail binary recursion).
+    if !disabled.contains("rec2iter") {
+        module.for_each_function(recursion_to_iter::recursion_to_iteration);
     }
 
     let iterations = 3;
