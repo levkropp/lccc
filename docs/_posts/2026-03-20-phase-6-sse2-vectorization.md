@@ -704,6 +704,6 @@ movupd  %xmm0, (%rax)
 ---
 
 **Read more:**
-- [Phase 5: FP Peephole Optimization]({% post_url 2026-03-15-phase-5-fp-peephole %})
+- [Phase 5: FP Peephole Optimization]({{ site.baseurl }}/docs/optimization-passes)
 - [Register Allocator Deep Dive]({{ site.baseurl }}/docs/register-allocator)
 - [GitHub: levkropp/lccc](https://github.com/levkropp/lccc)
