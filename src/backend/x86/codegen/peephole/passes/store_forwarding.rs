@@ -126,6 +126,29 @@ fn invalidate_all_mappings(slot_entries: &mut Vec<SlotEntry>, reg_offsets: &mut 
     }
 }
 
+/// Invalidate only caller-saved register mappings, preserving callee-saved ones.
+/// Callee-saved registers (rbx=3, r12=12, r13=13, r14=14, r15=15) are never
+/// clobbered implicitly, so their stack-slot mappings remain valid across
+/// jump-target labels (e.g., loop headers).
+fn invalidate_caller_saved_mappings(slot_entries: &mut Vec<SlotEntry>, reg_offsets: &mut [SmallVec; 16]) {
+    // Remove entries for caller-saved registers, keep callee-saved
+    slot_entries.retain(|entry| {
+        if entry.active && is_callee_saved_reg(entry.mapping.reg_id) {
+            true // keep
+        } else if entry.active {
+            // Caller-saved: remove from per-register tracking
+            reg_offsets[entry.mapping.reg_id as usize].remove_val(entry.offset);
+            false
+        } else {
+            false // already inactive
+        }
+    });
+    // Clear per-register offset lists for caller-saved registers
+    for reg in [0u8, 1, 2, 6, 7, 8, 9, 10, 11] {
+        reg_offsets[reg as usize].clear();
+    }
+}
+
 /// Deactivate a single slot entry and remove its offset from the per-register tracking.
 #[inline]
 fn deactivate_entry(entry: &mut SlotEntry, reg_offsets: &mut [SmallVec; 16]) {
@@ -229,8 +252,14 @@ fn gsf_handle_label(
     } else {
         targets.has_non_numeric_jump_targets
     };
-    if is_target || prev_was_unconditional_jump {
+    if prev_was_unconditional_jump {
+        // After an unconditional jump, we don't know which path was taken, so clear all.
         invalidate_all_mappings(slot_entries, reg_offsets);
+    } else if is_target {
+        // At a jump target (e.g., loop header), callee-saved register mappings are
+        // still valid because callee-saved registers are never clobbered implicitly.
+        // Only invalidate caller-saved register mappings.
+        invalidate_caller_saved_mappings(slot_entries, reg_offsets);
     }
 }
 
