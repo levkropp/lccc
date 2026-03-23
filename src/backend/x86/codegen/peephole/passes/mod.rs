@@ -149,7 +149,7 @@ pub fn peephole_optimize(asm: String) -> String {
     dead_code::eliminate_never_read_stores(&store, &mut infos);
 
     // Phase 6: Eliminate unused callee-saved register saves/restores.
-    callee_saves::eliminate_unused_callee_saves(&store, &mut infos);
+    callee_saves::eliminate_unused_callee_saves(&mut store, &mut infos);
 
     // Phase 7: Compact stack frames by packing callee-saved saves tightly
     // and shrinking subq $N, %rsp when dead stores/callee-save elimination

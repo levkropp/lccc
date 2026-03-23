@@ -8,7 +8,7 @@
 use super::super::types::*;
 use super::helpers::*;
 
-pub(super) fn eliminate_unused_callee_saves(store: &LineStore, infos: &mut [LineInfo]) {
+pub(super) fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo]) {
     let len = store.len();
     if len == 0 {
         return;
@@ -51,9 +51,10 @@ pub(super) fn eliminate_unused_callee_saves(store: &LineStore, infos: &mut [Line
 
         j = next_non_nop(infos, j, len);
 
-        // First, collect pushq callee-saved registers (new prologue style)
+        // First, collect pushq callee-saved registers (new prologue style).
+        // Skip .cfi directives interspersed between pushes.
         while j < len {
-            if infos[j].is_nop() { j += 1; continue; }
+            if infos[j].is_nop() || infos[j].kind == LineKind::Directive { j += 1; continue; }
             if let LineKind::Push { reg } = infos[j].kind {
                 if is_callee_saved_reg(reg) {
                     saves.push(CalleeSave { reg, save_line_idx: j, is_push: true });
@@ -64,8 +65,8 @@ pub(super) fn eliminate_unused_callee_saves(store: &LineStore, infos: &mut [Line
             break;
         }
 
-        // Skip subq $N, %rsp if present
-        j = next_non_nop(infos, j, len);
+        // Skip subq $N, %rsp if present (also skip directives)
+        while j < len && (infos[j].is_nop() || infos[j].kind == LineKind::Directive) { j += 1; }
         if j < len {
             let subq_line = infos[j].trimmed(store.get(j));
             if let Some(rest) = subq_line.strip_prefix("subq $") {
@@ -149,6 +150,33 @@ pub(super) fn eliminate_unused_callee_saves(store: &LineStore, infos: &mut [Line
                 mark_nop(&mut infos[save.save_line_idx]);
                 for &ri in &restore_indices {
                     mark_nop(&mut infos[ri]);
+                }
+            }
+        }
+
+        // Update leaq -N(%rbp), %rsp in epilogues when push-based saves were eliminated.
+        // The leaq offset must shrink by 8 for each eliminated push.
+        let eliminated_pushes = saves.iter()
+            .filter(|s| s.is_push && infos[s.save_line_idx].is_nop())
+            .count();
+        if eliminated_pushes > 0 {
+            let remaining_pushes = saves.iter()
+                .filter(|s| s.is_push && !infos[s.save_line_idx].is_nop())
+                .count();
+            let new_offset = -(remaining_pushes as i64 * 8);
+            let old_offset = -((remaining_pushes + eliminated_pushes) as i64 * 8);
+            let old_leaq = format!("leaq {}(%rbp), %rsp", old_offset);
+            let new_leaq = if remaining_pushes > 0 {
+                format!("    leaq {}(%rbp), %rsp", new_offset)
+            } else {
+                "    movq %rbp, %rsp".to_string()
+            };
+
+            for k in body_start..func_end {
+                if infos[k].is_nop() { continue; }
+                let line = infos[k].trimmed(store.get(k));
+                if line.contains(&old_leaq) {
+                    replace_line(store, &mut infos[k], k, new_leaq.clone());
                 }
             }
         }
