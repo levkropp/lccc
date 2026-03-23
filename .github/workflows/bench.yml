@@ -1,0 +1,67 @@
+name: Benchmarks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    name: LCCC vs GCC
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build LCCC
+        run: cargo build --release
+
+      - name: Detect GCC include path
+        id: gcc
+        run: |
+          GCC_INC="$(gcc -print-file-name=include)"
+          echo "inc=$GCC_INC" >> "$GITHUB_OUTPUT"
+          echo "GCC include: $GCC_INC"
+          gcc --version | head -1
+
+      - name: Run benchmarks
+        env:
+          GCC_INC: ${{ steps.gcc.outputs.inc }}
+        run: |
+          python3 .github/scripts/ci-bench.py \
+            --lccc target/release/lccc \
+            --gcc-inc "$GCC_INC" \
+            --reps 5 \
+            --json bench-results.json \
+            --summary > bench-summary.md
+
+      - name: Post benchmark summary
+        if: always()
+        run: cat bench-summary.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: |
+            bench-results.json
+            bench-summary.md
