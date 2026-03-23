@@ -392,6 +392,107 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
     changed
 }
 
+// ── Redundant sign-extension elimination for callee-saved registers ──────────
+//
+// The codegen emits `movslq %REGd, %REG` after every signed i32 ALU op on
+// callee-saved registers. Two patterns are eliminated:
+//
+// 1. Self sign-extension followed by movslq to rax:
+//    movslq %r11d, %r11   ← redundant (the next movslq re-extends)
+//    movslq %r11d, %rax
+//
+// 2. cltq followed by store: the sign-extension is unnecessary since the
+//    stored value will be re-extended on the next load.
+
+pub(super) fn eliminate_dead_sign_extensions(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+
+    while i < len {
+        if infos[i].is_nop() { i += 1; continue; }
+
+        let t = infos[i].trimmed(store.get(i));
+
+        // Pattern 1: movslq %REGd, %REG followed by movslq %REGd, %rax
+        // The first movslq is dead because the second re-extends from %REGd.
+        if t.starts_with("movslq %") && t.contains("d, %") {
+            // Parse: "movslq %XXXd, %XXX" (self sign-extension)
+            let parts: Vec<&str> = t.split(", ").collect();
+            if parts.len() == 2 {
+                let src = parts[0].trim_start_matches("movslq ");
+                let dst = parts[1];
+                // Check if it's a self sign-extension: src without 'd' suffix == dst
+                let src_base = src.trim_end_matches('d');
+                if src_base == dst {
+                    // Look ahead for another movslq from the same 32-bit register
+                    let mut j = i + 1;
+                    let mut found_re_extend = false;
+                    while j < len && j < i + 4 {
+                        if infos[j].is_nop() { j += 1; continue; }
+                        let t2 = infos[j].trimmed(store.get(j));
+                        // Next instruction uses %REGd as source (re-extends)
+                        if t2.starts_with("movslq ") && t2.contains(src) {
+                            found_re_extend = true;
+                            break;
+                        }
+                        // If the 64-bit form is used before re-extension, we can't remove
+                        if t2.contains(dst) {
+                            break;
+                        }
+                        j += 1;
+                    }
+                    if found_re_extend {
+                        mark_nop(&mut infos[i]);
+                        changed = true;
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Pattern 2: cltq where ALL subsequent uses of %rax before its next write
+        // are stores to stack (which will be re-sign-extended on load).
+        // Only safe if no other instruction reads %rax as 64-bit before it's overwritten.
+        if t == "cltq" {
+            let mut j = i + 1;
+            let mut all_stores = true;
+            let mut found_any = false;
+            while j < len && j < i + 6 {
+                if infos[j].is_nop() { j += 1; continue; }
+                if infos[j].is_barrier() { break; }
+                match infos[j].kind {
+                    LineKind::StoreRbp { reg: 0, .. } => {
+                        found_any = true;
+                        j += 1;
+                        continue;
+                    }
+                    _ => {
+                        // If this instruction reads rax (family 0), the cltq may be needed
+                        if infos[j].reg_refs & 1 != 0 {
+                            all_stores = false;
+                        }
+                        break;
+                    }
+                }
+            }
+            if found_any && all_stores {
+                mark_nop(&mut infos[i]);
+                changed = true;
+                i += 1;
+                continue;
+            }
+        }
+
+        i += 1;
+    }
+    changed
+}
+
 // ── FP XMM↔GPR round-trip elimination ────────────────────────────────────────
 //
 // float_ops.rs emits FP binops as:

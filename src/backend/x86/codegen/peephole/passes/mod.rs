@@ -78,6 +78,7 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= local_patterns::eliminate_fp_spill_around_load(&mut store, &mut infos);
         changed |= local_patterns::fuse_copy_and_operation(&mut store, &mut infos);
         changed |= local_patterns::promote_loop_invariant_fp_load(&mut store, &mut infos);
+        changed |= local_patterns::eliminate_dead_sign_extensions(&mut store, &mut infos);
         if local_changed || pass_count == 0 {
             changed |= push_pop::eliminate_push_pop_pairs(&store, &mut infos);
             changed |= push_pop::eliminate_binop_push_pop_pattern(&mut store, &mut infos);
