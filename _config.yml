@@ -13,6 +13,8 @@ kramdown:
 permalink: pretty
 
 exclude:
+  - vendor/
+  - Gemfile.lock
   - Cargo.toml
   - Cargo.lock
   - target/
