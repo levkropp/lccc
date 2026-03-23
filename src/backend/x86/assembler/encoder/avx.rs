@@ -301,6 +301,41 @@ impl super::InstructionEncoder {
         }
     }
 
+    /// Encode AVX/FMA3 3-operand in 0F38 map with W=1 (double-precision FMA)
+    /// vfmadd231pd, vfmadd213pd, vfmadd132pd, etc.
+    pub(crate) fn encode_avx_3op_38_w1(&mut self, ops: &[Operand], opcode: u8, has_66: bool) -> Result<(), String> {
+        if ops.len() != 3 { return Err("FMA3 3-op requires 3 operands".to_string()); }
+        let l = self.vex_l_from_ops(ops);
+        let pp = if has_66 { 1 } else { 0 };
+
+        match (&ops[0], &ops[1], &ops[2]) {
+            (Operand::Register(src), Operand::Register(vvvv), Operand::Register(dst)) => {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let vvvv_num = reg_num(&vvvv.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                let r = needs_vex_ext(&dst.name);
+                let b = needs_vex_ext(&src.name);
+                let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
+                self.emit_vex(r, false, b, 2, 1, vvvv_enc, l, pp); // W=1 for F64
+                self.bytes.push(opcode);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+                Ok(())
+            }
+            (Operand::Memory(mem), Operand::Register(vvvv), Operand::Register(dst)) => {
+                let vvvv_num = reg_num(&vvvv.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                let r = needs_vex_ext(&dst.name);
+                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
+                self.emit_vex(r, x, b_ext, 2, 1, vvvv_enc, l, pp); // W=1 for F64
+                self.bytes.push(opcode);
+                self.encode_modrm_mem(dst_num, mem)
+            }
+            _ => Err("unsupported FMA3 3-op operands".to_string()),
+        }
+    }
+
     /// Encode AVX 3-operand in 0F map (mm=1) with imm8 (vshufps, vshufpd, etc.)
     pub(crate) fn encode_avx_3op_0f_imm8(&mut self, ops: &[Operand], opcode: u8, has_66: bool) -> Result<(), String> {
         if ops.len() != 4 { return Err("AVX 3-op+imm8 requires 4 operands".to_string()); }
