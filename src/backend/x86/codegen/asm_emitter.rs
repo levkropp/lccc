@@ -182,6 +182,9 @@ impl InlineAsmEmitter for X86Codegen {
                             // would have set mem_addr, but handle defensively)
                             self.state.out.emit_instr_rbp_reg("    leaq", slot.0, &tmp_reg);
                         }
+                    } else if self.state.vector_values.contains(&v.0) {
+                        // Vector value: use leaq to get address (vectors are stored directly at slot)
+                        self.state.out.emit_instr_rbp_reg("    leaq", slot.0, &tmp_reg);
                     } else {
                         // Non-alloca: slot holds a pointer, load it
                         self.state.out.emit_instr_rbp_reg("    movq", slot.0, &tmp_reg);

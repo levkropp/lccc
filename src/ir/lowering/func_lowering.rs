@@ -548,6 +548,9 @@ impl Lowerer {
         let ret_eightbyte_classes = self.func_meta.sigs.get(&func.name)
             .map(|s| s.ret_eightbyte_classes.clone())
             .unwrap_or_default();
+        // Use the lowerer's global next_label counter to ensure labels are globally unique
+        let next_label = self.next_label;
+
         let ir_func = IrFunction {
             name: func.name.clone(), return_type, params,
             blocks: std::mem::take(&mut self.func_mut().blocks),
@@ -556,6 +559,7 @@ impl Lowerer {
             is_always_inline: func.attrs.is_always_inline(),
             is_noinline: func.attrs.is_noinline(),
             next_value_id: next_val,
+            next_label,
             section: func.attrs.section.clone(),
             visibility: func.attrs.visibility.clone(),
             is_weak: func.attrs.is_weak(),

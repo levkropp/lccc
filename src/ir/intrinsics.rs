@@ -83,6 +83,123 @@ pub enum IntrinsicOp {
     /// args[1]: pointer to 4×F64 source vector
     /// NOT pure: modifies memory at dest_ptr.
     FmaF64x4,
+
+    // --- Vector loads for reduction patterns ---
+    /// Load 4 packed doubles (256-bit unaligned): vmovupd
+    /// args[0] = base pointer, args[1] = byte offset
+    /// dest_ptr = result ptr (32 bytes, 4×F64)
+    LoadF64x4,
+    /// Load 2 packed doubles (128-bit unaligned): movupd
+    /// args[0] = base pointer, args[1] = byte offset
+    /// dest_ptr = result ptr (16 bytes, 2×F64)
+    LoadF64x2,
+    /// Load 8 packed 32-bit ints (256-bit unaligned): vmovdqu
+    /// args[0] = base pointer, args[1] = byte offset
+    /// dest_ptr = result ptr (32 bytes, 8×I32)
+    LoadI32x8,
+    /// Load 4 packed 32-bit ints (128-bit unaligned): movdqu
+    /// args[0] = base pointer, args[1] = byte offset
+    /// dest_ptr = result ptr (16 bytes, 4×I32)
+    LoadI32x4,
+
+    // --- Vector arithmetic for reductions ---
+    /// Packed 4×F64 add (256-bit): vaddpd
+    /// args[0] = src1 ptr, args[1] = src2 ptr; dest_ptr = result ptr
+    AddF64x4,
+    /// Packed 2×F64 add (128-bit): addpd
+    /// args[0] = src1 ptr, args[1] = src2 ptr; dest_ptr = result ptr
+    AddF64x2,
+    /// Packed 4×F64 multiply (256-bit): vmulpd
+    /// args[0] = src1 ptr, args[1] = src2 ptr; dest_ptr = result ptr
+    MulF64x4,
+    /// Packed 2×F64 multiply (128-bit): mulpd
+    /// args[0] = src1 ptr, args[1] = src2 ptr; dest_ptr = result ptr
+    MulF64x2,
+    /// Packed 8×I32 add (256-bit): vpaddd
+    /// args[0] = src1 ptr, args[1] = src2 ptr; dest_ptr = result ptr
+    AddI32x8,
+    /// Packed 4×I32 add (128-bit): paddd
+    /// args[0] = src1 ptr, args[1] = src2 ptr; dest_ptr = result ptr
+    AddI32x4,
+
+    // --- Horizontal reduction (vector → scalar) ---
+    /// Horizontal add 4×F64 → 1×F64 (AVX2)
+    /// Reduces {a, b, c, d} to a+b+c+d
+    /// args[0] = src vector ptr (32 bytes); dest = scalar F64
+    HorizontalAddF64x4,
+    /// Horizontal add 2×F64 → 1×F64 (SSE2)
+    /// Reduces {a, b} to a+b
+    /// args[0] = src vector ptr (16 bytes); dest = scalar F64
+    HorizontalAddF64x2,
+    /// Horizontal add 8×I32 → 1×I32 (AVX2)
+    /// Reduces {a,b,c,d,e,f,g,h} to a+b+c+d+e+f+g+h
+    /// args[0] = src vector ptr (32 bytes); dest = scalar I32
+    HorizontalAddI32x8,
+    /// Horizontal add 4×I32 → 1×I32 (SSE2)
+    /// Reduces {a,b,c,d} to a+b+c+d
+    /// args[0] = src vector ptr (16 bytes); dest = scalar I32
+    HorizontalAddI32x4,
+
+    // --- Register-based vector operations for reductions (SSA-friendly) ---
+    /// Vector load: %dest_vec = load_vector(base_ptr, offset) - AVX2 4×F64
+    /// Returns vector value in SSA, lives in %ymm register
+    /// args[0] = base pointer, args[1] = byte offset; dest = vector value
+    VecLoadF64x4,
+    /// Vector load: %dest_vec = load_vector(base_ptr, offset) - SSE2 2×F64
+    /// Returns vector value in SSA, lives in %xmm register
+    /// args[0] = base pointer, args[1] = byte offset; dest = vector value
+    VecLoadF64x2,
+    /// Vector load: %dest_vec = load_vector(base_ptr, offset) - AVX2 8×I32
+    /// args[0] = base pointer, args[1] = byte offset; dest = vector value
+    VecLoadI32x8,
+    /// Vector load: %dest_vec = load_vector(base_ptr, offset) - SSE2 4×I32
+    /// args[0] = base pointer, args[1] = byte offset; dest = vector value
+    VecLoadI32x4,
+
+    /// Vector add: %dest_vec = %src1_vec + %src2_vec - AVX2 4×F64
+    /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
+    VecAddF64x4,
+    /// Vector add: %dest_vec = %src1_vec + %src2_vec - SSE2 2×F64
+    /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
+    VecAddF64x2,
+    /// Vector multiply: %dest_vec = %src1_vec * %src2_vec - AVX2 4×F64
+    /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
+    VecMulF64x4,
+    /// Vector multiply: %dest_vec = %src1_vec * %src2_vec - SSE2 2×F64
+    /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
+    VecMulF64x2,
+    /// Vector add: %dest_vec = %src1_vec + %src2_vec - AVX2 8×I32
+    /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
+    VecAddI32x8,
+    /// Vector add: %dest_vec = %src1_vec + %src2_vec - SSE2 4×I32
+    /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
+    VecAddI32x4,
+
+    /// Horizontal reduction: %scalar = horizontal_add(%vec) - AVX2 4×F64 → F64
+    /// args[0] = source vector value; dest = scalar F64 result
+    VecHorizontalAddF64x4,
+    /// Horizontal reduction: %scalar = horizontal_add(%vec) - SSE2 2×F64 → F64
+    /// args[0] = source vector value; dest = scalar F64 result
+    VecHorizontalAddF64x2,
+    /// Horizontal reduction: %scalar = horizontal_add(%vec) - AVX2 8×I32 → I32
+    /// args[0] = source vector value; dest = scalar I32 result
+    VecHorizontalAddI32x8,
+    /// Horizontal reduction: %scalar = horizontal_add(%vec) - SSE2 4×I32 → I32
+    /// args[0] = source vector value; dest = scalar I32 result
+    VecHorizontalAddI32x4,
+
+    /// Vector zero: %dest_vec = {0.0, 0.0, 0.0, 0.0} - AVX2 4×F64
+    /// No args; dest = zero vector
+    VecZeroF64x4,
+    /// Vector zero: %dest_vec = {0.0, 0.0} - SSE2 2×F64
+    /// No args; dest = zero vector
+    VecZeroF64x2,
+    /// Vector zero: %dest_vec = {0, 0, 0, 0, 0, 0, 0, 0} - AVX2 8×I32
+    /// No args; dest = zero vector
+    VecZeroI32x8,
+    /// Vector zero: %dest_vec = {0, 0, 0, 0} - SSE2 4×I32
+    /// No args; dest = zero vector
+    VecZeroI32x4,
     /// AES-NI: aesenc (single round encrypt)
     /// args[0] = state ptr, args[1] = round key ptr; dest_ptr = result ptr
     Aesenc128,
@@ -234,7 +351,15 @@ impl IntrinsicOp {
             // SSE4.1 insert/extract are pure
             IntrinsicOp::Pinsrd128 | IntrinsicOp::Pextrd128 |
             IntrinsicOp::Pinsrb128 | IntrinsicOp::Pextrb128 |
-            IntrinsicOp::Pinsrq128 | IntrinsicOp::Pextrq128
+            IntrinsicOp::Pinsrq128 | IntrinsicOp::Pextrq128 |
+            // Vector reduction operations are pure
+            IntrinsicOp::LoadF64x4 | IntrinsicOp::LoadF64x2 |
+            IntrinsicOp::LoadI32x8 | IntrinsicOp::LoadI32x4 |
+            IntrinsicOp::AddF64x4 | IntrinsicOp::AddF64x2 |
+            IntrinsicOp::MulF64x4 | IntrinsicOp::MulF64x2 |
+            IntrinsicOp::AddI32x8 | IntrinsicOp::AddI32x4 |
+            IntrinsicOp::HorizontalAddF64x4 | IntrinsicOp::HorizontalAddF64x2 |
+            IntrinsicOp::HorizontalAddI32x8 | IntrinsicOp::HorizontalAddI32x4
         )
     }
 }

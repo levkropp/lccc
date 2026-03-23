@@ -860,6 +860,9 @@ impl X86Codegen {
                 } else {
                     self.state.out.emit_instr_rbp_reg("    leaq", slot.0, reg);
                 }
+            } else if self.state.vector_values.contains(&val.0) {
+                // Vector value: use leaq to get address (vectors are stored directly at slot)
+                self.state.out.emit_instr_rbp_reg("    leaq", slot.0, reg);
             } else {
                 self.state.out.emit_instr_rbp_reg("    movq", slot.0, reg);
             }
@@ -1480,7 +1483,32 @@ impl ArchCodegen for X86Codegen {
     fn emit_call_store_f128_result(&mut self, _dest: &Value) { unreachable!("x86 uses custom emit_call_store_result for F128") }
 
     fn emit_copy_value(&mut self, dest: &Value, src: &Operand) {
+        // Handle vector Copy instructions: %dest_vec = copy %src_vec
+        // Vectors are stored directly in stack slots (not as pointers), so we copy
+        // with ymm/xmm registers instead of scalar movq.
         if let Operand::Value(v) = src {
+            if self.state.vector_values.contains(&v.0) {
+                let debug = std::env::var("LCCC_DEBUG_PROTECT").is_ok();
+                if debug {
+                    eprintln!("[COPY-VEC] Copying vector SSA {} to SSA {}", v.0, dest.0);
+                }
+                if let (Some(src_slot), Some(dest_slot)) = (self.state.get_slot(v.0), self.state.get_slot(dest.0)) {
+                    // Copy vector from src slot to dest slot using ymm0
+                    // TODO: check if it's SSE (128-bit) or AVX (256-bit) and use appropriate register
+                    // For now, assume AVX2 (256-bit)
+                    if debug {
+                        eprintln!("[COPY-VEC] Copying slot {} to slot {}", src_slot.0, dest_slot.0);
+                    }
+                    self.state.out.emit_instr_rbp_reg("    vmovupd", src_slot.0 as i64, "ymm0");
+                    self.state.out.emit_instr_reg_rbp("    vmovupd", "ymm0", dest_slot.0 as i64);
+                    self.state.vector_values.insert(dest.0);
+                    return;
+                } else if debug {
+                    eprintln!("[COPY-VEC] Missing slot! src_slot={:?}, dest_slot={:?}",
+                        self.state.get_slot(v.0), self.state.get_slot(dest.0));
+                }
+            }
+
             if self.state.f128_direct_slots.contains(&v.0) {
                 if let (Some(src_slot), Some(dest_slot)) = (self.state.get_slot(v.0), self.state.get_slot(dest.0)) {
                     self.state.out.emit_instr_rbp("    fldt", src_slot.0);

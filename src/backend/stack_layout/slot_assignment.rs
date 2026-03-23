@@ -30,8 +30,15 @@ use super::{
 pub(super) fn coalescable_group(
     val_id: u32,
     ctx: &StackLayoutContext,
+    state: &crate::backend::state::CodegenState,
 ) -> Option<usize> {
     if !ctx.coalesce {
+        return None;
+    }
+    // Protected values (DynAlloca results, vector temps) must use Tier 2 (multi-block)
+    // to get permanent, non-reusable slots. Tier 3 (block-local) slots are shared
+    // across blocks via deferred finalization, which can cause aliasing issues.
+    if state.protected_slot_values.contains(&val_id) {
         return None;
     }
     // Values defined in multiple blocks (from phi elimination) must use Tier 2.
@@ -419,19 +426,42 @@ fn classify_value(
         }
     }
 
+    // Vector values from Vec* intrinsics need protected stack slots to prevent
+    // slot reuse from corrupting vector data during reduction vectorization.
+    // The vector_values set is populated by the backend's intrinsic emitters
+    // when they encounter VecZero*, VecLoad*, VecAdd*, etc. operations.
+    if state.vector_values.contains(&dest.0) {
+        state.protected_slot_values.insert(dest.0);
+    }
+
+    let debug_protect = std::env::var("LCCC_DEBUG_PROTECT").is_ok();
+
     // Skip register-assigned values (no stack slot needed).
     if reg_assigned.contains_key(&dest.0) {
+        if debug_protect && state.protected_slot_values.contains(&dest.0) {
+            eprintln!("[CLASSIFY] SSA {} is protected but register-assigned, skipping slot", dest.0);
+        }
         return;
     }
 
     // Skip dead values (defined but never used).
     if !ctx.used_values.contains(&dest.0) {
+        if debug_protect && state.protected_slot_values.contains(&dest.0) {
+            eprintln!("[CLASSIFY] SSA {} is protected but not in used_values, skipping slot", dest.0);
+        }
         return;
     }
 
     // Skip copy-aliased values (they'll share root's slot). Not for i128/f128.
-    if !is_i128 && !is_f128 && ctx.copy_alias.contains_key(&dest.0) {
+    // Also don't skip protected values (vectors, DynAlloca results) - they need
+    // unique slots even if copy-aliased, to prevent corruption from slot reuse.
+    let is_copy_aliased = ctx.copy_alias.contains_key(&dest.0);
+    let is_protected = state.protected_slot_values.contains(&dest.0);
+    if !is_i128 && !is_f128 && !is_protected && is_copy_aliased {
         return;
+    }
+    if debug_protect && is_protected && is_copy_aliased {
+        eprintln!("[CLASSIFY] SSA {} is protected AND copy-aliased, allocating slot anyway", dest.0);
     }
 
     // Skip immediately-consumed values: produced and consumed in adjacent
@@ -460,7 +490,7 @@ fn classify_value(
         state.small_slot_values.insert(dest.0);
     }
 
-    if let Some(target_blk) = coalescable_group(dest.0, ctx) {
+    if let Some(target_blk) = coalescable_group(dest.0, ctx, state) {
         block_local_values.push(BlockLocalValue {
             dest_id: dest.0,
             slot_size,
@@ -481,6 +511,7 @@ fn classify_value(
 /// critical for functions like blake2s_compress_generic where macro expansion
 /// creates thousands of short-lived intermediates in a single loop body block.
 pub(super) fn assign_tier3_block_local_slots(
+    state: &crate::backend::state::CodegenState,
     func: &IrFunction,
     ctx: &StackLayoutContext,
     coalesce: bool,
@@ -617,6 +648,7 @@ pub(super) fn assign_tier3_block_local_slots(
     }
 
     // For each block, assign slots with greedy coloring.
+    let debug_protect = std::env::var("LCCC_DEBUG_PROTECT").is_ok();
     for (blk_idx, values) in &per_block {
         let mut active: Vec<(usize, i64, i64)> = Vec::new(); // (last_use, offset, size)
         let mut free_8: Vec<i64> = Vec::new();
@@ -638,12 +670,21 @@ pub(super) fn assign_tier3_block_local_slots(
             }
 
             // Try to reuse a freed slot of matching size.
+            // Protected values (DynAlloca results, vector temps) must get unique slots.
+            let can_reuse = !state.protected_slot_values.contains(&dest_id);
             let free_list = if slot_size == 16 { &mut free_16 } else { &mut free_8 };
-            let offset = if let Some(reused) = free_list.pop() {
+            let offset = if can_reuse && free_list.len() > 0 {
+                let reused = free_list.pop().unwrap();
+                if debug_protect {
+                    eprintln!("[PROTECT-T3] SSA {} reused block-local slot {}", dest_id, reused);
+                }
                 reused
             } else {
                 let off = block_peak;
                 block_peak += slot_size;
+                if debug_protect && !can_reuse {
+                    eprintln!("[PROTECT-T3] SSA {} is protected, forced new slot at offset {}", dest_id, off);
+                }
                 off
             };
 
@@ -749,19 +790,37 @@ fn pack_values_into_slots(
     let mut heap: BinaryHeap<Reverse<(u32, usize)>> = BinaryHeap::new();
     let mut slot_offsets: Vec<i64> = Vec::new();
 
+    let debug_protect = std::env::var("LCCC_DEBUG_PROTECT").is_ok();
     for &(dest_id, start, end) in values.iter() {
-        if let Some(&Reverse((slot_end, slot_idx))) = heap.peek() {
-            if slot_end < start {
-                heap.pop();
-                let slot_offset = slot_offsets[slot_idx];
-                heap.push(Reverse((end, slot_idx)));
-                state.value_locations.insert(dest_id, StackSlot(slot_offset));
-                continue;
+        // Protected values (DynAlloca results, vector temps) must get unique slots.
+        // These values hold critical pointers or data that must not be overwritten
+        // by slot reuse, even if liveness analysis suggests they're dead.
+        let can_reuse = !state.protected_slot_values.contains(&dest_id);
+
+        if debug_protect && !can_reuse {
+            eprintln!("[PROTECT-T2] SSA {} is protected, forcing new slot (size={})", dest_id, slot_size);
+        }
+
+        if can_reuse {
+            if let Some(&Reverse((slot_end, slot_idx))) = heap.peek() {
+                if slot_end < start {
+                    heap.pop();
+                    let slot_offset = slot_offsets[slot_idx];
+                    heap.push(Reverse((end, slot_idx)));
+                    state.value_locations.insert(dest_id, StackSlot(slot_offset));
+                    if debug_protect {
+                        eprintln!("[PROTECT-T2] SSA {} reused slot {}", dest_id, slot_offset);
+                    }
+                    continue;
+                }
             }
         }
         let slot_idx = slot_offsets.len();
         let (slot, new_space) = assign_slot(*non_local_space, slot_size, 0);
         state.value_locations.insert(dest_id, StackSlot(slot));
+        if debug_protect {
+            eprintln!("[PROTECT-T2] SSA {} assigned new slot {} (protected={})", dest_id, slot, !can_reuse);
+        }
         *non_local_space = new_space;
         slot_offsets.push(slot);
         heap.push(Reverse((end, slot_idx)));

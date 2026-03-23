@@ -181,6 +181,10 @@ pub struct IrFunction {
     /// Set by lowering/mem2reg/phi_eliminate to avoid expensive full-IR scans.
     /// A value of 0 means "not yet computed" (will fall back to scanning).
     pub next_value_id: u32,
+    /// Cached upper bound on Block Labels: all Block Labels in this function are < next_label.
+    /// Set by vectorization and other transformation passes to avoid duplicate labels.
+    /// A value of 0 means "not yet computed" (will fall back to scanning).
+    pub next_label: u32,
     /// __attribute__((section("..."))) - place in specific ELF section.
     pub section: Option<String>,
     /// __attribute__((visibility("hidden"|"default"|...)))
@@ -299,6 +303,7 @@ impl IrFunction {
             is_always_inline: false,
             is_noinline: false,
             next_value_id: 0,
+            next_label: 0,
             section: None,
             visibility: None,
             is_weak: false,

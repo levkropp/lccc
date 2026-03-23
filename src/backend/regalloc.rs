@@ -381,6 +381,23 @@ fn collect_non_gpr_values(func: &IrFunction, is_32bit: bool) -> FxHashSet<u32> {
                         non_gpr_values.insert(dest.0);
                     }
                 }
+                Instruction::Intrinsic { dest: Some(d), op, .. } => {
+                    // Vector intrinsics produce 128/256-bit values that cannot be
+                    // stored in scalar GPRs. Exclude them from register allocation.
+                    use crate::ir::intrinsics::IntrinsicOp;
+                    let is_vector = matches!(op,
+                        IntrinsicOp::VecZeroF64x4 | IntrinsicOp::VecZeroF64x2 |
+                        IntrinsicOp::VecZeroI32x8 | IntrinsicOp::VecZeroI32x4 |
+                        IntrinsicOp::VecLoadF64x4 | IntrinsicOp::VecLoadF64x2 |
+                        IntrinsicOp::VecLoadI32x8 | IntrinsicOp::VecLoadI32x4 |
+                        IntrinsicOp::VecAddF64x4 | IntrinsicOp::VecAddF64x2 |
+                        IntrinsicOp::VecAddI32x8 | IntrinsicOp::VecAddI32x4 |
+                        IntrinsicOp::VecMulF64x4 | IntrinsicOp::VecMulF64x2
+                    );
+                    if is_vector {
+                        non_gpr_values.insert(d.0);
+                    }
+                }
                 _ => {}
             }
         }

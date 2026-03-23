@@ -1090,6 +1090,80 @@ impl Driver {
         eliminate_phis(&mut module);
         if time_phases { eprintln!("[TIME] phi elimination: {:.3}s", t7.elapsed().as_secs_f64()); }
 
+        // CRITICAL FIX: Renumber all block labels to ensure global uniqueness across all functions
+        // This fixes a bug where optimization passes can create duplicate labels
+        {
+            use crate::ir::instruction::BlockId;
+            use std::collections::HashMap;
+            let mut next_global_label = 0u32;
+
+            for func in &mut module.functions {
+                if func.is_declaration {
+                    continue;
+                }
+
+                // Build a map from old labels to new globally-unique labels
+                let mut label_map: HashMap<BlockId, BlockId> = HashMap::new();
+                for block in &func.blocks {
+                    if !label_map.contains_key(&block.label) {
+                        label_map.insert(block.label, BlockId(next_global_label));
+                        next_global_label += 1;
+                    }
+                }
+
+                // Renumber all block labels
+                for block in &mut func.blocks {
+                    block.label = label_map[&block.label];
+                }
+
+                // Renumber all terminator targets
+                for block in &mut func.blocks {
+                    use crate::ir::reexports::Terminator;
+                    match &mut block.terminator {
+                        Terminator::Branch(target) => {
+                            if let Some(&new) = label_map.get(target) {
+                                *target = new;
+                            }
+                        }
+                        Terminator::CondBranch { true_label, false_label, .. } => {
+                            if let Some(&new) = label_map.get(true_label) {
+                                *true_label = new;
+                            }
+                            if let Some(&new) = label_map.get(false_label) {
+                                *false_label = new;
+                            }
+                        }
+                        Terminator::Switch { cases, default, .. } => {
+                            for (_val, target) in cases {
+                                if let Some(&new) = label_map.get(target) {
+                                    *target = new;
+                                }
+                            }
+                            if let Some(&new) = label_map.get(default) {
+                                *default = new;
+                            }
+                        }
+                        Terminator::IndirectBranch { possible_targets, .. } => {
+                            for target in possible_targets {
+                                if let Some(&new) = label_map.get(target) {
+                                    *target = new;
+                                }
+                            }
+                        }
+                        Terminator::Return(_) | Terminator::Unreachable => {}
+                    }
+                }
+            }
+        }
+
+        // Debug: dump IR labels before codegen
+        if std::env::var("LCCC_DEBUG_LABELS").is_ok() {
+            for func in &module.functions {
+                eprintln!("[IR] Function {}: labels = {:?}", func.name,
+                          func.blocks.iter().map(|b| b.label.0).collect::<Vec<_>>());
+            }
+        }
+
         // Note: we intentionally do NOT run copy_prop after phi elimination.
         // The IR is no longer in SSA form at this point - Copy instructions from
         // phi elimination represent moves at specific program points. Propagating

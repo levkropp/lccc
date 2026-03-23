@@ -19,7 +19,7 @@
 //! This allows the backend's indexed addressing detection (Phase 9) to emit
 //! efficient SIB-form instructions.
 
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::FxHashSet;
 use crate::common::types::IrType;
 use crate::ir::reexports::{
     BlockId,
@@ -213,8 +213,10 @@ fn extract_base_from_init(func: &IrFunction, init_op: &Operand) -> Option<(Value
 
 /// Find an integer IV phi in the same header block
 fn find_index_iv_in_header(func: &IrFunction, header: BlockId) -> Option<Value> {
-    let header_block = &func.blocks[header.0 as usize];
     let debug = std::env::var("CCC_DEBUG_UNIVSR").is_ok();
+
+    // Find the block with the matching label
+    let header_block = func.blocks.iter().find(|b| b.label.0 == header.0)?;
 
     if debug {
         eprintln!("[Un-IVSR]     Looking for index IV in block {}", header.0);
@@ -380,6 +382,70 @@ fn is_value_from_iv_increment(func: &IrFunction, val: Value, phi_dest: Value) ->
     false
 }
 
+/// Validate that the pointer phi uses are safe to transform
+fn validate_transformation_safety(
+    func: &IrFunction,
+    ptr_iv: &IvsrPointerIV,
+    _uses: &[(usize, usize, UseKind)],
+) -> bool {
+    // Rule 1: No escaping uses (stored to memory, passed to calls, etc.)
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                // Unsafe: pointer stored to memory
+                Instruction::Store { val: Operand::Value(v), .. }
+                    if v.0 == ptr_iv.ptr_phi_dest.0 => {
+                    return false;
+                }
+
+                // Unsafe: pointer passed to function call
+                Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+                    for arg in &info.args {
+                        if let Operand::Value(v) = arg {
+                            if v.0 == ptr_iv.ptr_phi_dest.0 {
+                                return false;
+                            }
+                        }
+                    }
+                }
+
+                // Unsafe: pointer used in comparison (rare but possible)
+                Instruction::Cmp { lhs, rhs, .. } => {
+                    let check = |op: &Operand| {
+                        if let Operand::Value(v) = op {
+                            v.0 == ptr_iv.ptr_phi_dest.0
+                        } else {
+                            false
+                        }
+                    };
+                    if check(lhs) || check(rhs) {
+                        return false;
+                    }
+                }
+
+                _ => {}
+            }
+        }
+    }
+
+    // Rule 2: All uses must be Load/Store (already guaranteed by find_transitive_ptr_uses)
+
+    // Rule 3: Pointer phi must be in a loop header
+    // (This is implicitly checked by IVSR pattern detection)
+
+    true
+}
+
+/// Information about a transformation to apply
+struct TransformInfo {
+    block_idx: usize,
+    inst_idx: usize,
+    offset_inst: Instruction,
+    add_inst: Option<Instruction>,
+    gep_inst: Instruction,
+    new_ptr: Value,
+}
+
 /// Revert a pointer IV back to indexed form
 fn revert_pointer_iv(func: &mut IrFunction, ptr_iv: &IvsrPointerIV) -> bool {
     let debug = std::env::var("CCC_DEBUG_UNIVSR").is_ok();
@@ -389,33 +455,35 @@ fn revert_pointer_iv(func: &mut IrFunction, ptr_iv: &IvsrPointerIV) -> bool {
         None => return false,
     };
 
-    // Find all uses of the pointer phi and collect them
-    let ptr_uses = find_ptr_phi_uses(func, ptr_iv.ptr_phi_dest);
+    // Find all transitive uses (through GEPs)
+    let ptr_uses = find_transitive_ptr_uses(func, ptr_iv.ptr_phi_dest);
 
     if debug {
-        eprintln!("[Un-IVSR]     Found {} uses of pointer phi", ptr_uses.len());
+        eprintln!("[Un-IVSR]     Found {} transitive uses", ptr_uses.len());
     }
 
     if ptr_uses.is_empty() {
         return false;
     }
 
-    // Get the next value ID for creating new instructions
+    // Validate transformation safety
+    if !validate_transformation_safety(func, ptr_iv, &ptr_uses) {
+        if debug {
+            eprintln!("[Un-IVSR]     Skipped: unsafe uses detected");
+        }
+        return false;
+    }
+
+    // Allocate fresh Value IDs for transformed instructions
     let mut next_val_id = func.next_value_id;
     if next_val_id == 0 {
-        // Compute max value ID if not cached
         next_val_id = compute_max_value_id(func) + 1;
     }
 
-    // For each use of the pointer phi, we need to create:
-    // 1. Multiply or shift: %offset = index * stride
-    // 2. GEP: %addr = GEP(base, offset)
-    // 3. Replace the pointer use with the new GEP result
-
-    for (block_idx, inst_idx) in ptr_uses {
-        let block = &mut func.blocks[block_idx];
-
-        // Create offset calculation: %offset = index * stride (or shift for powers of 2)
+    // Transform each use - collect all transformations first
+    let mut transforms = Vec::new();
+    for (block_idx, inst_idx, _use_kind) in &ptr_uses {
+        // Create offset calculation: %offset = index * stride
         let offset_val = Value(next_val_id);
         next_val_id += 1;
 
@@ -426,19 +494,15 @@ fn revert_pointer_iv(func: &mut IrFunction, ptr_iv: &IvsrPointerIV) -> bool {
         );
 
         // Create GEP: %addr = GEP(base, offset + init_offset)
-        let gep_val = Value(next_val_id);
-        next_val_id += 1;
-
-        let gep_inst = if ptr_iv.init_offset == 0 {
-            Instruction::GetElementPtr {
-                dest: gep_val,
+        let (gep_inst, add_inst_opt) = if ptr_iv.init_offset == 0 {
+            (Instruction::GetElementPtr {
+                dest: Value(next_val_id),
                 base: ptr_iv.base_ptr,
                 offset: Operand::Value(offset_val),
                 ty: IrType::Ptr,
-            }
+            }, None)
         } else {
-            // Need to add init_offset to the computed offset
-            // Create: %adjusted_offset = offset + init_offset
+            // Need to add init_offset: %adjusted = offset + init_offset
             let adjusted_offset_val = Value(next_val_id);
             next_val_id += 1;
 
@@ -450,48 +514,94 @@ fn revert_pointer_iv(func: &mut IrFunction, ptr_iv: &IvsrPointerIV) -> bool {
                 ty: IrType::I64,
             };
 
-            // Insert the add instruction
-            block.instructions.insert(inst_idx, add_inst);
-
-            Instruction::GetElementPtr {
-                dest: gep_val,
+            let gep = Instruction::GetElementPtr {
+                dest: Value(next_val_id),
                 base: ptr_iv.base_ptr,
                 offset: Operand::Value(adjusted_offset_val),
                 ty: IrType::Ptr,
-            }
+            };
+
+            (gep, Some(add_inst))
         };
 
-        // Insert offset and GEP instructions before the use
-        let insert_pos = if ptr_iv.init_offset == 0 {
-            inst_idx
+        let gep_val = if ptr_iv.init_offset == 0 {
+            Value(next_val_id)
         } else {
-            inst_idx + 1  // Account for the add instruction we inserted
+            Value(next_val_id)
         };
+        next_val_id += 1;
 
-        block.instructions.insert(insert_pos, offset_inst);
-        block.instructions.insert(insert_pos + 1, gep_inst);
-
-        // Update the instruction to use the new GEP value instead of the pointer phi
-        let use_inst_idx = if ptr_iv.init_offset == 0 {
-            inst_idx + 2  // offset + GEP
-        } else {
-            inst_idx + 3  // add + offset + GEP
-        };
-
-        replace_ptr_use_in_instruction(
-            &mut block.instructions[use_inst_idx],
-            ptr_iv.ptr_phi_dest,
-            gep_val,
-        );
+        transforms.push(TransformInfo {
+            block_idx: *block_idx,
+            inst_idx: *inst_idx,
+            offset_inst,
+            add_inst: add_inst_opt,
+            gep_inst,
+            new_ptr: gep_val,
+        });
     }
 
-    // Update the function's next_value_id cache
-    func.next_value_id = next_val_id;
+    // Apply transforms in reverse order (to preserve instruction indices)
+    // Sort by (block_idx, inst_idx) descending
+    transforms.sort_by(|a, b| {
+        b.block_idx.cmp(&a.block_idx)
+            .then(b.inst_idx.cmp(&a.inst_idx))
+    });
 
-    // Note: We don't remove the pointer phi here because:
-    // 1. It might still be used in the backedge GEP (which is now dead)
-    // 2. Dead code elimination will clean it up later
-    // 3. Removing it requires updating the phi's uses which is complex
+    for transform in transforms {
+        let block = &mut func.blocks[transform.block_idx];
+
+        // Insert new instructions before the Load/Store
+        let mut insert_idx = transform.inst_idx;
+
+        // Insert offset instruction
+        block.instructions.insert(insert_idx, transform.offset_inst);
+        insert_idx += 1;
+
+        // Insert add instruction if needed
+        if let Some(add_inst) = transform.add_inst {
+            block.instructions.insert(insert_idx, add_inst);
+            insert_idx += 1;
+        }
+
+        // Insert GEP instruction
+        block.instructions.insert(insert_idx, transform.gep_inst);
+        insert_idx += 1;
+
+        // Update the Load/Store to use new GEP result
+        if debug {
+            eprintln!("[Un-IVSR]       Updating instruction at block {} inst {} (was inst {})",
+                      transform.block_idx, insert_idx, transform.inst_idx);
+            eprintln!("[Un-IVSR]         Instruction: {:?}", block.instructions[insert_idx]);
+        }
+
+        let use_inst = &mut block.instructions[insert_idx];
+        match use_inst {
+            Instruction::Load { ptr, .. } => {
+                if debug {
+                    eprintln!("[Un-IVSR]         Replacing ptr Value({}) with Value({})",
+                              ptr.0, transform.new_ptr.0);
+                }
+                *ptr = transform.new_ptr;
+            }
+            Instruction::Store { ptr, .. } => {
+                if debug {
+                    eprintln!("[Un-IVSR]         Replacing ptr Value({}) with Value({})",
+                              ptr.0, transform.new_ptr.0);
+                }
+                *ptr = transform.new_ptr;
+            }
+            _ => {
+                if debug {
+                    eprintln!("[Un-IVSR]     WARNING: Expected Load or Store at block {} inst {}, found {:?}",
+                              transform.block_idx, insert_idx, use_inst);
+                }
+            }
+        }
+    }
+
+    // Update next_value_id cache
+    func.next_value_id = next_val_id;
 
     true
 }
@@ -521,35 +631,53 @@ fn create_offset_instruction(dest: Value, index: Value, stride: i64) -> Instruct
     }
 }
 
-/// Find all uses of the pointer phi value (Load/Store instructions)
-fn find_ptr_phi_uses(func: &IrFunction, ptr_val: Value) -> Vec<(usize, usize)> {
+/// Kind of use found (for tracking purposes)
+#[derive(Debug, Clone, Copy)]
+enum UseKind {
+    Load,
+    Store,
+}
+
+/// Direct use of a value (either actual use or intermediate GEP)
+#[derive(Debug)]
+enum DirectUse {
+    Load,
+    Store,
+    Gep(Value),  // GEP destination value
+}
+
+/// Find all Load/Store instructions that transitively use the pointer phi
+/// This handles cases where the pointer is used through intermediate GEPs:
+///   %ptr = Phi(...)
+///   %gep1 = GEP(%ptr, offset)
+///   %val = Load(%gep1)  <- transitive use through %gep1
+fn find_transitive_ptr_uses(
+    func: &IrFunction,
+    ptr_val: Value,
+) -> Vec<(usize, usize, UseKind)> {
     let debug = std::env::var("CCC_DEBUG_UNIVSR").is_ok();
-    let mut uses = Vec::new();
+    let mut results = Vec::new();
+
+    // Phase 1: Find direct uses of ptr_val (Load/Store/GEP)
+    let mut direct_uses: Vec<(usize, usize, DirectUse)> = Vec::new();
 
     for (block_idx, block) in func.blocks.iter().enumerate() {
         for (inst_idx, inst) in block.instructions.iter().enumerate() {
-            // Check all instructions for uses of the pointer value
-            if debug && block_idx < 5 {
-                // Check if this instruction uses our pointer value in any operand
-                let uses_ptr = match inst {
-                    Instruction::Load { ptr, .. } => ptr.0 == ptr_val.0,
-                    Instruction::Store { ptr, .. } => ptr.0 == ptr_val.0,
-                    Instruction::GetElementPtr { base, .. } => base.0 == ptr_val.0,
-                    _ => false,
-                };
-
-                if uses_ptr {
-                    eprintln!("[Un-IVSR]       Block {} inst {}: {:?} uses Value({})",
-                              block_idx, inst_idx, inst, ptr_val.0);
-                }
-            }
-
             match inst {
                 Instruction::Load { ptr, .. } if ptr.0 == ptr_val.0 => {
-                    uses.push((block_idx, inst_idx));
+                    direct_uses.push((block_idx, inst_idx, DirectUse::Load));
                 }
                 Instruction::Store { ptr, .. } if ptr.0 == ptr_val.0 => {
-                    uses.push((block_idx, inst_idx));
+                    direct_uses.push((block_idx, inst_idx, DirectUse::Store));
+                }
+                Instruction::GetElementPtr { dest, base, offset, .. } if base.0 == ptr_val.0 => {
+                    // Skip the pointer increment GEP (backedge of the phi)
+                    // We only care about GEPs used for memory access
+                    let is_zero_offset = matches!(offset, Operand::Const(c) if c.to_i64() == Some(0));
+                    if debug && is_zero_offset {
+                        eprintln!("[Un-IVSR]       Found zero-offset GEP -> Value({})", dest.0);
+                    }
+                    direct_uses.push((block_idx, inst_idx, DirectUse::Gep(*dest)));
                 }
                 _ => {}
             }
@@ -557,11 +685,118 @@ fn find_ptr_phi_uses(func: &IrFunction, ptr_val: Value) -> Vec<(usize, usize)> {
     }
 
     if debug {
-        eprintln!("[Un-IVSR]     Looking for uses of Value({}) - found {} uses",
-                  ptr_val.0, uses.len());
+        eprintln!("[Un-IVSR]     Phase 1: found {} direct uses of Value({})",
+                  direct_uses.len(), ptr_val.0);
+        for (block_idx, inst_idx, use_kind) in &direct_uses {
+            eprintln!("[Un-IVSR]       Block {} inst {}: {:?}",
+                      block_idx, inst_idx, use_kind);
+        }
     }
 
-    uses
+    // Phase 2: Build a list of values to explore (GEPs and their results, plus Copy destinations)
+    // We need to follow both GEP chains and Copy chains
+    let mut values_to_explore: Vec<Value> = direct_uses.iter()
+        .filter_map(|(_, _, use_kind)| {
+            if let DirectUse::Gep(gep_dest) = use_kind {
+                Some(*gep_dest)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Also follow Copy instructions that copy the pointer phi
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        for (inst_idx, inst) in block.instructions.iter().enumerate() {
+            if let Instruction::Copy { dest, src: Operand::Value(v) } = inst {
+                if v.0 == ptr_val.0 {
+                    if debug {
+                        eprintln!("[Un-IVSR]     Found Copy: Value({}) -> Value({})", ptr_val.0, dest.0);
+                    }
+                    values_to_explore.push(*dest);
+                }
+            }
+        }
+    }
+
+    // Track which values we've already explored (avoid cycles)
+    let mut explored_values = FxHashSet::default();
+
+    if debug && !values_to_explore.is_empty() {
+        eprintln!("[Un-IVSR]     Phase 2: exploring {} values (GEPs and Copies)", values_to_explore.len());
+    }
+
+    while let Some(val_to_check) = values_to_explore.pop() {
+        if !explored_values.insert(val_to_check.0) {
+            continue;  // Already explored
+        }
+
+        if debug {
+            eprintln!("[Un-IVSR]       Exploring uses of Value({})", val_to_check.0);
+        }
+
+        // Find uses of this value
+        for (block_idx, block) in func.blocks.iter().enumerate() {
+            for (inst_idx, inst) in block.instructions.iter().enumerate() {
+
+                match inst {
+                    // Skip Phi uses - those are loop-carried dependencies, not memory accesses
+                    Instruction::Phi { incoming, .. } => {
+                        for (op, _) in incoming {
+                            if let Operand::Value(v) = op {
+                                if v.0 == val_to_check.0 && debug {
+                                    eprintln!("[Un-IVSR]         Skipping Phi use (loop backedge)");
+                                }
+                            }
+                        }
+                    }
+                    // Follow Copy chains
+                    Instruction::Copy { dest, src: Operand::Value(v) } if v.0 == val_to_check.0 => {
+                        if debug {
+                            eprintln!("[Un-IVSR]         Found Copy chain: Value({}) -> Value({})",
+                                      val_to_check.0, dest.0);
+                        }
+                        values_to_explore.push(*dest);
+                    }
+                    Instruction::Load { ptr, .. } if ptr.0 == val_to_check.0 => {
+                        if debug {
+                            eprintln!("[Un-IVSR]         ✓ Found Load at block {} inst {}", block_idx, inst_idx);
+                        }
+                        results.push((block_idx, inst_idx, UseKind::Load));
+                    }
+                    Instruction::Store { ptr, .. } if ptr.0 == val_to_check.0 => {
+                        if debug {
+                            eprintln!("[Un-IVSR]         ✓ Found Store at block {} inst {}", block_idx, inst_idx);
+                        }
+                        results.push((block_idx, inst_idx, UseKind::Store));
+                    }
+                    Instruction::GetElementPtr { dest, base, .. } if base.0 == val_to_check.0 => {
+                        // Another level of GEP - continue exploring
+                        if debug {
+                            eprintln!("[Un-IVSR]         Found nested GEP -> Value({})", dest.0);
+                        }
+                        values_to_explore.push(*dest);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Phase 3: Add direct Load/Store uses (non-GEP path)
+    for (block_idx, inst_idx, use_kind) in direct_uses {
+        match use_kind {
+            DirectUse::Load => results.push((block_idx, inst_idx, UseKind::Load)),
+            DirectUse::Store => results.push((block_idx, inst_idx, UseKind::Store)),
+            DirectUse::Gep(_) => {}, // Already handled in Phase 2
+        }
+    }
+
+    if debug {
+        eprintln!("[Un-IVSR]     Found {} transitive uses total", results.len());
+    }
+
+    results
 }
 
 /// Replace uses of old pointer value with new value in an instruction
@@ -679,4 +914,39 @@ impl DestValue for Instruction {
 /// Check if a stride is valid for x86-64 SIB encoding
 fn is_valid_sib_scale(stride: i64) -> bool {
     matches!(stride, 1 | 2 | 4 | 8)
+}
+
+/// Build use-def chains using existing infrastructure from DCE/copy-prop patterns
+#[allow(dead_code)]
+fn build_use_count_map(func: &IrFunction) -> Vec<u32> {
+    let max_id = compute_max_value_id(func);
+    let mut use_count = vec![0u32; (max_id + 1) as usize];
+
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            // Reuse existing for_each_used_value pattern from DCE
+            if let Instruction::Phi { dest, incoming, .. } = inst {
+                // Handle phi specially to avoid self-references
+                for (op, _) in incoming {
+                    if let Operand::Value(v) = op {
+                        if v.0 != dest.0 {
+                            let idx = v.0 as usize;
+                            if idx < use_count.len() {
+                                use_count[idx] += 1;
+                            }
+                        }
+                    }
+                }
+            } else {
+                inst.for_each_used_value(|id| {
+                    let idx = id as usize;
+                    if idx < use_count.len() {
+                        use_count[idx] += 1;
+                    }
+                });
+            }
+        }
+    }
+
+    use_count
 }
