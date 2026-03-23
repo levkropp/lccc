@@ -573,12 +573,12 @@ impl X86Codegen {
                     self.operand_to_reg(&args[0], "rcx");      // A ptr → %rcx
                     self.operand_to_reg(&args[1], "rdx");      // B ptr → %rdx
                     self.value_to_reg(c_ptr, "rax");           // C ptr → %rax
-                    self.state.emit("    movsd (%rcx), %xmm1");       // xmm1 = A scalar
-                    self.state.emit("    unpcklpd %xmm1, %xmm1");     // xmm1 = {A, A}
-                    self.state.emit("    movupd (%rdx), %xmm0");      // xmm0 = {B[j], B[j+1]}
-                    self.state.emit("    mulpd %xmm1, %xmm0");        // xmm0 = {A*Bj, A*Bj1}
-                    self.state.emit("    addpd (%rax), %xmm0");       // xmm0 += {C[j], C[j+1]}
-                    self.state.emit("    movupd %xmm0, (%rax)");      // store back
+                    // FMA3: load C, fused multiply-add with B, store back
+                    self.state.emit("    movsd (%rcx), %xmm1");          // xmm1 = A scalar
+                    self.state.emit("    unpcklpd %xmm1, %xmm1");        // xmm1 = {A, A}
+                    self.state.emit("    movupd (%rax), %xmm0");         // xmm0 = {C[j], C[j+1]}
+                    self.state.emit("    vfmadd231pd (%rdx), %xmm1, %xmm0"); // xmm0 = xmm1*B[mem] + xmm0
+                    self.state.emit("    movupd %xmm0, (%rax)");         // store back
                 }
             }
             IntrinsicOp::FmaF64x4 => {
@@ -591,13 +591,12 @@ impl X86Codegen {
                     self.operand_to_reg(&args[1], "rdx");      // B ptr → %rdx
                     self.value_to_reg(c_ptr, "rax");           // C ptr → %rax
 
-                    // AVX2 instructions (VEX-encoded, 256-bit ymm registers)
-                    self.state.emit("    movsd (%rcx), %xmm1");          // Load A scalar (64-bit)
-                    self.state.emit("    vbroadcastsd %xmm1, %ymm1");    // Broadcast to {A, A, A, A}
-                    self.state.emit("    vmovupd (%rdx), %ymm0");        // Load 4 doubles unaligned
-                    self.state.emit("    vmulpd %ymm1, %ymm0, %ymm0");   // ymm0 = A * {B[j..j+3]}
-                    self.state.emit("    vaddpd (%rax), %ymm0, %ymm0");  // ymm0 += {C[j..j+3]}
-                    self.state.emit("    vmovupd %ymm0, (%rax)");        // Write 4 results back
+                    // FMA3 + AVX2: load C, fused multiply-add with B, store back
+                    self.state.emit("    movsd (%rcx), %xmm1");              // Load A scalar (64-bit)
+                    self.state.emit("    vbroadcastsd %xmm1, %ymm1");        // Broadcast to {A, A, A, A}
+                    self.state.emit("    vmovupd (%rax), %ymm0");            // Load C[j..j+3]
+                    self.state.emit("    vfmadd231pd (%rdx), %ymm1, %ymm0"); // ymm0 = ymm1 * B[mem] + ymm0
+                    self.state.emit("    vmovupd %ymm0, (%rax)");            // Write 4 results back
                 }
             }
 
