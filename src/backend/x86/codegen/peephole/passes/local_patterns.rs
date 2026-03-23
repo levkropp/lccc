@@ -991,18 +991,26 @@ pub(super) fn promote_loop_invariant_fp_load(
             }
             if xmm2_used { continue; }
 
-            // Find preheader store: "movq %rax, -O(%rbp)" just before the header.
-            // Scan backward from header for a StoreRbp to the same offset.
+            // Find preheader store: "movq %rax, -O(%rbp)" before the header.
+            // Scan backward, crossing labels but stopping at function boundaries (.size).
             let mut preheader_store = None;
             let mut ph = if header > 0 { header - 1 } else { 0 };
             let mut ph_count = 0;
-            while ph_count < 20 {
+            while ph_count < 60 {
                 if infos[ph].is_nop() {
                     if ph == 0 { break; }
                     ph -= 1;
                     continue;
                 }
-                if infos[ph].kind == LineKind::Label { break; } // hit another label
+                // Stop at function boundaries, not labels
+                if infos[ph].kind == LineKind::Directive {
+                    let dt = infos[ph].trimmed(store.get(ph));
+                    if dt.starts_with(".size ") || dt.starts_with(".globl ") || dt.starts_with(".type ") {
+                        break;
+                    }
+                }
+                // Labels are OK to cross — we're looking for ANY store to this offset
+                // that dominates the loop header.
                 if let LineKind::StoreRbp { reg: 0, offset: o, .. } = infos[ph].kind {
                     let s = format!("{}(%rbp)", o);
                     if s == offset_str {
