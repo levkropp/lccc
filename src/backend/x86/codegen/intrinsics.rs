@@ -17,6 +17,7 @@ use crate::ir::reexports::{
     Operand,
     Value,
 };
+use crate::backend::state::StackSlot;
 use super::emit::X86Codegen;
 
 impl X86Codegen {
@@ -102,13 +103,17 @@ impl X86Codegen {
     /// Emit SSE binary 128-bit op: load xmm0 from arg0 ptr, xmm1 from arg1 ptr,
     /// apply the given SSE instruction, store result xmm0 to dest_ptr.
     fn emit_sse_binary_128(&mut self, dest_ptr: &Value, args: &[Operand], sse_inst: &str) {
+        // Load destination address FIRST into a dedicated register to avoid clobbering
+        self.value_to_reg(dest_ptr, "rdx");
+        // Load operands into separate registers
         self.operand_to_reg(&args[0], "rax");
         self.state.emit("    movdqu (%rax), %xmm0");
         self.operand_to_reg(&args[1], "rcx");
         self.state.emit("    movdqu (%rcx), %xmm1");
+        // Perform vector operation
         self.state.emit_fmt(format_args!("    {} %xmm1, %xmm0", sse_inst));
-        self.value_to_reg(dest_ptr, "rax");
-        self.state.emit("    movdqu %xmm0, (%rax)");
+        // Store result using dedicated destination register
+        self.state.emit("    movdqu %xmm0, (%rdx)");
     }
 
     /// Emit SSE unary 128-bit op with immediate: load xmm0 from arg0 ptr,
@@ -595,6 +600,465 @@ impl X86Codegen {
                     self.state.emit("    vmovupd %ymm0, (%rax)");        // Write 4 results back
                 }
             }
+
+            // --- Vector loads for reduction patterns ---
+            IntrinsicOp::LoadF64x4 => {
+                // Load 4 packed doubles: vmovupd (%base + %offset), %ymm0
+                if let Some(dptr) = dest_ptr {
+                    self.value_to_reg(dptr, "rdx");          // Load dest FIRST into %rdx
+                    self.operand_to_reg(&args[0], "rax");    // base pointer
+                    self.operand_to_reg(&args[1], "rcx");    // byte offset
+                    self.state.emit("    vmovupd (%rax,%rcx), %ymm0");
+                    self.state.emit("    vmovupd %ymm0, (%rdx)");  // Store to %rdx
+                }
+            }
+            IntrinsicOp::LoadF64x2 => {
+                // Load 2 packed doubles: movupd (%base + %offset), %xmm0
+                if let Some(dptr) = dest_ptr {
+                    self.value_to_reg(dptr, "rdx");          // Load dest FIRST into %rdx
+                    self.operand_to_reg(&args[0], "rax");
+                    self.operand_to_reg(&args[1], "rcx");
+                    self.state.emit("    movupd (%rax,%rcx), %xmm0");
+                    self.state.emit("    movupd %xmm0, (%rdx)");  // Store to %rdx
+                }
+            }
+            IntrinsicOp::LoadI32x8 => {
+                // Load 8 packed ints: vmovdqu (%base + %offset), %ymm0
+                if let Some(dptr) = dest_ptr {
+                    self.value_to_reg(dptr, "rdx");          // Load dest FIRST into %rdx
+                    self.operand_to_reg(&args[0], "rax");
+                    self.operand_to_reg(&args[1], "rcx");
+                    self.state.emit("    vmovdqu (%rax,%rcx), %ymm0");
+                    self.state.emit("    vmovdqu %ymm0, (%rdx)");  // Store to %rdx
+                }
+            }
+            IntrinsicOp::LoadI32x4 => {
+                // Load 4 packed ints: movdqu (%base + %offset), %xmm0
+                if let Some(dptr) = dest_ptr {
+                    self.value_to_reg(dptr, "rdx");          // Load dest FIRST into %rdx
+                    self.operand_to_reg(&args[0], "rax");
+                    self.operand_to_reg(&args[1], "rcx");
+                    self.state.emit("    movdqu (%rax,%rcx), %xmm0");
+                    self.state.emit("    movdqu %xmm0, (%rdx)");  // Store to %rdx
+                }
+            }
+
+            // --- Vector arithmetic ---
+            IntrinsicOp::AddF64x4 => {
+                if let Some(dptr) = dest_ptr {
+                    self.emit_avx_binary_256(dptr, args, "vaddpd");
+                }
+            }
+            IntrinsicOp::AddF64x2 => {
+                if let Some(dptr) = dest_ptr {
+                    self.emit_sse_binary_128(dptr, args, "addpd");
+                }
+            }
+            IntrinsicOp::MulF64x4 => {
+                if let Some(dptr) = dest_ptr {
+                    self.emit_avx_binary_256(dptr, args, "vmulpd");
+                }
+            }
+            IntrinsicOp::MulF64x2 => {
+                if let Some(dptr) = dest_ptr {
+                    self.emit_sse_binary_128(dptr, args, "mulpd");
+                }
+            }
+            IntrinsicOp::AddI32x8 => {
+                if let Some(dptr) = dest_ptr {
+                    self.emit_avx_binary_256(dptr, args, "vpaddd");
+                }
+            }
+            IntrinsicOp::AddI32x4 => {
+                if let Some(dptr) = dest_ptr {
+                    self.emit_sse_binary_128(dptr, args, "paddd");
+                }
+            }
+
+            // --- Horizontal reduction ---
+            IntrinsicOp::HorizontalAddF64x4 => {
+                // Reduce 4×F64 → 1×F64
+                self.operand_to_reg(&args[0], "rax");
+                self.state.emit("    vmovupd (%rax), %ymm0");        // Load 4 doubles
+                self.state.emit("    vextractf128 $1, %ymm0, %xmm1"); // Extract upper 128 bits
+                self.state.emit("    vaddpd %xmm1, %xmm0, %xmm0");    // Add upper + lower (4→2)
+                self.state.emit("    vunpckhpd %xmm0, %xmm0, %xmm1"); // Shuffle element 1 to position 0
+                self.state.emit("    vaddsd %xmm1, %xmm0, %xmm0");    // Final scalar add (2→1)
+                self.state.emit("    vmovq %xmm0, %rax");             // Extract to GPR
+                if let Some(d) = dest {
+                    self.store_rax_to(d);
+                }
+            }
+            IntrinsicOp::HorizontalAddF64x2 => {
+                // Reduce 2×F64 → 1×F64
+                self.operand_to_reg(&args[0], "rax");
+                self.state.emit("    movupd (%rax), %xmm0");          // Load 2 doubles
+                self.state.emit("    unpckhpd %xmm0, %xmm0, %xmm1");  // Duplicate upper to xmm1
+                self.state.emit("    addsd %xmm1, %xmm0");            // Add (2→1)
+                self.state.emit("    movq %xmm0, %rax");              // Extract to GPR
+                if let Some(d) = dest {
+                    self.store_rax_to(d);
+                }
+            }
+            IntrinsicOp::HorizontalAddI32x8 => {
+                // Reduce 8×I32 → 1×I32
+                self.operand_to_reg(&args[0], "rax");
+                self.state.emit("    vmovdqu (%rax), %ymm0");         // Load 8 ints
+                self.state.emit("    vextracti128 $1, %ymm0, %xmm1"); // Extract upper 128 (8→4)
+                self.state.emit("    vpaddd %xmm1, %xmm0, %xmm0");    // Add halves (8→4)
+                self.state.emit("    vpsrldq $8, %xmm0, %xmm1");      // Shift 8 bytes (4→2)
+                self.state.emit("    vpaddd %xmm1, %xmm0, %xmm0");    // Add (4→2)
+                self.state.emit("    vpsrldq $4, %xmm0, %xmm1");      // Shift 4 bytes (2→1)
+                self.state.emit("    vpaddd %xmm1, %xmm0, %xmm0");    // Add (2→1)
+                self.state.emit("    vmovd %xmm0, %eax");             // Extract to GPR
+                if let Some(d) = dest {
+                    self.store_rax_to(d);
+                }
+            }
+            IntrinsicOp::HorizontalAddI32x4 => {
+                // Reduce 4×I32 → 1×I32
+                self.operand_to_reg(&args[0], "rax");
+                self.state.emit("    movdqu (%rax), %xmm0");          // Load 4 ints
+                self.state.emit("    psrldq $8, %xmm0, %xmm1");       // Shift 8 bytes (4→2)
+                self.state.emit("    paddd %xmm1, %xmm0");            // Add (4→2)
+                self.state.emit("    psrldq $4, %xmm0, %xmm1");       // Shift 4 bytes (2→1)
+                self.state.emit("    paddd %xmm1, %xmm0");            // Add (2→1)
+                self.state.emit("    movd %xmm0, %eax");              // Extract to GPR
+                if let Some(d) = dest {
+                    self.store_rax_to(d);
+                }
+            }
+
+            // --- Register-based vector operations (SSA-friendly) ---
+
+            IntrinsicOp::VecLoadF64x4 => {
+                // %dest_vec = load_vector(base_ptr, offset) - AVX2 4×F64
+                // Load from memory array into ymm0, then store directly to stack slot
+                self.operand_to_reg(&args[0], "rax");  // base pointer
+                self.operand_to_reg(&args[1], "rcx");  // offset
+                self.state.emit("    vmovupd (%rax,%rcx), %ymm0");
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    if let Some(slot) = self.state.get_slot(d.0) {
+                        // Store vector directly to stack slot (not via pointer indirection)
+                        self.state.out.emit_instr_reg_rbp("    vmovupd", "ymm0", slot.0 as i64);
+                    }
+                }
+            }
+            IntrinsicOp::VecLoadF64x2 => {
+                // %dest_vec = load_vector(base_ptr, offset) - SSE2 2×F64
+                self.operand_to_reg(&args[0], "rax");
+                self.operand_to_reg(&args[1], "rcx");
+                self.state.emit("    movupd (%rax,%rcx), %xmm0");
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    if let Some(slot) = self.state.get_slot(d.0) {
+                        // Store vector directly to stack slot
+                        self.state.out.emit_instr_reg_rbp("    movupd", "xmm0", slot.0 as i64);
+                    }
+                }
+            }
+            IntrinsicOp::VecLoadI32x8 => {
+                // %dest_vec = load_vector(base_ptr, offset) - AVX2 8×I32
+                self.operand_to_reg(&args[0], "rax");
+                self.operand_to_reg(&args[1], "rcx");
+                self.state.emit("    vmovdqu (%rax,%rcx), %ymm0");
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    if let Some(slot) = self.state.get_slot(d.0) {
+                        self.state.out.emit_instr_rbp_reg("    leaq", slot.0 as i64, "rdx");
+                        self.state.emit("    vmovdqu %ymm0, (%rdx)");
+                    }
+                }
+            }
+            IntrinsicOp::VecLoadI32x4 => {
+                // %dest_vec = load_vector(base_ptr, offset) - SSE2 4×I32
+                self.operand_to_reg(&args[0], "rax");
+                self.operand_to_reg(&args[1], "rcx");
+                self.state.emit("    movdqu (%rax,%rcx), %xmm0");
+                if let Some(d) = dest {
+                    if let Some(slot) = self.state.get_slot(d.0) {
+                        self.state.out.emit_instr_rbp_reg("    leaq", slot.0 as i64, "rdx");
+                        self.state.emit("    movdqu %xmm0, (%rdx)");
+                    }
+                }
+            }
+
+            IntrinsicOp::VecAddF64x4 => {
+                // %dest_vec = %src1_vec + %src2_vec - AVX2 4×F64
+                // Load both source vectors directly from their stack slots and add.
+                // Vector values are stored directly in stack slots (not as pointers),
+                // so we load them with offset(%rbp) addressing, not pointer indirection.
+                if let Some(slot) = self.get_slot_for_operand(&args[0]) {
+                    // Vector operand: load directly from stack slot
+                    self.state.out.emit_instr_rbp_reg("    vmovupd", slot.0 as i64, "ymm0");
+                } else {
+                    // Non-vector operand (shouldn't happen for VecAdd, but handle gracefully)
+                    self.operand_to_reg(&args[0], "rax");
+                    self.state.emit("    vmovupd (%rax), %ymm0");
+                }
+                if let Some(slot) = self.get_slot_for_operand(&args[1]) {
+                    // Vector operand: load directly from stack slot
+                    self.state.out.emit_instr_rbp_reg("    vmovupd", slot.0 as i64, "ymm1");
+                } else {
+                    // Non-vector operand (shouldn't happen for VecAdd, but handle gracefully)
+                    self.operand_to_reg(&args[1], "rcx");
+                    self.state.emit("    vmovupd (%rcx), %ymm1");
+                }
+                self.state.emit("    vaddpd %ymm1, %ymm0, %ymm0");
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    if let Some(slot) = self.state.get_slot(d.0) {
+                        // Store result directly to stack slot
+                        self.state.out.emit_instr_reg_rbp("    vmovupd", "ymm0", slot.0 as i64);
+                    }
+                }
+            }
+            IntrinsicOp::VecAddF64x2 => {
+                // %dest_vec = %src1_vec + %src2_vec - SSE2 2×F64
+                // Load both source vectors directly from stack slots
+                if let Some(slot) = self.get_slot_for_operand(&args[0]) {
+                    self.state.out.emit_instr_rbp_reg("    movupd", slot.0 as i64, "xmm0");
+                } else {
+                    self.operand_to_reg(&args[0], "rax");
+                    self.state.emit("    movupd (%rax), %xmm0");
+                }
+                if let Some(slot) = self.get_slot_for_operand(&args[1]) {
+                    self.state.out.emit_instr_rbp_reg("    movupd", slot.0 as i64, "xmm1");
+                } else {
+                    self.operand_to_reg(&args[1], "rcx");
+                    self.state.emit("    movupd (%rcx), %xmm1");
+                }
+                self.state.emit("    addpd %xmm1, %xmm0");
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    if let Some(slot) = self.state.get_slot(d.0) {
+                        // Store result directly to stack slot
+                        self.state.out.emit_instr_reg_rbp("    movupd", "xmm0", slot.0 as i64);
+                    }
+                }
+            }
+            IntrinsicOp::VecMulF64x4 => {
+                // %dest_vec = %src1_vec * %src2_vec - AVX2 4×F64
+                // Load both source vectors directly from stack slots
+                if let Some(slot) = self.get_slot_for_operand(&args[0]) {
+                    self.state.out.emit_instr_rbp_reg("    vmovupd", slot.0 as i64, "ymm0");
+                } else {
+                    self.operand_to_reg(&args[0], "rax");
+                    self.state.emit("    vmovupd (%rax), %ymm0");
+                }
+                if let Some(slot) = self.get_slot_for_operand(&args[1]) {
+                    self.state.out.emit_instr_rbp_reg("    vmovupd", slot.0 as i64, "ymm1");
+                } else {
+                    self.operand_to_reg(&args[1], "rcx");
+                    self.state.emit("    vmovupd (%rcx), %ymm1");
+                }
+                self.state.emit("    vmulpd %ymm1, %ymm0, %ymm0");
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    if let Some(slot) = self.state.get_slot(d.0) {
+                        // Store result directly to stack slot
+                        self.state.out.emit_instr_reg_rbp("    vmovupd", "ymm0", slot.0 as i64);
+                    }
+                }
+            }
+            IntrinsicOp::VecMulF64x2 => {
+                // %dest_vec = %src1_vec * %src2_vec - SSE2 2×F64
+                // Load both source vectors directly from stack slots
+                if let Some(slot) = self.get_slot_for_operand(&args[0]) {
+                    self.state.out.emit_instr_rbp_reg("    movupd", slot.0 as i64, "xmm0");
+                } else {
+                    self.operand_to_reg(&args[0], "rax");
+                    self.state.emit("    movupd (%rax), %xmm0");
+                }
+                if let Some(slot) = self.get_slot_for_operand(&args[1]) {
+                    self.state.out.emit_instr_rbp_reg("    movupd", slot.0 as i64, "xmm1");
+                } else {
+                    self.operand_to_reg(&args[1], "rcx");
+                    self.state.emit("    movupd (%rcx), %xmm1");
+                }
+                self.state.emit("    mulpd %xmm1, %xmm0");
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    if let Some(slot) = self.state.get_slot(d.0) {
+                        // Store result directly to stack slot
+                        self.state.out.emit_instr_reg_rbp("    movupd", "xmm0", slot.0 as i64);
+                    }
+                }
+            }
+            IntrinsicOp::VecAddI32x8 | IntrinsicOp::VecAddI32x4 => {
+                // Vector integer add (similar pattern)
+                let (load_inst, add_inst, store_inst, reg) = match op {
+                    IntrinsicOp::VecAddI32x8 => ("vmovdqu", "vpaddd", "vmovdqu", "ymm"),
+                    IntrinsicOp::VecAddI32x4 => ("movdqu", "paddd", "movdqu", "xmm"),
+                    _ => unreachable!(),
+                };
+                self.operand_to_reg(&args[0], "rax");
+                if let Some(slot) = self.get_slot_for_operand(&args[0]) {
+                    self.state.out.emit_instr_rbp_reg("    leaq", slot.0 as i64, "rax");
+                }
+                self.state.emit_fmt(format_args!("    {} (%rax), %{}0", load_inst, reg));
+                self.operand_to_reg(&args[1], "rcx");
+                if let Some(slot) = self.get_slot_for_operand(&args[1]) {
+                    self.state.out.emit_instr_rbp_reg("    leaq", slot.0 as i64, "rcx");
+                }
+                self.state.emit_fmt(format_args!("    {} (%rcx), %{}1", load_inst, reg));
+                self.state.emit_fmt(format_args!("    {} %{}1, %{}0, %{}0", add_inst, reg, reg, reg));
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    if let Some(slot) = self.state.get_slot(d.0) {
+                        self.state.out.emit_instr_rbp_reg("    leaq", slot.0 as i64, "rdx");
+                        self.state.emit_fmt(format_args!("    {} %{}0, (%rdx)", store_inst, reg));
+                    }
+                }
+            }
+
+            IntrinsicOp::VecHorizontalAddF64x4 => {
+                // %scalar = horizontal_add(%vec) - AVX2 4×F64 → F64
+                // Load vector from operand and reduce
+                if let Some(slot) = self.get_slot_for_operand(&args[0]) {
+                    // Direct load from slot
+                    self.state.out.emit_instr_rbp_reg("    vmovupd", slot.0 as i64, "ymm0");
+                } else {
+                    // Fallback: load pointer then dereference
+                    self.operand_to_reg(&args[0], "rax");
+                    self.state.emit("    vmovupd (%rax), %ymm0");
+                }
+                self.state.emit("    vextractf128 $1, %ymm0, %xmm1");
+                self.state.emit("    vaddpd %xmm1, %xmm0, %xmm0");
+                self.state.emit("    vunpckhpd %xmm0, %xmm0, %xmm1");
+                self.state.emit("    vaddsd %xmm1, %xmm0, %xmm0");
+                self.state.emit("    vmovq %xmm0, %rax");
+                if let Some(d) = dest {
+                    self.store_rax_to(d);
+                }
+            }
+            IntrinsicOp::VecHorizontalAddF64x2 => {
+                // %scalar = horizontal_add(%vec) - SSE2 2×F64 → F64
+                if let Some(slot) = self.get_slot_for_operand(&args[0]) {
+                    // Direct load from slot
+                    self.state.out.emit_instr_rbp_reg("    movupd", slot.0 as i64, "xmm0");
+                } else {
+                    // Fallback: load pointer then dereference
+                    self.operand_to_reg(&args[0], "rax");
+                    self.state.emit("    movupd (%rax), %xmm0");
+                }
+                self.state.emit("    unpckhpd %xmm0, %xmm0, %xmm1");
+                self.state.emit("    addsd %xmm1, %xmm0");
+                self.state.emit("    movq %xmm0, %rax");
+                if let Some(d) = dest {
+                    self.store_rax_to(d);
+                }
+            }
+            IntrinsicOp::VecHorizontalAddI32x8 => {
+                // %scalar = horizontal_add(%vec) - AVX2 8×I32 → I32
+                if let Some(slot) = self.get_slot_for_operand(&args[0]) {
+                    // Direct load from slot
+                    self.state.out.emit_instr_rbp_reg("    vmovdqu", slot.0 as i64, "ymm0");
+                } else {
+                    // Fallback: load pointer then dereference
+                    self.operand_to_reg(&args[0], "rax");
+                    self.state.emit("    vmovdqu (%rax), %ymm0");
+                }
+                self.state.emit("    vextracti128 $1, %ymm0, %xmm1");
+                self.state.emit("    vpaddd %xmm1, %xmm0, %xmm0");
+                self.state.emit("    vpsrldq $8, %xmm0, %xmm1");
+                self.state.emit("    vpaddd %xmm1, %xmm0, %xmm0");
+                self.state.emit("    vpsrldq $4, %xmm0, %xmm1");
+                self.state.emit("    vpaddd %xmm1, %xmm0, %xmm0");
+                self.state.emit("    vmovd %xmm0, %eax");
+                if let Some(d) = dest {
+                    self.store_rax_to(d);
+                }
+            }
+            IntrinsicOp::VecHorizontalAddI32x4 => {
+                // %scalar = horizontal_add(%vec) - SSE2 4×I32 → I32
+                if let Some(slot) = self.get_slot_for_operand(&args[0]) {
+                    // Direct load from slot
+                    self.state.out.emit_instr_rbp_reg("    movdqu", slot.0 as i64, "xmm0");
+                } else {
+                    // Fallback: load pointer then dereference
+                    self.operand_to_reg(&args[0], "rax");
+                    self.state.emit("    movdqu (%rax), %xmm0");
+                }
+                self.state.emit("    psrldq $8, %xmm0, %xmm1");
+                self.state.emit("    paddd %xmm1, %xmm0");
+                self.state.emit("    psrldq $4, %xmm0, %xmm1");
+                self.state.emit("    paddd %xmm1, %xmm0");
+                self.state.emit("    movd %xmm0, %eax");
+                if let Some(d) = dest {
+                    self.store_rax_to(d);
+                }
+            }
+
+            IntrinsicOp::VecZeroF64x4 => {
+                // %dest_vec = {0.0, 0.0, 0.0, 0.0} - AVX2 4×F64
+                self.state.emit("    vxorpd %ymm0, %ymm0, %ymm0");
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    if let Some(slot) = self.state.get_slot(d.0) {
+                        // Store zero vector directly to stack slot
+                        self.state.out.emit_instr_reg_rbp("    vmovupd", "ymm0", slot.0 as i64);
+                    }
+                }
+            }
+            IntrinsicOp::VecZeroF64x2 => {
+                // %dest_vec = {0.0, 0.0} - SSE2 2×F64
+                self.state.emit("    xorpd %xmm0, %xmm0");
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    if let Some(slot) = self.state.get_slot(d.0) {
+                        // Store zero vector directly to stack slot
+                        self.state.out.emit_instr_reg_rbp("    movupd", "xmm0", slot.0 as i64);
+                    }
+                }
+            }
+            IntrinsicOp::VecZeroI32x8 => {
+                // %dest_vec = {0, 0, 0, 0, 0, 0, 0, 0} - AVX2 8×I32
+                self.state.emit("    vpxor %ymm0, %ymm0, %ymm0");
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    if let Some(slot) = self.state.get_slot(d.0) {
+                        self.state.out.emit_instr_rbp_reg("    leaq", slot.0 as i64, "rdx");
+                        self.state.emit("    vmovdqu %ymm0, (%rdx)");
+                    }
+                }
+            }
+            IntrinsicOp::VecZeroI32x4 => {
+                // %dest_vec = {0, 0, 0, 0} - SSE2 4×I32
+                self.state.emit("    pxor %xmm0, %xmm0");
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    if let Some(slot) = self.state.get_slot(d.0) {
+                        self.state.out.emit_instr_rbp_reg("    leaq", slot.0 as i64, "rdx");
+                        self.state.emit("    movdqu %xmm0, (%rdx)");
+                    }
+                }
+            }
         }
+    }
+
+    /// Helper: Get stack slot for an operand if it's a Value
+    fn get_slot_for_operand(&self, op: &Operand) -> Option<StackSlot> {
+        match op {
+            Operand::Value(v) => self.state.get_slot(v.0),
+            _ => None,
+        }
+    }
+
+    /// Emit AVX binary 256-bit op: load ymm0 from arg0 ptr, ymm1 from arg1 ptr,
+    /// apply the given AVX instruction, store result ymm0 to dest_ptr.
+    fn emit_avx_binary_256(&mut self, dest_ptr: &Value, args: &[Operand], avx_inst: &str) {
+        // Load destination address FIRST into a dedicated register to avoid clobbering
+        self.value_to_reg(dest_ptr, "rdx");
+        // Load operands into separate registers
+        self.operand_to_reg(&args[0], "rax");
+        self.state.emit("    vmovupd (%rax), %ymm0");
+        self.operand_to_reg(&args[1], "rcx");
+        self.state.emit("    vmovupd (%rcx), %ymm1");
+        // Perform vector operation
+        self.state.emit_fmt(format_args!("    {} %ymm1, %ymm0, %ymm0", avx_inst));
+        // Store result using dedicated destination register
+        self.state.emit("    vmovupd %ymm0, (%rdx)");
     }
 }

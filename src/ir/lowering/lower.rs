@@ -1050,6 +1050,10 @@ impl Lowerer {
     pub(super) fn fresh_label(&mut self) -> BlockId {
         let l = BlockId(self.next_label);
         self.next_label += 1;
+        if std::env::var("LCCC_DEBUG_LABELS").is_ok() {
+            eprintln!("[LABEL] Allocated BlockId({}) in function {:?}, next_label now {}",
+                      l.0, self.func_state.as_ref().map(|f| &f.name), self.next_label);
+        }
         l
     }
 

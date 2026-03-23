@@ -253,8 +253,23 @@ impl X86Codegen {
             ));
         }
 
-        // Update register cache
-        self.state.reg_cache.set_acc(dest.0, false);
+        // Update register cache - for FP types, value is in xmm0, for integers in rax
+        match ty {
+            IrType::F64 | IrType::F32 => {
+                // For floating point, the value is in xmm0, not rax
+                // We need to move it to rax for the common code path
+                if ty == IrType::F64 {
+                    self.state.emit("    movq %xmm0, %rax");
+                } else {
+                    self.state.emit("    movd %xmm0, %eax");
+                }
+                self.state.reg_cache.set_acc(dest.0, false);
+            }
+            _ => {
+                // Integer types are already in rax
+                self.state.reg_cache.set_acc(dest.0, false);
+            }
+        }
 
         true
     }
@@ -337,8 +352,23 @@ impl X86Codegen {
             load_instr, base_reg, index_reg, scale, dest_reg
         ));
 
-        // Update register cache
-        self.state.reg_cache.set_acc(dest.0, false);
+        // Update register cache - for FP types, value is in xmm0, for integers in rax
+        match ty {
+            IrType::F64 | IrType::F32 => {
+                // For floating point, the value is in xmm0, not rax
+                // We need to move it to rax for the common code path
+                if ty == IrType::F64 {
+                    self.state.emit("    movq %xmm0, %rax");
+                } else {
+                    self.state.emit("    movd %xmm0, %eax");
+                }
+                self.state.reg_cache.set_acc(dest.0, false);
+            }
+            _ => {
+                // Integer types are already in rax
+                self.state.reg_cache.set_acc(dest.0, false);
+            }
+        }
 
         true
     }

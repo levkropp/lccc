@@ -1120,6 +1120,10 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction, gep_fold_m
         }
         Instruction::DynAlloca { dest, size, align } => {
             cg.emit_dyn_alloca(dest, size, *align);
+            // Mark DynAlloca results as protected — their stack slots must not be
+            // reused for other values, since they hold pointers to dynamically
+            // allocated stack space that may be referenced throughout the function.
+            cg.state().protected_slot_values.insert(dest.0);
             cg.state().reg_cache.invalidate_all();
         }
         Instruction::Call { func, info } => {

@@ -154,8 +154,15 @@ impl I686Codegen {
                 self.state.emit("    fabs");
                 self.emit_f32_store_from_x87(dest);
             }
-            // FmaF64x2 and FmaF64x4 are x86-64 SSE2/AVX2 intrinsics; not implemented on i686.
-            IntrinsicOp::FmaF64x2 | IntrinsicOp::FmaF64x4 => {
+            // FmaF64x2, FmaF64x4, and reduction intrinsics are x86-64 SSE2/AVX2 intrinsics; not implemented on i686.
+            IntrinsicOp::FmaF64x2 | IntrinsicOp::FmaF64x4 |
+            IntrinsicOp::LoadF64x4 | IntrinsicOp::LoadF64x2 |
+            IntrinsicOp::LoadI32x8 | IntrinsicOp::LoadI32x4 |
+            IntrinsicOp::AddF64x4 | IntrinsicOp::AddF64x2 |
+            IntrinsicOp::MulF64x4 | IntrinsicOp::MulF64x2 |
+            IntrinsicOp::AddI32x8 | IntrinsicOp::AddI32x4 |
+            IntrinsicOp::HorizontalAddF64x4 | IntrinsicOp::HorizontalAddF64x2 |
+            IntrinsicOp::HorizontalAddI32x8 | IntrinsicOp::HorizontalAddI32x4 => {
                 // Not reachable on i686 - emit a no-op placeholder.
             }
 
@@ -424,6 +431,17 @@ impl I686Codegen {
                     };
                     self.emit_sse_shuffle_imm_128(dptr, args, inst);
                 }
+            }
+
+            // Register-based vector intrinsics (x86-64-specific, not implemented for i686)
+            IntrinsicOp::VecLoadF64x4 | IntrinsicOp::VecLoadF64x2 | IntrinsicOp::VecLoadI32x8 | IntrinsicOp::VecLoadI32x4 |
+            IntrinsicOp::VecAddF64x4 | IntrinsicOp::VecAddF64x2 | IntrinsicOp::VecMulF64x4 | IntrinsicOp::VecMulF64x2 |
+            IntrinsicOp::VecAddI32x8 | IntrinsicOp::VecAddI32x4 |
+            IntrinsicOp::VecHorizontalAddF64x4 | IntrinsicOp::VecHorizontalAddF64x2 |
+            IntrinsicOp::VecHorizontalAddI32x8 | IntrinsicOp::VecHorizontalAddI32x4 |
+            IntrinsicOp::VecZeroF64x4 | IntrinsicOp::VecZeroF64x2 | IntrinsicOp::VecZeroI32x8 | IntrinsicOp::VecZeroI32x4 => {
+                // These are x86-64-specific register-based vector operations
+                unimplemented!("Register-based vector intrinsics not implemented for i686");
             }
         }
         self.state.reg_cache.invalidate_acc();

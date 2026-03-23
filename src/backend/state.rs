@@ -93,6 +93,10 @@ pub struct CodegenState {
     /// copy handling (e.g., x87 fldl/fstpl for F64, two-word copy for I64).
     /// Only populated on i686; empty on 64-bit targets.
     pub wide_values: FxHashSet<u32>,
+    /// Vector values (produced by Vec* intrinsics like VecZeroF64x4, VecLoadF64x4, etc.).
+    /// These should be addressed via leaq (to get stack slot address) instead of movq
+    /// (which would load scalar bytes), because they hold 128/256-bit vector data.
+    pub vector_values: FxHashSet<u32>,
     /// Counter for generating unique labels (e.g., memcpy loops).
     label_counter: u32,
     /// Whether position-independent code (PIC) generation is enabled.
@@ -170,6 +174,12 @@ pub struct CodegenState {
     /// stores the output register to this slot after the asm, and subsequent
     /// uses load the value from it.
     pub asm_output_values: FxHashSet<u32>,
+    /// Values whose stack slots must not be reused for other values.
+    /// This includes DynAlloca results (which hold pointers to dynamically
+    /// allocated stack space) and other vectorization-critical values.
+    /// The backend's slot allocation must preserve these values' slots for
+    /// their entire live range to prevent corruption.
+    pub protected_slot_values: FxHashSet<u32>,
     /// Whether to emit .file/.loc debug directives for source-level debugging.
     pub debug_info: bool,
     /// Pre-computed parameter classifications for the current function.
@@ -218,6 +228,7 @@ impl CodegenState {
             alloca_alignments: FxHashMap::default(),
             i128_values: FxHashSet::default(),
             wide_values: FxHashSet::default(),
+            vector_values: FxHashSet::default(),
             label_counter: 0,
             pic_mode: false,
             local_symbols: FxHashSet::default(),
@@ -237,6 +248,7 @@ impl CodegenState {
             small_slot_values: FxHashSet::default(),
             reg_assigned_values: FxHashSet::default(),
             asm_output_values: FxHashSet::default(),
+            protected_slot_values: FxHashSet::default(),
             debug_info: false,
             param_classes: Vec::new(),
             num_params: 0,

@@ -134,6 +134,109 @@ pub fn calculate_stack_space_common(
     // kernel functions with macro-expanded short-lived intermediates.
     let coalesce = num_blocks >= 2;
 
+    // Phase 0: Pre-scan for vector intrinsics and mark their destinations.
+    // This must happen BEFORE stack layout because the slot allocator needs to
+    // know which values are vectors in order to protect them from slot reuse.
+    // Vector values need protected slots because reduction vectorization creates
+    // tight dependency chains (init_zero → vec_load → vec_add → PHI) where
+    // premature slot reuse corrupts intermediate vector data.
+    use crate::ir::intrinsics::IntrinsicOp;
+    let debug_protect = std::env::var("LCCC_DEBUG_PROTECT").is_ok();
+    if debug_protect {
+        eprintln!("[PROTECT] Scanning function {} for vector intrinsics", func.name);
+    }
+
+    // Pass 1: Mark all vector intrinsic destinations as vector values
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let crate::ir::instruction::Instruction::Intrinsic { dest: Some(d), op, .. } = inst {
+                // Mark destinations of all vector intrinsics as vector values
+                let is_vector = matches!(op,
+                    IntrinsicOp::VecZeroF64x4 | IntrinsicOp::VecZeroF64x2 |
+                    IntrinsicOp::VecZeroI32x8 | IntrinsicOp::VecZeroI32x4 |
+                    IntrinsicOp::VecLoadF64x4 | IntrinsicOp::VecLoadF64x2 |
+                    IntrinsicOp::VecLoadI32x8 | IntrinsicOp::VecLoadI32x4 |
+                    IntrinsicOp::VecAddF64x4 | IntrinsicOp::VecAddF64x2 |
+                    IntrinsicOp::VecAddI32x8 | IntrinsicOp::VecAddI32x4 |
+                    IntrinsicOp::VecMulF64x4 | IntrinsicOp::VecMulF64x2
+                );
+                if is_vector {
+                    state.vector_values.insert(d.0);
+                    // Also mark as protected so slot reuse doesn't corrupt vector data
+                    state.protected_slot_values.insert(d.0);
+                    if debug_protect {
+                        eprintln!("[PROTECT] Marked SSA value {} as protected ({:?})", d.0, op);
+                    }
+                }
+            }
+        }
+    }
+
+    // Pass 2: Mark PHI nodes that have vector incoming values as vector/protected.
+    // This handles the vectorized accumulator PHI: %acc_phi = phi [%init_zero, entry], [%vec_add, latch]
+    // Must be done AFTER Pass 1 so that incoming vector values are already marked.
+    // NOTE: PHI nodes are eliminated before stack layout, so this won't find them.
+    // Instead, we rely on Pass 3 (Copy propagation) to mark the Copy instructions
+    // that replace PHI nodes.
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let crate::ir::instruction::Instruction::Phi { dest, incoming, .. } = inst {
+                if debug_protect {
+                    eprintln!("[PROTECT-PHI] Checking PHI SSA {}, incoming: {:?}", dest.0, incoming);
+                }
+                // If any incoming value is a vector, the PHI result is also a vector
+                let has_vector_incoming = incoming.iter().any(|(val, _)| {
+                    if let crate::ir::instruction::Operand::Value(v) = val {
+                        let is_vec = state.vector_values.contains(&v.0);
+                        if debug_protect && is_vec {
+                            eprintln!("[PROTECT-PHI]   Incoming SSA {} is a vector!", v.0);
+                        }
+                        is_vec
+                    } else {
+                        false
+                    }
+                });
+                if has_vector_incoming {
+                    state.vector_values.insert(dest.0);
+                    state.protected_slot_values.insert(dest.0);
+                    if debug_protect {
+                        eprintln!("[PROTECT] Marked PHI SSA value {} as protected (has vector incoming)", dest.0);
+                    }
+                }
+            }
+        }
+    }
+
+    // Pass 3: Propagate protection through Copy instructions.
+    // PHI elimination converts `%acc = phi [%init, entry], [%result, latch]` into
+    // Copy instructions. If the source of a Copy is protected, the dest should be too.
+    // Iterate until no new protected values are found (fixed-point).
+    loop {
+        let initial_count = state.protected_slot_values.len();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let crate::ir::instruction::Instruction::Copy { dest, src } = inst {
+                    if let crate::ir::instruction::Operand::Value(src_val) = src {
+                        if state.protected_slot_values.contains(&src_val.0) {
+                            let was_new = state.protected_slot_values.insert(dest.0);
+                            state.vector_values.insert(dest.0);
+                            if debug_protect && was_new {
+                                eprintln!("[PROTECT-COPY] Marked SSA {} as protected (copy from protected SSA {})", dest.0, src_val.0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if state.protected_slot_values.len() == initial_count {
+            break; // Fixed point reached
+        }
+    }
+
+    if debug_protect {
+        eprintln!("[PROTECT] Total protected values: {}", state.protected_slot_values.len());
+    }
+
     // Phase 1: Build analysis context (use-blocks, def-blocks, used values,
     //          dead param allocas, alloca coalescability, copy aliases).
     let ctx = build_layout_context(func, coalesce, reg_assigned, callee_saved_regs, lhs_first_binop);
@@ -158,7 +261,7 @@ pub fn calculate_stack_space_common(
 
     // Phase 3: Tier 3 — block-local greedy slot reuse.
     slot_assignment::assign_tier3_block_local_slots(
-        func, &ctx, coalesce,
+        state, func, &ctx, coalesce,
         &block_local_values, &mut deferred_slots,
         &mut block_space, &mut max_block_local_space, &assign_slot,
     );
