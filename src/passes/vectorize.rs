@@ -108,13 +108,11 @@ pub(crate) fn vectorize_with_analysis(func: &mut IrFunction, cfg: &CfgAnalysis) 
 
     // Process innermost loops (loops that don't contain other loops).
     for (idx, loop_info) in loops.iter().enumerate() {
-        // Check if this is an innermost loop (no nested loops).
-        let is_innermost = loops.iter().enumerate().all(|(other_idx, other)| {
-            if idx == other_idx {
-                return true;
-            }
-            // If this loop's body is a subset of another loop's body, it's nested.
-            !loop_info.body.iter().all(|b| other.body.contains(b))
+        // Check if this is an innermost loop (no other loop nests strictly inside it).
+        let is_innermost = !loops.iter().enumerate().any(|(other_idx, other)| {
+            idx != other_idx
+                && other.body.len() < loop_info.body.len()
+                && other.body.iter().all(|b| loop_info.body.contains(b))
         });
 
         if debug {
@@ -252,6 +250,13 @@ fn analyze_loop_pattern(
     _cfg: &CfgAnalysis,
 ) -> Option<VectorizablePattern> {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
+
+    // Build label→index map so we can convert BlockId labels to array indices.
+    let label_to_idx: FxHashMap<BlockId, usize> = func.blocks.iter()
+        .enumerate()
+        .map(|(i, b)| (b.label, i))
+        .collect();
+
     let header_idx = loop_info.header;
     let header = &func.blocks[header_idx];
 
@@ -352,24 +357,28 @@ fn analyze_loop_pattern(
     let body_idx = body_idx?;
 
     // Find exit by looking at loop successors that are outside the loop.
-    let mut exit_idx = None;
+    // Use label_to_idx to convert BlockId labels to block array indices for body.contains().
+    let mut exit_label = None;
     for &block_idx in &loop_info.body {
         let block = &func.blocks[block_idx];
         match &block.terminator {
             Terminator::CondBranch { true_label, false_label, .. } => {
-                let then_in_loop = loop_info.body.contains(&(true_label.0 as usize));
-                let else_in_loop = loop_info.body.contains(&(false_label.0 as usize));
+                let then_idx = label_to_idx.get(true_label).copied();
+                let else_idx = label_to_idx.get(false_label).copied();
+                let then_in_loop = then_idx.map_or(false, |i| loop_info.body.contains(&i));
+                let else_in_loop = else_idx.map_or(false, |i| loop_info.body.contains(&i));
                 if !then_in_loop {
-                    exit_idx = Some(true_label.0 as usize);
+                    exit_label = Some(*true_label);
                     break;
                 } else if !else_in_loop {
-                    exit_idx = Some(false_label.0 as usize);
+                    exit_label = Some(*false_label);
                     break;
                 }
             }
             Terminator::Branch(target) => {
-                if !loop_info.body.contains(&(target.0 as usize)) {
-                    exit_idx = Some(target.0 as usize);
+                let target_idx = label_to_idx.get(target).copied();
+                if !target_idx.map_or(false, |i| loop_info.body.contains(&i)) {
+                    exit_label = Some(*target);
                     break;
                 }
             }
@@ -377,13 +386,14 @@ fn analyze_loop_pattern(
         }
     }
 
-    if exit_idx.is_none() {
+    if exit_label.is_none() {
         if debug {
             eprintln!("[VEC]   No exit block found");
         }
         return None;
     }
-    let exit_idx = exit_idx?;
+    let exit_label = exit_label?;
+    let exit_idx = *label_to_idx.get(&exit_label)?;
 
     // Find the latch block (backedges to header).
     let latch_idx = find_latch(func, loop_info);
@@ -1502,7 +1512,7 @@ fn insert_remainder_loop(
         terminator: Terminator::CondBranch {
             cond: Operand::Value(j_rem_cmp),
             true_label: remainder_body_label,
-            false_label: BlockId(pattern.exit_idx as u32),
+            false_label: func.blocks[pattern.exit_idx].label,
         },
         source_spans: vec![],
     };
@@ -1631,6 +1641,11 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
     let mut next_val_id = func.next_value_id;
     let mut next_label = func.next_label;
 
+    // Restrict all IV/GEP tracing and modifications to the innermost loop blocks only.
+    let innermost_blocks: FxHashSet<usize> = [
+        pattern.header_idx, pattern.body_idx, pattern.latch_idx,
+    ].iter().copied().collect();
+
     // Build a set of IV-derived values (for finding all IV-related comparisons)
     // Start with the IV from the header, but also trace back from the GEPs to find
     // the actual j-loop IV
@@ -1640,7 +1655,7 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
     // Find the IV used in the B and C GEPs by tracing backwards
     // The GEPs use an offset that's derived from the j-loop IV
     let mut gep_ivs = FxHashSet::default();
-    for &block_idx in &pattern.loop_blocks {
+    for &block_idx in &innermost_blocks {
         let block = &func.blocks[block_idx];
         for inst in &block.instructions {
             if let Instruction::GetElementPtr { dest, base: _, offset, ty: _ } = inst {
@@ -1661,7 +1676,7 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
     let mut changed = true;
     while changed {
         changed = false;
-        for &block_idx in &pattern.loop_blocks {
+        for &block_idx in &innermost_blocks {
             let block = &func.blocks[block_idx];
             for inst in &block.instructions {
                 match inst {
@@ -1704,7 +1719,7 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
     changed = true;
     while changed {
         changed = false;
-        for &block_idx in &pattern.loop_blocks {
+        for &block_idx in &innermost_blocks {
             let block = &func.blocks[block_idx];
             for inst in &block.instructions {
                 match inst {
@@ -1780,8 +1795,8 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
             }
         };
 
-        // Now modify all comparisons that use IV-derived values in loop blocks
-        for &block_idx in &pattern.loop_blocks {
+        // Modify the exit comparison in the header block only (not outer loop comparisons)
+        for block_idx in [pattern.header_idx] {
             let block = &mut func.blocks[block_idx];
 
             if debug {
@@ -1841,7 +1856,7 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
         let mut modified_any_increment = false;
 
         // First, try to find and modify explicit IV * 8 multiplies
-        for &block_idx in &pattern.loop_blocks {
+        for &block_idx in &innermost_blocks {
             let block = &mut func.blocks[block_idx];
             for inst in &mut block.instructions {
                 if let Instruction::BinOp {
@@ -1896,7 +1911,7 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
             pointer_values.insert(pattern.b_gep);
 
             // Track pointer values through the loop (they flow through adds and GEPs)
-            for &block_idx in &pattern.loop_blocks {
+            for &block_idx in &innermost_blocks {
                 let block = &func.blocks[block_idx];
                 for inst in &block.instructions {
                     match inst {
@@ -1929,7 +1944,7 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
             }
 
             // Now modify all pointer increments by 8 to increment by 16
-            for &block_idx in &pattern.loop_blocks {
+            for &block_idx in &innermost_blocks {
                 let block = &mut func.blocks[block_idx];
                 for inst in &mut block.instructions {
                     if let Instruction::BinOp {
@@ -1983,7 +1998,7 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
 
             // Collect GEPs that need to be modified (two-pass to avoid borrow issues)
             let mut geps_to_modify = Vec::new();
-            for &block_idx in &pattern.loop_blocks {
+            for &block_idx in &innermost_blocks {
                 let block = &func.blocks[block_idx];
                 for (inst_idx, inst) in block.instructions.iter().enumerate() {
                     if let Instruction::GetElementPtr { dest, base: _, offset, ty } = inst {
@@ -2055,20 +2070,24 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
             ],
         };
 
-        // Insert intrinsic before the store, then remove the store.
-        body.instructions.insert(pattern.store_idx, intrinsic);
+        // Find the store instruction by scanning (store_idx may be stale after Step 2 insertions).
+        let store_pos = body.instructions.iter().position(|inst| {
+            matches!(inst, Instruction::Store { ptr, .. } if *ptr == pattern.c_gep)
+        });
+
+        if let Some(pos) = store_pos {
+            body.instructions.insert(pos, intrinsic);
+            body.instructions.remove(pos + 1);
+        } else {
+            body.instructions.push(intrinsic);
+        }
         changes += 1;
         if debug {
             eprintln!("[VEC]   Inserted FmaF64x2 intrinsic, dest_ptr=Value({}), args=[Value({}), Value({})]",
                 pattern.c_gep.0, pattern.a_ptr.0, pattern.b_gep.0);
         }
 
-        // Remove the old store (now at store_idx + 1).
-        if pattern.store_idx + 1 < body.instructions.len() {
-            body.instructions.remove(pattern.store_idx + 1);
-        }
-
-        // The old load/mul/add instructions are now dead. DCE will remove them.
+        // The old load/mul/add instructions are now dead. DCE will clean them up.
     }
 
     // Step 4: Create remainder loop blocks for N % 2 != 0
@@ -2103,6 +2122,12 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
     let mut next_val_id = func.next_value_id;
     let mut next_label = func.next_label;
 
+    // Restrict all IV/GEP tracing and modifications to the innermost loop blocks only.
+    // This prevents accidentally modifying comparisons or GEPs in outer loops.
+    let innermost_blocks: FxHashSet<usize> = [
+        pattern.header_idx, pattern.body_idx, pattern.latch_idx,
+    ].iter().copied().collect();
+
     // Build a set of IV-derived values (for finding all IV-related comparisons)
     // Start with the IV from the header, but also trace back from the GEPs to find
     // the actual j-loop IV
@@ -2112,7 +2137,7 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
     // Find the IV used in the B and C GEPs by tracing backwards
     // The GEPs use an offset that's derived from the j-loop IV
     let mut gep_ivs = FxHashSet::default();
-    for &block_idx in &pattern.loop_blocks {
+    for &block_idx in &innermost_blocks {
         let block = &func.blocks[block_idx];
         for inst in &block.instructions {
             if let Instruction::GetElementPtr { dest, base: _, offset, ty: _ } = inst {
@@ -2133,7 +2158,7 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
     let mut changed = true;
     while changed {
         changed = false;
-        for &block_idx in &pattern.loop_blocks {
+        for &block_idx in &innermost_blocks {
             let block = &func.blocks[block_idx];
             for inst in &block.instructions {
                 match inst {
@@ -2176,7 +2201,7 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
     changed = true;
     while changed {
         changed = false;
-        for &block_idx in &pattern.loop_blocks {
+        for &block_idx in &innermost_blocks {
             let block = &func.blocks[block_idx];
             for inst in &block.instructions {
                 match inst {
@@ -2252,8 +2277,8 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
             }
         };
 
-        // Now modify all comparisons that use IV-derived values in loop blocks
-        for &block_idx in &pattern.loop_blocks {
+        // Modify the exit comparison in the header block only (not outer loop comparisons)
+        for block_idx in [pattern.header_idx] {
             let block = &mut func.blocks[block_idx];
 
             if debug {
@@ -2313,7 +2338,7 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
         let mut modified_any_increment = false;
 
         // First, try to find and modify explicit IV * 8 multiplies to IV * 32
-        for &block_idx in &pattern.loop_blocks {
+        for &block_idx in &innermost_blocks {
             let block = &mut func.blocks[block_idx];
             for inst in &mut block.instructions {
                 if let Instruction::BinOp {
@@ -2368,7 +2393,7 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
             pointer_values.insert(pattern.b_gep);
 
             // Track pointer values through the loop (they flow through adds and GEPs)
-            for &block_idx in &pattern.loop_blocks {
+            for &block_idx in &innermost_blocks {
                 let block = &func.blocks[block_idx];
                 for inst in &block.instructions {
                     match inst {
@@ -2397,7 +2422,7 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
             }
 
             // Now find adds with constant 8 and change to 32
-            for &block_idx in &pattern.loop_blocks {
+            for &block_idx in &innermost_blocks {
                 let block = &mut func.blocks[block_idx];
                 for inst in &mut block.instructions {
                     if let Instruction::BinOp {
@@ -2439,7 +2464,7 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
             }
 
             let mut geps_to_modify = Vec::new();
-            for &block_idx in &pattern.loop_blocks {
+            for &block_idx in &innermost_blocks {
                 let block = &func.blocks[block_idx];
                 for (inst_idx, inst) in block.instructions.iter().enumerate() {
                     if let Instruction::GetElementPtr { dest, base: _, offset, ty } = inst {
@@ -2500,20 +2525,26 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
             ],
         };
 
-        // Insert intrinsic before the store, then remove the store.
-        body.instructions.insert(pattern.store_idx, intrinsic);
+        // Find the store instruction by scanning (store_idx may be stale after Step 2 insertions).
+        let store_pos = body.instructions.iter().position(|inst| {
+            matches!(inst, Instruction::Store { ptr, .. } if *ptr == pattern.c_gep)
+        });
+
+        if let Some(pos) = store_pos {
+            body.instructions.insert(pos, intrinsic);
+            body.instructions.remove(pos + 1); // Remove the old store
+        } else {
+            // Fallback: append intrinsic
+            body.instructions.push(intrinsic);
+        }
         changes += 1;
         if debug {
             eprintln!("[VEC]   Inserted FmaF64x4 intrinsic, dest_ptr=Value({}), args=[Value({}), Value({})]",
                 pattern.c_gep.0, pattern.a_ptr.0, pattern.b_gep.0);
         }
 
-        // Remove the old store (now at store_idx + 1).
-        if pattern.store_idx + 1 < body.instructions.len() {
-            body.instructions.remove(pattern.store_idx + 1);
-        }
-
-        // The old load/mul/add instructions are now dead. DCE will remove them.
+        // The old load/mul/add instructions are now dead (their sole consumer, the store,
+        // was removed). DCE will clean them up in a subsequent pass iteration.
     }
 
     // Step 4: Create remainder loop blocks for N % 4 != 0
