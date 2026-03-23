@@ -90,6 +90,47 @@ impl X86Codegen {
             return;
         }
 
+        // Memory-operand optimization: for Add/Sub, use memory source directly
+        // instead of loading rhs into %rcx first.
+        // Pattern: addq -N(%rbp), %rax  (saves one movq load instruction)
+        if matches!(op, IrBinOp::Add | IrBinOp::Sub) {
+            if let Operand::Value(rhs_val) = rhs {
+                // Check if rhs has a stack slot and is NOT register-allocated
+                if self.dest_reg(&rhs_val).is_none() {
+                    if let Some(slot) = self.state.get_slot(rhs_val.0) {
+                        self.operand_to_rax(lhs);
+                        let mnem = if op == IrBinOp::Add { "add" } else { "sub" };
+                        if use_32bit {
+                            self.state.emit_fmt(format_args!("    {}l {}(%rbp), %eax", mnem, slot.0));
+                            if !is_unsigned { self.state.emit("    cltq"); }
+                        } else {
+                            self.state.emit_fmt(format_args!("    {}q {}(%rbp), %rax", mnem, slot.0));
+                        }
+                        self.store_rax_to(dest);
+                        return;
+                    }
+                }
+            }
+            // Also try memory-operand for lhs (swap: rhs to rax, lhs from memory) for Add only
+            if op == IrBinOp::Add {
+                if let Operand::Value(lhs_val) = lhs {
+                    if self.dest_reg(&lhs_val).is_none() {
+                        if let Some(slot) = self.state.get_slot(lhs_val.0) {
+                            self.operand_to_rax(rhs);
+                            if use_32bit {
+                                self.state.emit_fmt(format_args!("    addl {}(%rbp), %eax", slot.0));
+                                if !is_unsigned { self.state.emit("    cltq"); }
+                            } else {
+                                self.state.emit_fmt(format_args!("    addq {}(%rbp), %rax", slot.0));
+                            }
+                            self.store_rax_to(dest);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
         // General case: load lhs to rax, rhs to rcx
         self.operand_to_rax(lhs);
         self.operand_to_rcx(rhs);
