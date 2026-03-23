@@ -591,7 +591,7 @@ impl X86Codegen {
                     self.operand_to_reg(&args[1], "rdx");      // B ptr → %rdx
                     self.value_to_reg(c_ptr, "rax");           // C ptr → %rax
 
-                    // FMA3 + AVX2: load C, fused multiply-add with B, store back
+                    // FMA3 + AVX2: load A, broadcast, load C, fused multiply-add, store
                     self.state.emit("    movsd (%rcx), %xmm1");              // Load A scalar (64-bit)
                     self.state.emit("    vbroadcastsd %xmm1, %ymm1");        // Broadcast to {A, A, A, A}
                     self.state.emit("    vmovupd (%rax), %ymm0");            // Load C[j..j+3]

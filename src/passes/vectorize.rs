@@ -2358,17 +2358,12 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
                     };
                     let rhs_is_8 = matches!(rhs, Operand::Const(IrConst::I64(8)) | Operand::Const(IrConst::I32(8)));
 
-                    if debug && (lhs_is_iv_derived || rhs_is_8) {
-                        eprintln!("[VEC]   Found multiply in block {}: Value({}) = {:?} * {:?}, lhs_is_iv_derived={}, rhs_is_8={}",
-                            block_idx, dest.0, lhs, rhs, lhs_is_iv_derived, rhs_is_8);
-                    }
-
                     if lhs_is_iv_derived && rhs_is_8 {
                         // Change 8 to 32 (process 4 doubles = 32 bytes)
                         *rhs = match rhs {
-                            Operand::Const(IrConst::I64(_)) => Operand::Const(IrConst::I64(32)),  // Changed from 16
-                            Operand::Const(IrConst::I32(_)) => Operand::Const(IrConst::I32(32)),  // Changed from 16
-                            _ => Operand::Const(IrConst::I64(32)),                                 // Changed from 16
+                            Operand::Const(IrConst::I64(_)) => Operand::Const(IrConst::I64(32)),
+                            Operand::Const(IrConst::I32(_)) => Operand::Const(IrConst::I32(32)),
+                            _ => Operand::Const(IrConst::I64(32)),
                         };
                         changes += 1;
                         modified_any_increment = true;
