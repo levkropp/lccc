@@ -891,9 +891,23 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
     cg.state().has_dyn_alloca = has_dyn_alloca;
     cg.state().uses_sret = func.uses_sret;
 
+    // Determine if we can omit the frame pointer for this function.
+    // Eligible if: no dynamic alloca, not variadic, no inline asm referencing %rbp.
+    let has_inline_asm_rbp = func.blocks.iter().any(|block| {
+        block.instructions.iter().any(|inst| {
+            if let Instruction::InlineAsm { template, .. } = inst {
+                template.contains("%rbp") || template.contains("{rbp}")
+            } else {
+                false
+            }
+        })
+    });
+    cg.state().omit_frame_pointer = !has_dyn_alloca && !func.is_variadic && !has_inline_asm_rbp;
+
     // Calculate stack space and emit prologue
     let raw_space = cg.calculate_stack_space(func);
     let frame_size = cg.aligned_frame_size(raw_space);
+    cg.state().frame_size = frame_size;
     cg.emit_prologue(func, frame_size);
 
     // Store parameters
