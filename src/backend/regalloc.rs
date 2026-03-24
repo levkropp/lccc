@@ -63,6 +63,9 @@ pub struct RegAllocConfig {
     /// Only enable this when the backend's asm emitter checks reg_assignments
     /// before falling back to stack access. Currently only RISC-V does this.
     pub allow_inline_asm_regalloc: bool,
+    /// Available XMM registers for F64 allocation (caller-saved, non-call-spanning).
+    /// Examples: x86 xmm2-xmm7 (PhysReg 20-25).
+    pub xmm_regs: Vec<PhysReg>,
 }
 
 /// Filter live intervals to only those eligible for register allocation,
