@@ -9,7 +9,7 @@
 //! maintaining an "active" set of intervals that overlap with the current position.
 //! For each interval, we either assign it a free register or spill it to the stack.
 
-use super::liveness::LiveInterval;
+use super::liveness::{LiveInterval, for_each_operand_in_instruction, for_each_operand_in_terminator};
 use super::regalloc::PhysReg;
 use crate::common::fx_hash::FxHashMap;
 use crate::ir::reexports::{Instruction, IrFunction, Operand, Terminator, Value};
@@ -345,14 +345,52 @@ pub fn build_live_ranges(
     loop_depth: &[u32],
     func: &IrFunction,
 ) -> Vec<LiveRange> {
+    // Build map: value_id → defining block index.
+    // This fixes a bug where value_id was incorrectly used as an index into
+    // block_loop_depth (which is indexed by block index, not value ID).
+    let mut def_block: FxHashMap<u32, usize> = FxHashMap::default();
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            if let Some(dest) = inst.dest() {
+                def_block.insert(dest.0, block_idx);
+            }
+        }
+    }
+
+    // Build map: value_id → max loop depth across all use sites.
+    // A value defined outside a loop but used inside it should get the inner
+    // loop's priority, not the definition site's (typically depth 0).
+    let mut max_use_depth: FxHashMap<u32, u32> = FxHashMap::default();
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        let bdepth = loop_depth.get(block_idx).copied().unwrap_or(0);
+        if bdepth == 0 { continue; } // Skip non-loop blocks (depth 0 can't increase max)
+        for inst in &block.instructions {
+            for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    let entry = max_use_depth.entry(v.0).or_insert(0);
+                    *entry = (*entry).max(bdepth);
+                }
+            });
+        }
+        for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                let entry = max_use_depth.entry(v.0).or_insert(0);
+                *entry = (*entry).max(bdepth);
+            }
+        });
+    }
+
     let mut ranges: Vec<LiveRange> = intervals
         .iter()
         .map(|interval| {
-            let depth = if (interval.value_id as usize) < loop_depth.len() {
-                loop_depth[interval.value_id as usize]
-            } else {
-                0
-            };
+            // Use the maximum of defining block depth and max use-site depth.
+            // This ensures values defined outside loops but used inside them
+            // get the correct inner-loop priority for register allocation.
+            let def_depth = def_block.get(&interval.value_id)
+                .and_then(|&bidx| loop_depth.get(bidx).copied())
+                .unwrap_or(0);
+            let use_depth = max_use_depth.get(&interval.value_id).copied().unwrap_or(0);
+            let depth = def_depth.max(use_depth);
             LiveRange::from_interval(*interval, depth)
         })
         .collect();
