@@ -79,6 +79,8 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= local_patterns::fuse_copy_and_operation(&mut store, &mut infos);
         changed |= local_patterns::promote_loop_invariant_fp_load(&mut store, &mut infos);
         changed |= local_patterns::eliminate_dead_sign_extensions(&mut store, &mut infos);
+        changed |= local_patterns::fold_base_index_addressing(&mut store, &mut infos);
+        changed |= local_patterns::fold_accumulator_alu_store(&mut store, &mut infos);
         if local_changed || pass_count == 0 {
             changed |= push_pop::eliminate_push_pop_pairs(&store, &mut infos);
             changed |= push_pop::eliminate_binop_push_pop_pattern(&mut store, &mut infos);
@@ -114,6 +116,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);
             changed2 |= dead_code::eliminate_dead_stores(&store, &mut infos);
             changed2 |= memory_fold::fold_memory_operands(&mut store, &mut infos);
+            changed2 |= local_patterns::fold_base_index_addressing(&mut store, &mut infos);
             pass_count2 += 1;
         }
     }
@@ -1257,6 +1260,37 @@ mod regression_tests {
         // The struct store at -8(%rbp) must be preserved because -4(%rbp) is read
         assert!(result.contains("movq %rsi, -8(%rbp)"),
             "struct param store at -8(%rbp) must NOT be NOP'd when -4(%rbp) is read: {}", result);
+    }
+
+    #[test]
+    fn test_sib_indexed_store_via_copy() {
+        // Pattern: movq %idx, %rax; addq %base, %rax; movq %rax, %tmp; store (%tmp)
+        let asm = [
+            "    movq %r14, %rax",
+            "    addq %rcx, %rax",
+            "    movq %rax, %rcx",
+            "    movb $0, (%rcx)",
+        ].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        eprintln!("sib_indexed result: {:?}", result);
+        assert!(result.contains("(%rcx, %r14)") || result.contains("(%rcx,%r14)"),
+            "should fold to SIB indexed addressing: {}", result);
+        assert!(!result.contains("addq %rcx, %rax"),
+            "addq should be eliminated: {}", result);
+    }
+
+    #[test]
+    fn test_sib_indexed_store_direct_rax() {
+        // Pattern: movq %idx, %rax; addq %base, %rax; store (%rax)
+        let asm = [
+            "    movq %r14, %rax",
+            "    addq %rbx, %rax",
+            "    movb $0, (%rax)",
+        ].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        eprintln!("sib_direct result: {:?}", result);
+        assert!(result.contains("(%rbx, %r14)") || result.contains("(%rbx,%r14)"),
+            "should fold to SIB indexed addressing: {}", result);
     }
 }
 

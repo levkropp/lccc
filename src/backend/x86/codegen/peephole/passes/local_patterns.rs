@@ -657,6 +657,237 @@ pub(super) fn eliminate_dead_sign_extensions(
     changed
 }
 
+// ── SIB indexed addressing folding ──────────────────────────────────────────
+//
+// The accumulator-based codegen computes `base + index` manually:
+//   movq %REG_IDX, %rax       ; copy index to accumulator
+//   addq %REG_BASE, %rax      ; compute address
+//   [movq %rax, %REG_TMP]     ; optional: copy to another register
+//   movX SRC, (%rax|%REG_TMP) ; store through computed address
+//   (or movX (%rax|%REG_TMP), DST for loads)
+//
+// This pass folds these into x86 SIB indexed addressing:
+//   movX SRC, (%REG_BASE,%REG_IDX)
+//
+// Requirements: REG_IDX and REG_BASE must be callee-saved or otherwise
+// guaranteed not clobbered between definition and use.
+
+pub(super) fn fold_base_index_addressing(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+
+    while i < len {
+        if infos[i].is_nop() { i += 1; continue; }
+
+        // Look for: movq %REG, %rax (copy a GP register to accumulator)
+        let ti = infos[i].trimmed(store.get(i));
+        if !ti.starts_with("movq %") || !ti.ends_with(", %rax") { i += 1; continue; }
+
+        // Extract the source register (the index)
+        let idx_reg = &ti[5..ti.len() - 6]; // strip "movq " prefix and ", %rax" suffix
+        if !idx_reg.starts_with('%') || idx_reg == "%rax" || idx_reg == "%rcx" {
+            i += 1; continue;
+        }
+        // Must be a valid GP register
+        let idx_family = register_family_fast(idx_reg);
+        if idx_family == REG_NONE || idx_family > REG_GP_MAX { i += 1; continue; }
+
+        // Next non-NOP: must be addq %REG_BASE, %rax
+        let mut j = i + 1;
+        while j < len && infos[j].is_nop() { j += 1; }
+        if j >= len || infos[j].is_barrier() { i += 1; continue; }
+
+        let tj = infos[j].trimmed(store.get(j));
+        if !tj.starts_with("addq %") || !tj.ends_with(", %rax") { i += 1; continue; }
+
+        let base_reg = &tj[5..tj.len() - 6]; // strip "addq " and ", %rax"
+        if !base_reg.starts_with('%') || base_reg == "%rax" {
+            i += 1; continue;
+        }
+        let base_family = register_family_fast(base_reg);
+        if base_family == REG_NONE || base_family > REG_GP_MAX { i += 1; continue; }
+
+        // Next non-NOP: either a memory op using (%rax), or movq %rax, %REG_TMP
+        let mut k = j + 1;
+        while k < len && infos[k].is_nop() { k += 1; }
+        if k >= len || infos[k].is_barrier() { i += 1; continue; }
+
+        let tk = infos[k].trimmed(store.get(k));
+
+        // Case 1: Direct use — the mem op uses (%rax)
+        if let Some(folded) = try_fold_mem_op_with_sib(tk, "(%rax)", base_reg, idx_reg) {
+            mark_nop(&mut infos[i]); // remove movq %REG, %rax
+            mark_nop(&mut infos[j]); // remove addq %REG_BASE, %rax
+            replace_line(store, &mut infos[k], k, folded);
+            changed = true;
+            i = k + 1;
+            continue;
+        }
+
+        // Case 2: Intermediate copy — movq %rax, %REG_TMP, then mem op on (%REG_TMP)
+        // tmp can equal base_reg (common: base loaded into %rcx, then %rcx reused
+        // for the computed address). After we eliminate the addq, %base_reg still
+        // holds the original base value, so SIB (%base,%idx) is correct.
+        if tk.starts_with("movq %rax, %") {
+            let tmp_reg = &tk[11..]; // after "movq %rax, " (includes the %)
+            let tmp_family = register_family_fast(tmp_reg);
+            if tmp_family != REG_NONE && tmp_family <= REG_GP_MAX
+                && tmp_family != idx_family // idx must differ from tmp
+            {
+                let mut m = k + 1;
+                while m < len && infos[m].is_nop() { m += 1; }
+                if m < len && !infos[m].is_barrier() {
+                    let tm = infos[m].trimmed(store.get(m));
+                    let addr_pat = format!("(%{})", &tmp_reg[1..]); // e.g. "(%rcx)"
+                    if let Some(folded) = try_fold_mem_op_with_sib(tm, &addr_pat, base_reg, idx_reg) {
+                        mark_nop(&mut infos[i]); // remove movq %REG, %rax
+                        mark_nop(&mut infos[j]); // remove addq
+                        mark_nop(&mut infos[k]); // remove movq %rax, %TMP
+                        replace_line(store, &mut infos[m], m, folded);
+                        changed = true;
+                        i = m + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        i += 1;
+    }
+    changed
+}
+
+/// Try to replace a memory operand `(ADDR_PAT)` in an instruction with SIB `(%BASE,%IDX)`.
+/// Returns the new instruction text if the pattern matches.
+fn try_fold_mem_op_with_sib(instr: &str, addr_pat: &str, base_reg: &str, idx_reg: &str) -> Option<String> {
+    // The instruction must contain the address pattern exactly once
+    if !instr.contains(addr_pat) { return None; }
+    // Don't fold into instructions that also reference rax/rcx in a way that conflicts
+    // (the movq/addq we're removing clobber rax)
+    // Build the SIB replacement
+    let sib = format!("(%{}, %{})", &base_reg[1..], &idx_reg[1..]);
+    let new_instr = format!("    {}", instr.replace(addr_pat, &sib));
+    Some(new_instr)
+}
+
+// ── Accumulator ALU + store folding ─────────────────────────────────────────
+//
+// Folds the pattern:
+//   movl %REGd, %eax            (copy 32-bit value to accumulator)
+//   addl OFFSET(%rsp), %eax     (32-bit ALU op with memory source)
+//   cltq                        (sign-extend for 64-bit store)
+//   movq %rax, OFFSET2(%rsp)    (64-bit store)
+//
+// Into:
+//   addl OFFSET(%rsp), %REGd    (ALU directly in register)
+//   movl %REGd, OFFSET2(%rsp)   (32-bit store, no sign-extend needed)
+//
+// Saves 2 instructions per occurrence. Common in arith_loop where 32-bit
+// variables are stored to 64-bit stack slots through the accumulator.
+
+pub(super) fn fold_accumulator_alu_store(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+
+    while i < len {
+        if infos[i].is_nop() { i += 1; continue; }
+
+        // Step 1: Look for `movl %REGd, %eax`
+        let (src_reg32, src_family) = {
+            let ti = infos[i].trimmed(store.get(i));
+            if !ti.starts_with("movl %") || !ti.ends_with(", %eax") { i += 1; continue; }
+            let sr = &ti[5..ti.len() - 6];
+            if !sr.starts_with('%') || sr == "%eax" { i += 1; continue; }
+            let sf = register_family_fast(sr);
+            if sf == REG_NONE || sf == 0 { i += 1; continue; }
+            (sr.to_string(), sf)
+        };
+
+        // Step 2: Next non-NOP must be `addl/subl/andl/orl/xorl STACK, %eax`
+        let mut j = i + 1;
+        while j < len && infos[j].is_nop() { j += 1; }
+        if j >= len || infos[j].is_barrier() { i += 1; continue; }
+
+        let (alu_op_s, mem_src_s) = {
+            let tj = infos[j].trimmed(store.get(j));
+            let ao = if let Some(pos) = tj.find(' ') { &tj[..pos] } else { i += 1; continue };
+            if !matches!(ao, "addl" | "subl" | "andl" | "orl" | "xorl") { i += 1; continue; }
+            if !tj.ends_with(", %eax") { i += 1; continue; }
+            let ms = tj[ao.len() + 1..tj.len() - 6].trim().to_string();
+            if !ms.ends_with("(%rsp)") && !ms.ends_with("(%rbp)") { i += 1; continue; }
+            (ao.to_string(), ms)
+        };
+
+        // Step 3: Next must be `cltq`
+        let mut k = j + 1;
+        while k < len && infos[k].is_nop() { k += 1; }
+        if k >= len { i += 1; continue; }
+        { let tk = infos[k].trimmed(store.get(k)); if tk != "cltq" { i += 1; continue; } }
+
+        // Step 4: Next must be `movq %rax, STACK` (store to stack)
+        let mut m = k + 1;
+        while m < len && infos[m].is_nop() { m += 1; }
+        if m >= len || infos[m].is_barrier() { i += 1; continue; }
+
+        let store_dst_s = {
+            let is_store_rax = match infos[m].kind {
+                LineKind::StoreRbp { reg: 0, size: MoveSize::Q, .. } => true,
+                _ => {
+                    let tm = infos[m].trimmed(store.get(m));
+                    tm.starts_with("movq %rax, ") && (tm.ends_with("(%rsp)") || tm.ends_with("(%rbp)"))
+                }
+            };
+            if !is_store_rax { i += 1; continue; }
+            let tm = infos[m].trimmed(store.get(m));
+            tm[11..].to_string() // after "movq %rax, "
+        };
+
+        // Step 5: Verify %SRC_REG is overwritten before its next 64-bit read
+        let src_bit = 1u16 << src_family;
+        let mut n = m + 1;
+        let mut src_safe = true;
+        while n < len && n < m + 12 {
+            if infos[n].is_nop() { n += 1; continue; }
+            if infos[n].is_barrier() { break; }
+            if infos[n].reg_refs & src_bit == 0 { n += 1; continue; }
+            match infos[n].kind {
+                LineKind::LoadRbp { reg, .. } if reg == src_family => break,
+                LineKind::Other { dest_reg } if dest_reg == src_family => break,
+                _ => {
+                    let tn = infos[n].trimmed(store.get(n));
+                    if tn.contains(&*src_reg32) {
+                        n += 1;
+                        continue;
+                    }
+                    src_safe = false;
+                    break;
+                }
+            }
+        }
+        if !src_safe { i += 1; continue; }
+
+        // Transform! Replace 4 instructions with 2.
+        mark_nop(&mut infos[i]);
+        let new_alu = format!("    {} {}, {}", alu_op_s, mem_src_s, src_reg32);
+        replace_line(store, &mut infos[j], j, new_alu);
+        mark_nop(&mut infos[k]);
+        let new_store = format!("    movl {}, {}", src_reg32, store_dst_s);
+        replace_line(store, &mut infos[m], m, new_store);
+
+        changed = true;
+        i = m + 1;
+    }
+    changed
+}
+
 /// Check if an instruction is a 32-bit operation that consumes %eax,
 /// meaning it only uses the lower 32 bits and then zero-extends the result.
 /// Examples: addl, subl, imull, andl, orl, xorl, movl, etc.
