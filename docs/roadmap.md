@@ -12,7 +12,7 @@ next_page:
 
 # Roadmap
 {:.doc-subtitle}
-LCCC improves CCC in seven phases. Phases 1–5 are complete.
+LCCC improves CCC in twelve phases. Phases 1–12 are complete.
 
 ## Status Overview
 
@@ -24,8 +24,16 @@ LCCC improves CCC in seven phases. Phases 1–5 are complete.
 | 3b | Phi-copy stack slot coalescing | ✅ Complete | **+19% additional on loop-heavy code** |
 | 4 | Loop unrolling + FP intrinsic lowering | ✅ Complete | **+45% matmul vs CCC; sieve counting loop 8×** |
 | 5 | FP peephole optimization | ✅ Complete | **-41% matmul time (6.0× → 4.0× vs GCC)** |
-| 6 | SIMD / auto-vectorization | 🔲 Planned | ~2–4× on remaining FP-heavy code |
-| 7 | Profile-guided optimization (PGO) | 🔲 Planned | ~1.2–1.5× general |
+| 6 | SSE2 auto-vectorization (2-wide) | ✅ Complete | **~2× on matmul-style FP loops** |
+| 7a | AVX2 vectorization (4-wide) | ✅ Complete | **~2× additional on matmul vs SSE2** |
+| 7b | Remainder loop handling | ✅ Complete | **Production-ready vectorization for any N** |
+| 8 | Reduction vectorization (sum, dot) | ✅ Complete | **~2.7× faster than GCC -O3** |
+| 9 | Indexed addressing modes (SIB) | ✅ Complete | **75% reduction in array access instructions** |
+| 10 | Binary rec-to-iter, XMM regalloc, FPO | ✅ Complete | **478× faster on fib, F64 in XMM regs** |
+| 11 | Peephole: const stores, SIB fold, ALU fold | ✅ Complete | **Sieve 1.78× → 1.55×, 75 sign-ext removed** |
+| 12 | Register allocator loop-depth fix | ✅ Complete | **Inner-loop values correctly prioritized** |
+| — | Better function inlining | 🔲 Planned | ~1.5× on call-heavy code |
+| — | Profile-guided optimization (PGO) | 🔲 Planned | ~1.2–1.5× general |
 
 ---
 
@@ -188,16 +196,47 @@ See the [Phase 4 write-up](/lccc/updates/phase4-loop-unrolling) for full details
 
 ---
 
+## Phase 11 — Peephole: Constant Stores, SIB Fold, Accumulator ALU Fold (Complete)
+
+**Goal:** Reduce instruction count in inner loops by adding three new peephole patterns and fixing FPO stack alignment.
+
+**What changed:**
+- `src/backend/x86/codegen/memory.rs` — constant-immediate stores bypass the accumulator (`movb $0, addr` instead of `xorl; movq; movb`)
+- `src/backend/x86/codegen/peephole/passes/local_patterns.rs` — SIB indexed address folding (3 instructions → 1 for `base + index` array access), accumulator ALU+store folding (4 → 2 for 32-bit ops), `movslq`/`cltq` elimination
+- `src/backend/x86/codegen/prologue.rs` — FPO stack alignment fix (frame size must be ≡ 8 mod 16)
+- `src/passes/recursion_to_iter.rs` — 8 unit tests for the rec2iter pass
+
+**Results:**
+- Sieve: 1.78× → 1.55× (SIB fold + constant stores)
+- Arith loop: 75 redundant sign-extensions eliminated (32 movslq + 23 cltq + 20 movl copies)
+- MatMul: **fixed** — was crashing with SIGSEGV due to stack misalignment in printf
+
+---
+
+## Phase 12 — Register Allocator Loop-Depth Fix (Complete)
+
+**Goal:** Fix a critical bug in the register allocator's priority computation.
+
+**What changed** (`src/backend/live_range.rs`):
+- `build_live_ranges()` was using `value_id` as an index into `block_loop_depth[]`, but `block_loop_depth` is indexed by block index (0..num_blocks), not value ID (sparse u32). This caused most values to get `loop_depth=0` (wrong), leading to incorrect priorities and unnecessary spilling.
+- Fix: build a `value_id → defining_block` map and compute `max_use_depth` (maximum loop depth across all use sites). Priority now uses `max(def_depth, max_use_depth)`, ensuring values defined outside a loop but used heavily inside it get correct inner-loop priority.
+
+**Results:**
+- Sieve: outer loop variable `i` promoted from stack to `%ebx`, eliminating 1 stack load per inner-loop iteration
+- All benchmarks: more correct allocation decisions across the board
+
+---
+
 ## Remaining Gap to GCC
 
-Even after all six phases, some gaps will remain:
+After all twelve phases, LCCC is within 1.3–1.8× of GCC -O2 on most workloads:
 
 | Source | Gap | Addressable? |
 |--------|-----|-------------|
-| SIMD vectorization | 4–8× on FP loops | Phase 5 |
-| SIMD vectorization (remaining) | 2–4× on FP loops | Phase 5 |
-| Graph-coloring register allocation | ~1.1× on register-pressure code | Future Phase 7 |
+| Accumulator-based codegen | 1.2–1.5× on ALU-heavy code | Fundamental architecture limit |
+| Graph-coloring register allocation | ~1.1× on register-pressure code | Future (would require regalloc rewrite) |
+| Better function inlining | ~1.5× on call-heavy code | Planned |
 | Link-time optimization (LTO) | ~1.1× general | Future |
-| Whole-program devirtualization | negligible for C | N/A |
+| Instruction scheduling | ~1.1× on latency-bound code | Future |
 
 The goal is not to beat GCC — it's to make CCC-compiled programs fast enough for real systems software, which means within ~1.5× of GCC on typical workloads.

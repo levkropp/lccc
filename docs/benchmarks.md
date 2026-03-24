@@ -19,24 +19,24 @@ Six micro-benchmarks targeting different bottlenecks. All measured with best-of-
 | Item | Value |
 |------|-------|
 | **Host** | Linux x86-64 |
-| **LCCC** | Phase 8 complete — linear scan + TCE + phi-copy coalescing + FP opts + AVX2 vectorization + reduction vectorization |
+| **LCCC** | Phase 12 complete — linear scan + TCE + phi-copy coalescing + FP opts + AVX2 vectorization + reduction vectorization + rec-to-iter + SIB fold + accumulator fold + regalloc loop-depth fix |
 | **CCC** | upstream, three-phase greedy allocator |
-| **GCC** | 15.2.0 (Ubuntu 15.2.0-4ubuntu4) |
+| **GCC** | 15.2.1 (Arch Linux) |
 | **Flags** | `-O2` for all compilers (GCC `-O3 -march=native` for reduction comparison) |
-| **Timing** | `time.perf_counter()` wall clock, 5 reps, best taken |
-| **Date** | 2026-03-23 |
+| **Timing** | `time.perf_counter()` wall clock, 7 reps, best taken |
+| **Date** | 2026-03-24 |
 
 ## Results
 
-| Benchmark | LCCC | CCC | GCC -O2 | LCCC/CCC | LCCC/GCC |
-|-----------|-----:|----:|--------:|:--------:|:--------:|
-| `arith_loop` | **0.104s** | 0.147s | 0.068s | **+41% faster** | 1.53× slower |
-| `sieve` | **0.037s** | 0.044s | 0.024s | **+19% faster** | 1.54× slower |
-| `qsort` | 0.098s | 0.096s | 0.087s | ≈ equal | 1.13× slower |
-| `fib(40)` | 0.352s | 0.355s | 0.096s | ≈ equal | 3.67× slower |
-| `matmul` | 0.027s | 0.029s | 0.003s | ≈ equal | 7.84× slower |
-| `reduction` | **AVX2** | scalar | scalar (GCC -O3) | **4× speedup** | **~2.7× faster** |
-| `tce_sum` | **0.008s** | 1.09s | 0.008s | **139× faster** | ≈ equal |
+| Benchmark | LCCC | GCC -O2 | LCCC/GCC |
+|-----------|-----:|--------:|:--------:|
+| `arith_loop` | 0.139s | 0.088s | 1.57× slower |
+| `sieve` | 0.073s | 0.047s | 1.55× slower |
+| `qsort` | 0.137s | 0.105s | 1.29× slower |
+| `fib(40)` | **0.000s** | 0.146s | **478× faster** |
+| `matmul` | 0.010s | 0.006s | 1.84× slower |
+| `reduction` | **AVX2** | scalar (GCC -O3) | **~2.7× faster** |
+| `tce_sum` | **0.008s** | 0.008s | ≈ equal |
 
 All outputs are byte-identical to GCC's.
 
@@ -73,11 +73,11 @@ long fib(int n) {
 // fib(40) = 102,334,155  (~330M recursive calls)
 ```
 
-**Why it matters:** Call-dominated workload. Every call site clobbers caller-saved registers, making callee-saved registers the only useful ones. Both LCCC and CCC allocate identically here — the function body is too small to benefit from better allocation.
+**Why it matters:** Call-dominated workload — tests whether the compiler can recognize and optimize the exponential recursion pattern.
 
-**LCCC vs CCC:** ≈ equal (0.352s vs 0.355s). Both compile `fib` to the same two-recursive-call structure.
+**LCCC vs GCC: 478× faster.** LCCC's binary recursion-to-iteration pass (Phase 10) detects the `f(n) = f(n-1) + f(n-2)` pattern and converts it to an O(n) iterative sliding-window loop. GCC -O2 keeps the exponential recursion (with partial loop transformation of one call). The transformation is verified by a CI test that computes fib(90) — impossible without the O(n) conversion.
 
-**LCCC vs GCC:** 3.67× slower. GCC eliminates the second recursive call via a loop transformation, dramatically reducing call overhead.
+**Note:** This is a synthetic benchmark. No production code uses naive recursive Fibonacci. The optimization demonstrates LCCC's pattern-matching capabilities but should not be interpreted as "LCCC is faster than GCC" in general — GCC wins on all other benchmarks.
 
 ### `03_matmul` — Floating Point + Cache
 
