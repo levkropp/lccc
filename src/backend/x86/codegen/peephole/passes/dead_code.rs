@@ -425,7 +425,7 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                         read_ranges.push((rbp_off, 32));
                     } else {
                         let line = infos[k].trimmed(store.get(k));
-                        if line.contains("(%rbp)") {
+                        if line.contains("(%rbp)") || line.contains("(%rsp)") {
                             has_indirect = true;
                             break;
                         }
@@ -439,7 +439,7 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                     let rbp_off = parse_rbp_offset(line);
                     if rbp_off != RBP_OFFSET_NONE {
                         read_ranges.push((rbp_off, 8));
-                    } else if line.contains("(%rbp)") {
+                    } else if line.contains("(%rbp)") || line.contains("(%rsp)") {
                         has_indirect = true;
                         break;
                     }

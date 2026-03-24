@@ -168,19 +168,17 @@ pub(super) fn compact_frame(store: &mut LineStore, infos: &mut [LineInfo]) {
                     let rbp_off = infos[k].rbp_offset;
                     if rbp_off != RBP_OFFSET_NONE {
                         let line = infos[k].trimmed(store.get(k));
-                        if line.starts_with("leaq ") && line.contains("(%rbp)") {
+                        if line.starts_with("leaq ") && (line.contains("(%rbp)") || line.contains("(%rsp)")) {
                             // leaq takes address of a stack slot — bail.
-                            // Address arithmetic breaks if we relocate offsets.
                             bail = true;
                             break;
                         }
                         if !callee_save_offsets.contains(&rbp_off) {
-                            // This is a read (memory operand in ALU, cmp, etc.)
                             read_offsets.push(rbp_off);
                         }
                     } else {
                         let line = infos[k].trimmed(store.get(k));
-                        if line.contains("(%rbp)") {
+                        if line.contains("(%rbp)") || line.contains("(%rsp)") {
                             // Unrecognized rbp reference — bail
                             bail = true;
                             break;
@@ -275,7 +273,9 @@ pub(super) fn compact_frame(store: &mut LineStore, infos: &mut [LineInfo]) {
             if let Some(&(_, _, new_off)) = new_offsets.iter().find(|&&(r, _, _)| r == save.reg) {
                 if new_off != save.offset {
                     let reg_name = reg_id_to_name_q(save.reg);
-                    let new_line = format!("    movq {}, {}(%rbp)", reg_name, new_off);
+                    let orig = infos[save.line_idx].trimmed(store.get(save.line_idx));
+                    let base = if orig.contains("(%rsp)") { "rsp" } else { "rbp" };
+                    let new_line = format!("    movq {}, {}(%{})", reg_name, new_off, base);
                     replace_line(store, &mut infos[save.line_idx], save.line_idx, new_line);
                 }
             }
@@ -291,7 +291,9 @@ pub(super) fn compact_frame(store: &mut LineStore, infos: &mut [LineInfo]) {
                     if let Some(&(_, _, new_off)) = new_offsets.iter().find(|&&(r, old_off, _)| r == reg && old_off == offset) {
                         if new_off != offset {
                             let reg_name = reg_id_to_name_q(reg);
-                            let new_line = format!("    movq {}(%rbp), {}", new_off, reg_name);
+                            let orig = infos[k].trimmed(store.get(k));
+                            let base = if orig.contains("(%rsp)") { "rsp" } else { "rbp" };
+                            let new_line = format!("    movq {}(%{}), {}", new_off, base, reg_name);
                             replace_line(store, &mut infos[k], k, new_line);
                         }
                     }

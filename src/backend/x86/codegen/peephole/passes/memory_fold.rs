@@ -18,8 +18,13 @@
 use super::super::types::*;
 
 /// Format a stack slot as an assembly memory operand string.
-fn format_rbp_offset(offset: i32) -> String {
-    format!("{}(%rbp)", offset)
+/// Uses (%rbp) or (%rsp) depending on the original instruction text.
+fn format_stack_offset(offset: i32, original_line: &str) -> String {
+    if original_line.contains("(%rsp)") {
+        format!("{}(%rsp)", offset)
+    } else {
+        format!("{}(%rbp)", offset)
+    }
 }
 
 /// Try to parse an ALU instruction of the form "OPsuffix %src, %dst"
@@ -106,7 +111,7 @@ pub(super) fn fold_fp_memory_operands(store: &mut LineStore, infos: &mut [LineIn
             if j >= len { i += 1; continue; }
 
             let line_j = infos[j].trimmed(store.get(j));
-            let mem_op = format_rbp_offset(offset);
+            let mem_op = format_stack_offset(offset, line_i);
             let replacement = match line_j {
                 "mulsd %xmm1, %xmm0" => Some(format!("    mulsd {}, %xmm0", mem_op)),
                 "addsd %xmm1, %xmm0" => Some(format!("    addsd {}, %xmm0", mem_op)),
@@ -191,7 +196,8 @@ pub(super) fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]
                             continue;
                         }
 
-                        let mem_op = format_rbp_offset(offset);
+                        let load_line = infos[i].trimmed(store.get(i));
+                        let mem_op = format_stack_offset(offset, load_line);
                         let new_inst = format!("    {} {}, {}", op_suffix, mem_op, dst_str);
 
                         mark_nop(&mut infos[i]);

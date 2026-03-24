@@ -902,13 +902,22 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
             }
         })
     });
-    // Frame pointer omission: eligible when no DynAlloca, not variadic, no inline asm %rbp.
-    // Currently disabled: 3 of 5 benchmarks crash due to remaining unconverted (%rbp) refs
-    // in format strings throughout the codegen and peephole pattern matchers. The AsmOutput
-    // helpers, alu.rs, memory.rs, asm_emitter.rs, f128.rs, calls.rs, and intrinsics.rs have
-    // been converted. Remaining: ~10 format strings in emit.rs (leaq, movsd, etc.) and
-    // peephole text-matching patterns that check for "(%rbp)" in assembly strings.
-    cg.state().omit_frame_pointer = false; // !has_dyn_alloca && !func.is_variadic && !has_inline_asm_rbp;
+    // Frame pointer omission: eligible when no DynAlloca, not variadic, no inline asm %rbp,
+    // and no vector intrinsics (which have special stack slot requirements).
+    let has_vector_intrinsics = func.blocks.iter().any(|block| {
+        block.instructions.iter().any(|inst| {
+            matches!(inst, Instruction::Intrinsic { op, .. }
+                if matches!(op,
+                    crate::ir::intrinsics::IntrinsicOp::FmaF64x4
+                    | crate::ir::intrinsics::IntrinsicOp::FmaF64x2
+                    | crate::ir::intrinsics::IntrinsicOp::VecZeroF64x4
+                    | crate::ir::intrinsics::IntrinsicOp::VecZeroF64x2
+                    | crate::ir::intrinsics::IntrinsicOp::LoadF64x4
+                    | crate::ir::intrinsics::IntrinsicOp::LoadF64x2
+                ))
+        })
+    });
+    cg.state().omit_frame_pointer = !has_dyn_alloca && !func.is_variadic && !has_inline_asm_rbp && !has_vector_intrinsics;
 
     // Calculate stack space and emit prologue
     let raw_space = cg.calculate_stack_space(func);
