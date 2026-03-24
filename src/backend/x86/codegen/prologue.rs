@@ -1,6 +1,6 @@
 //! X86Codegen: prologue, epilogue, parameter storage.
 
-use crate::ir::reexports::{IrFunction, Instruction, Value};
+use crate::ir::reexports::{IrBinOp, IrFunction, Instruction, Terminator, Value};
 use crate::common::types::IrType;
 use crate::backend::call_abi::{ParamClass, classify_params};
 use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
@@ -52,12 +52,24 @@ impl X86Codegen {
         let mut has_indirect_call = false;
         let mut has_i128_ops = false;
         let mut has_atomic_rmw = false;
+        // Track rdx-clobbering patterns for conditional rdx allocation
+        let mut has_div_rem = false;
+        let mut has_gep = false;       // GEP → indirect stores → emit_save_acc uses rdx
+        let mut has_switch = false;    // Switch → jump tables use rdx
+        let mut has_select = false;    // Select → cmov path uses rdx
         for block in &func.blocks {
             for inst in &block.instructions {
                 match inst {
                     Instruction::CallIndirect { .. } => { has_indirect_call = true; }
-                    Instruction::BinOp { ty, .. }
-                    | Instruction::UnaryOp { ty, .. } => {
+                    Instruction::BinOp { op, ty, .. } => {
+                        if matches!(ty, IrType::I128 | IrType::U128) {
+                            has_i128_ops = true;
+                        }
+                        if matches!(op, IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem) {
+                            has_div_rem = true;
+                        }
+                    }
+                    Instruction::UnaryOp { ty, .. } => {
                         if matches!(ty, IrType::I128 | IrType::U128) {
                             has_i128_ops = true;
                         }
@@ -75,8 +87,13 @@ impl X86Codegen {
                         }
                     }
                     Instruction::AtomicRmw { .. } => { has_atomic_rmw = true; }
+                    Instruction::GetElementPtr { .. } => { has_gep = true; }
+                    Instruction::Select { .. } => { has_select = true; }
                     _ => {}
                 }
+            }
+            if matches!(block.terminator, Terminator::Switch { .. }) {
+                has_switch = true;
             }
         }
         if has_indirect_call {
@@ -87,6 +104,13 @@ impl X86Codegen {
         }
         if has_atomic_rmw {
             caller_saved_regs.retain(|r| r.0 != 12); // r8
+        }
+        // rdx (PhysReg 16) is available as caller-saved when no codegen path uses
+        // it as scratch: no div/rem (implicit rdx), no i128 (rax:rdx pair), no GEP
+        // (indirect stores save acc to rdx), no switch (jump tables use rdx), no
+        // select (cmov path zeros rdx).
+        if !has_div_rem && !has_i128_ops && !has_gep && !has_switch && !has_select {
+            caller_saved_regs.push(PhysReg(16)); // rdx
         }
 
         let (reg_assigned, cached_liveness) = crate::backend::generation::run_regalloc_and_merge_clobbers(
