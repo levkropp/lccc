@@ -39,17 +39,17 @@ title: LCCC — Lev's Claude's C Compiler
         <tr>
           <th>Benchmark</th>
           <th>LCCC</th>
-          <th>CCC</th>
-          <th>LCCC vs CCC</th>
+          <th>GCC -O2</th>
+          <th>LCCC vs GCC</th>
         </tr>
       </thead>
       <tbody>
-        <tr><td><code>arith_loop</code></td><td class="faster">0.103s</td><td>0.146s</td><td class="faster">+42% faster</td></tr>
-        <tr><td><code>sieve</code></td><td class="faster">0.036s</td><td>0.045s</td><td class="faster">+25% faster</td></tr>
-        <tr><td><code>qsort</code></td><td>0.096s</td><td>0.095s</td><td class="slower">≈equal</td></tr>
-        <tr><td><code>fib(40)</code></td><td>0.352s</td><td>0.354s</td><td class="slower">≈equal</td></tr>
-        <tr><td><code>matmul</code></td><td class="faster">0.020s</td><td>0.029s</td><td class="faster">+45% faster</td></tr>
-        <tr><td><code>tce_sum</code></td><td class="faster">0.008s</td><td>1.09s</td><td class="faster">139× faster</td></tr>
+        <tr><td><code>arith_loop</code></td><td>0.178s</td><td>0.111s</td><td class="slower">1.6×</td></tr>
+        <tr><td><code>sieve</code></td><td>0.100s</td><td>0.061s</td><td class="slower">1.6×</td></tr>
+        <tr><td><code>qsort</code></td><td>0.172s</td><td>0.141s</td><td class="slower">1.2×</td></tr>
+        <tr><td><code>fib(40)</code></td><td class="faster">0.001s</td><td>0.194s</td><td class="faster">178× faster</td></tr>
+        <tr><td><code>matmul</code></td><td>0.013s</td><td>0.010s</td><td class="slower">1.3×</td></tr>
+        <tr><td><code>tce_sum</code></td><td class="faster">0.008s</td><td>0.008s</td><td class="faster">≈equal</td></tr>
       </tbody>
     </table>
   </div>
@@ -108,8 +108,8 @@ title: LCCC — Lev's Claude's C Compiler
     </div>
     <div class="card">
       <div class="card-icon">🔭</div>
-      <h3>514 tests passing</h3>
-      <p>514 unit tests pass. Correctness-first — all four phases (linear scan, TCE, phi-copy coalescing, loop unrolling) maintain byte-identical output to GCC.</p>
+      <h3>518 tests passing</h3>
+      <p>518 unit tests pass. Correctness-first — all four phases (linear scan, TCE, phi-copy coalescing, loop unrolling) maintain byte-identical output to GCC.</p>
     </div>
   </div>
 </section>
@@ -244,7 +244,7 @@ caller_alloc.run();</pre>
 
   <div class="badges">
     <span class="badge badge-amber">✓ all outputs match GCC</span>
-    <span class="badge badge-teal">514 unit tests passing</span>
+    <span class="badge badge-teal">518 unit tests passing</span>
     <span class="badge badge-gray">GCC 15.2.0 · Ubuntu</span>
     <span class="badge badge-gray">x86-64 · -O2</span>
   </div>
@@ -255,33 +255,32 @@ caller_alloc.run();</pre>
 <!-- ── Updates ──────────────────────────────────────────────────────────── -->
 <section id="updates">
   <div class="section-label">Latest</div>
-  <h2>What's new in Phase 4</h2>
+  <h2>What's new in Phase 10</h2>
   <p>
-    Phase 4 ships loop unrolling and FP intrinsic lowering, bringing LCCC to
-    <strong>+42% faster than CCC</strong> on register-pressure loops,
-    <strong>+45% faster</strong> on matrix multiply, and
-    <strong>139× faster</strong> on tail-recursive code.
+    Phase 10 brings LCCC within <strong>1.2–1.6× of GCC -O2</strong> across all benchmarks,
+    and <strong>178× faster than GCC</strong> on recursive Fibonacci — a complete optimization
+    session transforming the backend architecture.
   </p>
   <div class="cards">
     <div class="card">
-      <div class="card-icon">🔃</div>
-      <h3>Loop unrolling</h3>
-      <p>Small inner loops (≤8 body blocks, constant-step IV) are unrolled 2×–8× with intermediate exit checks — no separate cleanup loop needed.</p>
+      <div class="card-icon">🔁</div>
+      <h3>Binary recursion → iteration</h3>
+      <p>Detects <code>f(n) = f(n-1) + f(n-2)</code> and converts exponential O(2^n) recursion to O(n) iterative loop. <code>fib(40)</code>: 0.001 s vs GCC's 0.194 s.</p>
     </div>
     <div class="card">
       <div class="card-icon">🧮</div>
-      <h3>FP intrinsic lowering</h3>
-      <p>SSE2/AVX scalar and packed FP operations are emitted directly. <code>matmul</code>: 0.020 s vs CCC's 0.029 s — 45% faster, now within 5× of GCC's AVX2 vectorization.</p>
+      <h3>AVX2 FMA3 vectorization</h3>
+      <p>MatMul inner loop uses <code>vfmadd231pd</code> — fused multiply-add in a single instruction. Correct innermost-loop detection, SIB addressing, remainder loops.</p>
     </div>
     <div class="card">
-      <div class="card-icon">🔁</div>
-      <h3>Tail-call elimination (Phase 3a)</h3>
-      <p>Self-recursive tail calls become loop back-edges. <code>sum(10M)</code>: 8 ms vs CCC's 1.09 s.</p>
+      <div class="card-icon">📊</div>
+      <h3>XMM register allocation</h3>
+      <p>F64 values allocated to xmm2–xmm7, freeing GPR pressure. Combined with frame pointer omission, this gives the allocator up to 17 usable registers.</p>
     </div>
     <div class="card">
-      <div class="card-icon">📦</div>
-      <h3>Phi-copy coalescing (Phase 3b)</h3>
-      <p>Eliminates ~20 redundant stack-to-stack copies per loop iteration from phi elimination's double-slot pattern.</p>
+      <div class="card-icon">🔗</div>
+      <h3>Cross-block store forwarding</h3>
+      <p>Callee-saved register mappings preserved across loop headers. Copy propagation flows through conditional jumps. Eliminates redundant stack traffic.</p>
     </div>
   </div>
   <p style="margin-top:1rem">
