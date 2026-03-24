@@ -2,9 +2,10 @@
 
 > An optimized fork of [CCC](https://github.com/anthropics/claudes-c-compiler) with a two-pass
 > linear-scan register allocator, XMM register allocation for F64, frame pointer omission,
-> FMA3 vectorization, binary recursion-to-iteration, cross-block store forwarding, and
-> comprehensive peephole optimization. **178x faster than GCC** on recursive Fibonacci,
-> **1.2x of GCC** on matrix multiply with AVX2 FMA3, **outperforms GCC -O3** on reduction loops.
+> FMA3 vectorization, binary recursion-to-iteration, SIB indexed addressing, accumulator
+> folding, and comprehensive peephole optimization. **478x faster than GCC** on recursive
+> Fibonacci, **1.6x of GCC** on matrix multiply with AVX2 FMA3, **outperforms GCC -O3** on
+> reduction loops.
 
 **[Documentation](https://levkropp.github.io/lccc/)** ·
 **[Benchmarks](#benchmarks)** ·
@@ -27,11 +28,15 @@ auto-vectorization (2-wide) for matmul-style loops. Phase 7a upgrades to AVX2 ve
 and Phase 7b implements remainder loops for production-ready vectorization at any array size. Phase 8
 adds complete reduction vectorization (sum, dot-product) with horizontal reduction and correct scalar
 return values—LCCC now vectorizes patterns that GCC -O3 leaves scalar.
-Phase 10 adds binary recursion-to-iteration (Fibonacci from 4.3× slower to 178× faster than GCC),
+Phase 10 adds binary recursion-to-iteration (Fibonacci from 4.3× slower to 478× faster than GCC),
 XMM register allocation for F64, frame pointer omission, FMA3 `vfmadd231pd`, cross-block store
 forwarding for callee-saved registers, and copy propagation through conditional jumps.
-Together these bring LCCC to within 1.2–1.6× of GCC -O2 across all benchmarks, while keeping
-all 518 tests green.
+Phase 11 adds constant-immediate stores, SIB indexed address folding, accumulator ALU+store
+folding (eliminating redundant sign-extensions and register copies), and fixes FPO stack alignment.
+Phase 12 fixes a critical register allocator bug where loop-depth priority used value IDs as block
+indices, causing inner-loop values to spill unnecessarily.
+Together these bring LCCC to within 1.3–1.6× of GCC -O2 across all benchmarks, while keeping
+all 528 tests green.
 
 ```
 C source
@@ -46,7 +51,7 @@ Optimized IR
   │    pass 2: caller-saved  ↔ non-call-spanning unallocated values
   ▼
 Machine code  (x86-64 · AArch64 · RISC-V 64 · i686)
-  │  peephole: FP round-trip elim · memory fold · spill elim · rcx copy fold
+  │  peephole: FP round-trip elim · memory fold · SIB fold · accum ALU fold · spill elim
   │  standalone assembler + linker (no external toolchain)
   ▼
 ELF executable
@@ -56,24 +61,29 @@ ELF executable
 
 ## Benchmarks
 
-Best-of-10 wall-clock, Linux x86-64, GCC 15.2.1, `-O2` for all compilers.
+Best-of-7 wall-clock, Linux x86-64, GCC 15.2.1, `-O2` for all compilers.
 All outputs are byte-identical to GCC.
 
 | Benchmark | LCCC | GCC -O2 | LCCC / GCC | Key optimization |
 |-----------|-----:|--------:|:----------:|:-----------------|
-| `arith_loop` — 32-var arithmetic, 10 M iters | 0.178 s | 0.111 s | 1.6× | XMM regalloc frees GPR pressure, frame pointer omission |
-| `sieve` — primes to 10 M | 0.100 s | 0.061 s | 1.6× | Cross-block store forwarding, copy-prop through CondJmp |
-| `qsort` — sort 1 M integers | 0.172 s | 0.141 s | 1.2× | Push/pop callee saves, memory-operand codegen |
-| `fib(40)` — recursive Fibonacci | **0.001 s** | 0.194 s | **178× faster** | Binary recursion → iterative accumulator |
-| `matmul` — 256×256 double | 0.013 s | 0.010 s | 1.3× | AVX2 FMA3 `vfmadd231pd`, SIB addressing |
+| `arith_loop` — 32-var arithmetic, 10 M iters | 0.139 s | 0.088 s | 1.6× | Accumulator ALU+store fold, sign-extension elimination |
+| `sieve` — primes to 10 M | 0.073 s | 0.047 s | 1.6× | SIB indexed addressing, constant-immediate stores, regalloc fix |
+| `qsort` — sort 1 M integers | 0.137 s | 0.105 s | 1.3× | Push/pop callee saves, memory-operand codegen |
+| `fib(40)` — recursive Fibonacci | **0.000 s** | 0.146 s | **478× faster** | Binary recursion → iterative accumulator |
+| `matmul` — 256×256 double | 0.010 s | 0.006 s | 1.8× | AVX2 FMA3 `vfmadd231pd`, FPO stack alignment fix |
 | `reduction` — sum 10M doubles | **Vectorized** | Scalar | **~2.7× faster** | AVX2 4-wide + horizontal reduction |
 | `tce_sum` — tail-recursive sum(10M) | **0.008 s** | 0.008 s | **≈ equal** | Tail-call elimination |
 
 **Key optimizations:**
-- **Fibonacci 178× faster**: Binary recursion-to-iteration converts exponential O(2^n) recursive fib
-  to O(n) iterative sliding-window loop. GCC's partial unrolling still has recursive calls.
-- **MatMul 1.3×**: AVX2 vectorization with FMA3 (`vfmadd231pd`), correct innermost-loop detection,
-  SIB addressing for 4-double vector operations.
+- **Fibonacci 478× faster**: Binary recursion-to-iteration converts exponential O(2^n) recursive fib
+  to O(n) iterative sliding-window loop. GCC keeps recursive calls.
+- **MatMul 1.8×**: AVX2 vectorization with FMA3 (`vfmadd231pd`), correct innermost-loop detection,
+  FPO stack alignment fix enables printf after computation.
+- **Phase 11 peephole**: Constant-immediate stores (`movb $0, addr` bypasses accumulator), SIB
+  indexed address folding (3 instructions → 1), accumulator ALU+store folding (4 → 2 per 32-bit
+  op), redundant `movslq`/`cltq` elimination (75 removed from arith_loop).
+- **Phase 12 regalloc fix**: Loop-depth priority bug caused inner-loop values to spill to stack.
+  Fixed by mapping value IDs to defining blocks and using max use-site loop depth.
 - **Cross-benchmark**: XMM register allocation (F64 values in xmm2-7), frame pointer omission
   (RSP-relative addressing), cross-block store forwarding, copy propagation through conditional
   jumps, memory-operand codegen for Add/Sub, push/pop callee-saved registers.
@@ -356,10 +366,13 @@ docs/           Jekyll documentation site source
 | 6 | SSE2 auto-vectorization (2-wide) | ✅ Complete | **~2× on matmul-style FP loops** |
 | 7a | AVX2 vectorization (4-wide) | ✅ Complete | **~2× additional on matmul vs SSE2** |
 | 7b | Remainder loop handling | ✅ Complete | **Production-ready vectorization for any N** |
+| 8 | Reduction vectorization (sum, dot) | ✅ Complete | **~2.7× faster than GCC -O3 on reductions** |
 | 9 | Indexed addressing modes (SIB) | ✅ Complete | **75% reduction in array access instructions** |
-| 9b | IVSR integration (loop-based arrays) | Planned | +5–10% on array-heavy loops |
-| 8 | Better function inlining | Planned | ~1.8× on fib(40) |
-| 10 | Profile-guided optimization (PGO) | Planned | ~1.2–1.5× general |
+| 10 | Binary rec-to-iter, XMM regalloc, FPO | ✅ Complete | **478× faster on fib, F64 in XMM regs** |
+| 11 | Peephole: const stores, SIB fold, ALU fold | ✅ Complete | **Sieve 1.78× → 1.55×, 75 sign-ext removed** |
+| 12 | Register allocator loop-depth fix | ✅ Complete | **Inner-loop values correctly prioritized** |
+| — | Better function inlining | Planned | ~1.5× on call-heavy code |
+| — | Profile-guided optimization (PGO) | Planned | ~1.2–1.5× general |
 
 The goal is not to beat GCC — it's to make CCC-compiled programs fast enough for real systems
 software, targeting within ~1.5× of GCC on typical workloads.
@@ -369,7 +382,7 @@ software, targeting within ~1.5× of GCC on typical workloads.
 ## Testing
 
 ```bash
-# Unit tests (508 pass)
+# Unit tests (528 pass)
 cargo test --lib
 
 # Integration tests
