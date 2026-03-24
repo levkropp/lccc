@@ -24,10 +24,16 @@ use crate::backend::regalloc::PhysReg;
 
 /// x86-64 callee-saved registers available for register allocation.
 /// System V AMD64 ABI callee-saved: rbx, r12, r13, r14, r15.
-/// rbp is the frame pointer and cannot be allocated.
+/// rbp is the frame pointer and cannot be allocated (unless FPO mode).
 /// PhysReg encoding: 1=rbx, 2=r12, 3=r13, 4=r14, 5=r15.
 pub(super) const X86_CALLEE_SAVED: [PhysReg; 5] = [
     PhysReg(1), PhysReg(2), PhysReg(3), PhysReg(4), PhysReg(5),
+];
+
+/// Extended callee-saved list including rbp (used when frame pointer is omitted).
+/// PhysReg(6) = rbp.
+pub(super) const X86_CALLEE_SAVED_WITH_RBP: [PhysReg; 6] = [
+    PhysReg(1), PhysReg(2), PhysReg(3), PhysReg(4), PhysReg(5), PhysReg(6),
 ];
 
 /// x86-64 caller-saved registers available for allocation to values that
@@ -73,8 +79,9 @@ fn reg_name_to_32(name: &str) -> &'static str {
 pub(super) fn phys_reg_name(reg: PhysReg) -> &'static str {
     match reg.0 {
         1 => "rbx", 2 => "r12", 3 => "r13", 4 => "r14", 5 => "r15",
+        6 => "rbp",
         10 => "r11", 11 => "r10", 12 => "r8", 13 => "r9",
-        14 => "rdi", 15 => "rsi",
+        14 => "rdi", 15 => "rsi", 16 => "rdx",
         // XMM registers for F64 allocation
         20 => "xmm2", 21 => "xmm3", 22 => "xmm4", 23 => "xmm5", 24 => "xmm6", 25 => "xmm7",
         _ => unreachable!("invalid x86 register index {}", reg.0),
@@ -91,8 +98,9 @@ pub(super) fn is_xmm_reg(reg: PhysReg) -> bool {
 pub(super) fn phys_reg_name_32(reg: PhysReg) -> &'static str {
     match reg.0 {
         1 => "ebx", 2 => "r12d", 3 => "r13d", 4 => "r14d", 5 => "r15d",
+        6 => "ebp",
         10 => "r11d", 11 => "r10d", 12 => "r8d", 13 => "r9d",
-        14 => "edi", 15 => "esi",
+        14 => "edi", 15 => "esi", 16 => "edx",
         _ => unreachable!("invalid x86 register index {}", reg.0),
     }
 }

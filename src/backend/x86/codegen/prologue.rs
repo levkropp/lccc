@@ -5,8 +5,8 @@ use crate::common::types::IrType;
 use crate::backend::call_abi::{ParamClass, classify_params};
 use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
 use crate::backend::regalloc::PhysReg;
-use super::emit::{X86Codegen, X86_CALLEE_SAVED, X86_CALLER_SAVED, phys_reg_name,
-                     collect_inline_asm_callee_saved_x86, X86_ARG_REGS};
+use super::emit::{X86Codegen, X86_CALLEE_SAVED, X86_CALLEE_SAVED_WITH_RBP, X86_CALLER_SAVED,
+                     phys_reg_name, collect_inline_asm_callee_saved_x86, X86_ARG_REGS};
 
 impl X86Codegen {
     pub(super) fn calculate_stack_space_impl(&mut self, func: &IrFunction) -> i64 {
@@ -41,7 +41,12 @@ impl X86Codegen {
         // skip allocating stack slots for values assigned to registers.
         let mut asm_clobbered_regs: Vec<PhysReg> = Vec::new();
         collect_inline_asm_callee_saved_x86(func, &mut asm_clobbered_regs);
-        let available_regs = crate::backend::generation::filter_available_regs(&X86_CALLEE_SAVED, &asm_clobbered_regs);
+        let callee_base: &[PhysReg] = if self.state.omit_frame_pointer {
+            &X86_CALLEE_SAVED_WITH_RBP
+        } else {
+            &X86_CALLEE_SAVED
+        };
+        let available_regs = crate::backend::generation::filter_available_regs(callee_base, &asm_clobbered_regs);
 
         let mut caller_saved_regs = X86_CALLER_SAVED.to_vec();
         let mut has_indirect_call = false;
