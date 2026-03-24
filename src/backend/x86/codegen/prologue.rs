@@ -124,7 +124,18 @@ impl X86Codegen {
     }
 
     pub(super) fn aligned_frame_size_impl(&self, raw_space: i64) -> i64 {
-        if raw_space > 0 { (raw_space + 15) & !15 } else { 0 }
+        if raw_space <= 0 { return 0; }
+        let aligned = (raw_space + 15) & !15;
+        if self.state.omit_frame_pointer {
+            // With frame pointer omission, there's no `push %rbp` to absorb the
+            // 8-byte return address misalignment. The frame size must be ≡ 8 (mod 16)
+            // so that RSP is 16-byte aligned at subsequent CALL instructions.
+            // At function entry: RSP ≡ 8 (mod 16) due to the caller's CALL.
+            // subq $(8 mod 16), %rsp → RSP ≡ 8 - 8 = 0 (mod 16) ✓
+            if aligned % 16 == 0 { aligned + 8 } else { aligned }
+        } else {
+            aligned
+        }
     }
 
     pub(super) fn emit_prologue_impl(&mut self, func: &IrFunction, frame_size: i64) {

@@ -466,31 +466,54 @@ pub(super) fn eliminate_dead_sign_extensions(
         }
 
         // Pattern 2: cltq where ALL subsequent uses of %rax before its next write
-        // are stores to stack (which will be re-sign-extended on load).
-        // Only safe if no other instruction reads %rax as 64-bit before it's overwritten.
+        // are stores to stack (which will be re-sign-extended on load),
+        // OR the next non-store consumer is a 32-bit operation that only uses %eax.
         if t == "cltq" {
             let mut j = i + 1;
-            let mut all_stores = true;
-            let mut found_any = false;
-            while j < len && j < i + 6 {
+            let mut can_eliminate = false;
+            let mut found_store = false;
+            while j < len && j < i + 8 {
                 if infos[j].is_nop() { j += 1; continue; }
                 if infos[j].is_barrier() { break; }
                 match infos[j].kind {
                     LineKind::StoreRbp { reg: 0, .. } => {
-                        found_any = true;
+                        found_store = true;
                         j += 1;
                         continue;
                     }
-                    _ => {
-                        // If this instruction reads rax (family 0), the cltq may be needed
-                        if infos[j].reg_refs & 1 != 0 {
-                            all_stores = false;
+                    LineKind::Other { dest_reg: 0 } => {
+                        // Something writes to %rax — check if it's a 32-bit op
+                        // that only uses %eax (the cltq upper bits don't matter)
+                        let tj = infos[j].trimmed(store.get(j));
+                        if is_32bit_eax_consumer(tj) {
+                            can_eliminate = true;
                         }
                         break;
                     }
+                    _ => {
+                        // Non-store, non-%rax-write — check if it reads rax
+                        if infos[j].reg_refs & 1 != 0 {
+                            break; // reads rax, can't eliminate
+                        }
+                        j += 1;
+                        continue;
+                    }
                 }
             }
-            if found_any && all_stores {
+            if can_eliminate || (found_store && {
+                // Original pattern: only stores found, no 64-bit consumers
+                let mut safe = true;
+                let mut k = j;
+                while k < len && k < i + 8 {
+                    if infos[k].is_nop() { k += 1; continue; }
+                    if infos[k].is_barrier() { break; }
+                    if infos[k].reg_refs & 1 != 0 {
+                        safe = false;
+                    }
+                    break;
+                }
+                safe
+            }) {
                 mark_nop(&mut infos[i]);
                 changed = true;
                 i += 1;
@@ -498,9 +521,160 @@ pub(super) fn eliminate_dead_sign_extensions(
             }
         }
 
+        // Pattern 3: movslq %REGd, %REG (self sign-extension) where the register
+        // is overwritten before being read in 64-bit context. Also handles the
+        // common accumulator pattern:
+        //   movslq %REGd, %REG       → NOP (or kept if REG has other 64-bit readers)
+        //   movq %REG, %rax          → movl %REGd, %eax (32-bit copy)
+        //   addl/imull/.., %eax      → unchanged (only uses 32 bits)
+        if t.starts_with("movslq %") {
+            let parts: Vec<&str> = t.split(", ").collect();
+            if parts.len() == 2 {
+                let src = parts[0].trim_start_matches("movslq ");
+                let dst = parts[1];
+                // Use register family comparison to detect self sign-extension.
+                // This handles both classic regs (%ebx→%rbx) and extended (%r8d→%r8).
+                let src_family = super::super::types::register_family_fast(src);
+                let dst_family = super::super::types::register_family_fast(dst);
+                if src_family == dst_family && src_family != super::super::types::REG_NONE {
+                    let reg_family = dst_family;
+                    if reg_family != 0 { // rax is handled by cltq pattern
+                        let reg_bit = 1u16 << reg_family;
+
+                        // Sub-pattern 3a: next non-NOP is `movq %REG, %rax` followed
+                        // by a 32-bit consumer of %eax. Replace both movslq+movq with
+                        // a single `movl %REGd, %eax`.
+                        let mut j = i + 1;
+                        while j < len && infos[j].is_nop() { j += 1; }
+                        if j < len && !infos[j].is_barrier() {
+                            let reg64 = dst; // e.g., "%rbx"
+                            let expected_movq = format!("movq {}, %rax", reg64);
+                            let tj = infos[j].trimmed(store.get(j));
+                            if tj == expected_movq {
+                                // Found movq %REG, %rax. Check the next instruction
+                                // is a 32-bit consumer of %eax.
+                                let mut k = j + 1;
+                                while k < len && infos[k].is_nop() { k += 1; }
+                                let next_is_32bit = if k < len && !infos[k].is_barrier() {
+                                    match infos[k].kind {
+                                        LineKind::StoreRbp { reg: 0, .. } => true,
+                                        LineKind::Other { dest_reg: 0 } => {
+                                            let tk = infos[k].trimmed(store.get(k));
+                                            is_32bit_eax_consumer(tk)
+                                        }
+                                        _ => false,
+                                    }
+                                } else { false };
+
+                                if next_is_32bit {
+                                    // Verify %REG is overwritten before next 64-bit read
+                                    let mut m = j + 1;
+                                    let mut reg_safe = true;
+                                    while m < len && m < j + 12 {
+                                        if infos[m].is_nop() { m += 1; continue; }
+                                        if infos[m].is_barrier() { break; }
+                                        if infos[m].reg_refs & reg_bit == 0 { m += 1; continue; }
+                                        // Found reference to %REG
+                                        match infos[m].kind {
+                                            LineKind::LoadRbp { reg, .. } if reg == reg_family => {
+                                                break; // overwritten → safe
+                                            }
+                                            LineKind::Other { dest_reg } if dest_reg == reg_family => {
+                                                break; // overwritten → safe
+                                            }
+                                            _ => {
+                                                reg_safe = false;
+                                                break;
+                                            }
+                                        }
+                                    }
+
+                                    if reg_safe {
+                                        // Replace: NOP the movslq, replace movq with movl
+                                        mark_nop(&mut infos[i]);
+                                        let new_movl = format!("    movl {}, %eax", src);
+                                        replace_line(store, &mut infos[j], j, new_movl);
+                                        changed = true;
+                                        i += 1;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Sub-pattern 3b: %REG is overwritten before any 64-bit read.
+                        // Also safe if %REG is only read in 32-bit form (%REGd).
+                        let reg32_suffix = src; // e.g. "%ebx"
+                        let reg64_name = dst;   // e.g. "%rbx"
+                        let mut j2 = i + 1;
+                        let mut can_eliminate = false;
+                        while j2 < len && j2 < i + 12 {
+                            if infos[j2].is_nop() { j2 += 1; continue; }
+                            if infos[j2].is_barrier() { break; }
+                            if infos[j2].reg_refs & reg_bit == 0 { j2 += 1; continue; }
+                            // This instruction references our register family.
+                            match infos[j2].kind {
+                                LineKind::LoadRbp { reg, .. } if reg == reg_family => {
+                                    // Overwritten by load from stack → safe
+                                    can_eliminate = true;
+                                    break;
+                                }
+                                LineKind::Other { dest_reg } if dest_reg == reg_family => {
+                                    // Written to by another instruction → safe
+                                    can_eliminate = true;
+                                    break;
+                                }
+                                _ => {
+                                    // Check if it only reads the 32-bit form.
+                                    // If the line contains %REGd but NOT %REG (64-bit),
+                                    // the sign-extension upper bits don't matter.
+                                    let line_text = infos[j2].trimmed(store.get(j2));
+                                    if line_text.contains(reg32_suffix)
+                                        && !line_text.contains(reg64_name)
+                                    {
+                                        // 32-bit-only read → safe, continue scanning
+                                        j2 += 1;
+                                        continue;
+                                    }
+                                    // 64-bit read → NOT safe
+                                    break;
+                                }
+                            }
+                        }
+                        if can_eliminate {
+                            mark_nop(&mut infos[i]);
+                            changed = true;
+                            i += 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
         i += 1;
     }
     changed
+}
+
+/// Check if an instruction is a 32-bit operation that consumes %eax,
+/// meaning it only uses the lower 32 bits and then zero-extends the result.
+/// Examples: addl, subl, imull, andl, orl, xorl, movl, etc.
+fn is_32bit_eax_consumer(trimmed: &str) -> bool {
+    // 32-bit ALU ops on %eax — these read %eax (lower 32 bits only)
+    // and write back to %eax (zero-extending to 64 bits).
+    if trimmed.ends_with(", %eax") || trimmed.ends_with("l %eax") {
+        let op = if let Some(pos) = trimmed.find(' ') {
+            &trimmed[..pos]
+        } else {
+            trimmed
+        };
+        return matches!(op,
+            "addl" | "subl" | "imull" | "andl" | "orl" | "xorl"
+            | "shll" | "shrl" | "sarl" | "movl" | "leal"
+        );
+    }
+    false
 }
 
 // ── FP XMM↔GPR round-trip elimination ────────────────────────────────────────

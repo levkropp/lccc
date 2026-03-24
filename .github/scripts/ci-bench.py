@@ -136,7 +136,10 @@ def print_terminal(results: list[dict], file=None):
 
         if "best" in gcc and "best" in lccc:
             ratio = lccc["best"] / gcc["best"]
-            ratio_s = f"{ratio:.2f}x"
+            if ratio < 1.0:
+                ratio_s = f"{1/ratio:.0f}x fast"
+            else:
+                ratio_s = f"{ratio:.2f}x"
         else:
             ratio_s = "—"
 
@@ -168,7 +171,11 @@ def github_summary(results: list[dict], reps: int) -> str:
 
         if "best" in gcc and "best" in lccc:
             ratio = lccc["best"] / gcc["best"]
-            ratio_s = f"{ratio:.2f}x"
+            if ratio < 1.0:
+                # LCCC is faster — show as "Nx faster"
+                ratio_s = f"**{1/ratio:.0f}x faster**"
+            else:
+                ratio_s = f"{ratio:.2f}x"
         else:
             ratio_s = "—"
 
@@ -230,6 +237,34 @@ def main():
     mismatches = [r["name"] for r in results if r.get("correct") is False]
     if mismatches:
         print(f"\nERROR: Correctness mismatch in: {', '.join(mismatches)}", file=sys.stderr)
+        sys.exit(1)
+
+    # Performance regression checks: verify key claims
+    # Fibonacci: rec2iter should make LCCC dramatically faster than GCC
+    # We claim 178x; conservatively require at least 10x to account for CI variance
+    PERF_THRESHOLDS = {
+        "Fibonacci": ("faster", 10.0),  # LCCC must be >= 10x faster than GCC
+    }
+    perf_failures = []
+    for r in results:
+        name = r.get("name", "")
+        if name not in PERF_THRESHOLDS:
+            continue
+        direction, threshold = PERF_THRESHOLDS[name]
+        gcc = r.get("gcc", {})
+        lccc = r.get("lccc", {})
+        if "best" not in gcc or "best" not in lccc:
+            continue
+        ratio = gcc["best"] / lccc["best"]  # >1 means LCCC is faster
+        if direction == "faster" and ratio < threshold:
+            perf_failures.append(
+                f"{name}: expected LCCC >= {threshold:.0f}x faster than GCC, "
+                f"got {ratio:.1f}x (LCCC={lccc['best']:.4f}s, GCC={gcc['best']:.4f}s)"
+            )
+    if perf_failures:
+        print(f"\nERROR: Performance regression detected:", file=sys.stderr)
+        for f in perf_failures:
+            print(f"  - {f}", file=sys.stderr)
         sys.exit(1)
 
 
