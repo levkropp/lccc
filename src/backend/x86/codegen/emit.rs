@@ -405,8 +405,14 @@ impl X86Codegen {
             Operand::Value(v) => {
                 if let Some(&reg) = self.reg_assignments.get(&v.0) {
                     if reg.0 != target.0 {
-                        let src_name = phys_reg_name(reg);
-                        self.state.out.emit_instr_reg_reg("    movq", src_name, target_name);
+                        if is_xmm_reg(reg) {
+                            // XMM → GPR
+                            let xmm_name = phys_reg_name(reg);
+                            self.state.emit_fmt(format_args!("    movq %{}, %{}", xmm_name, target_name));
+                        } else {
+                            let src_name = phys_reg_name(reg);
+                            self.state.out.emit_instr_reg_reg("    movq", src_name, target_name);
+                        }
                     }
                     // If same register, nothing to do
                 } else if let Some(slot) = self.state.get_slot(v.0) {
@@ -498,10 +504,16 @@ impl X86Codegen {
                 if self.state.reg_cache.acc_has(v.0, is_alloca) {
                     return;
                 }
-                // Check register allocation: load from callee-saved register
+                // Check register allocation: load from assigned register
                 if let Some(&reg) = self.reg_assignments.get(&v.0) {
-                    let reg_name = phys_reg_name(reg);
-                    self.state.out.emit_instr_reg_reg("    movq", reg_name, "rax");
+                    if is_xmm_reg(reg) {
+                        // XMM register: movq %xmmN, %rax (move 64-bit value from XMM to GPR)
+                        let reg_name = phys_reg_name(reg);
+                        self.state.emit_fmt(format_args!("    movq %{}, %rax", reg_name));
+                    } else {
+                        let reg_name = phys_reg_name(reg);
+                        self.state.out.emit_instr_reg_reg("    movq", reg_name, "rax");
+                    }
                     self.state.reg_cache.set_acc(v.0, false);
                 } else if self.state.get_slot(v.0).is_some() {
                     self.value_to_reg(v, "rax");
@@ -521,9 +533,15 @@ impl X86Codegen {
     /// assignment are stored to their stack slot as before.
     pub(super) fn store_rax_to(&mut self, dest: &Value) {
         if let Some(&reg) = self.reg_assignments.get(&dest.0) {
-            // Value has a callee-saved register: store only to register, skip stack.
-            let reg_name = phys_reg_name(reg);
-            self.state.out.emit_instr_reg_reg("    movq", "rax", reg_name);
+            if is_xmm_reg(reg) {
+                // XMM register: movq %rax, %xmmN
+                let reg_name = phys_reg_name(reg);
+                self.state.emit_fmt(format_args!("    movq %rax, %{}", reg_name));
+            } else {
+                // GPR register: movq %rax, %reg
+                let reg_name = phys_reg_name(reg);
+                self.state.out.emit_instr_reg_reg("    movq", "rax", reg_name);
+            }
         } else if let Some(slot) = self.state.get_slot(dest.0) {
             // No register: store to stack slot.
             self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
@@ -857,9 +875,15 @@ impl X86Codegen {
     pub(super) fn value_to_reg(&mut self, val: &Value, reg: &str) {
         // Check register allocation first (allocas are never register-allocated)
         if let Some(&phys_reg) = self.reg_assignments.get(&val.0) {
-            let reg_name = phys_reg_name(phys_reg);
-            if reg_name != reg {
-                self.state.out.emit_instr_reg_reg("    movq", reg_name, reg);
+            if is_xmm_reg(phys_reg) {
+                // XMM → GPR: movq %xmmN, %reg
+                let xmm_name = phys_reg_name(phys_reg);
+                self.state.emit_fmt(format_args!("    movq %{}, %{}", xmm_name, reg));
+            } else {
+                let reg_name = phys_reg_name(phys_reg);
+                if reg_name != reg {
+                    self.state.out.emit_instr_reg_reg("    movq", reg_name, reg);
+                }
             }
             return;
         }

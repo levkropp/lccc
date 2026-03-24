@@ -318,6 +318,53 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
 
+    // Phase 3: XMM register allocation for F64 values that don't span calls.
+    // These values were excluded from GPR allocation but can use XMM registers.
+    if !config.xmm_regs.is_empty() {
+        // Collect F64 values: values in non_gpr_values that are F64 typed,
+        // haven't been assigned a GPR, and don't span calls.
+        let f64_intervals: Vec<LiveInterval> = liveness
+            .intervals
+            .iter()
+            .filter(|iv| non_gpr_values.contains(&iv.value_id))
+            .filter(|iv| iv.end > iv.start)
+            .filter(|iv| !assignments.contains_key(&iv.value_id))
+            .filter(|iv| !spans_any_call(iv, call_points))
+            // Only include values that are actually F64 (not i128, not f32, etc.)
+            .filter(|iv| {
+                // Check if this value is produced by a F64-typed instruction
+                func.blocks.iter().any(|block| {
+                    block.instructions.iter().any(|inst| {
+                        match inst {
+                            Instruction::BinOp { dest, ty, .. }
+                            | Instruction::UnaryOp { dest, ty, .. } if *ty == IrType::F64 => dest.0 == iv.value_id,
+                            Instruction::Load { dest, ty, .. } if *ty == IrType::F64 => dest.0 == iv.value_id,
+                            Instruction::Cast { dest, to_ty, .. } if *to_ty == IrType::F64 => dest.0 == iv.value_id,
+                            _ => false,
+                        }
+                    })
+                })
+            })
+            .copied()
+            .collect();
+
+        if !f64_intervals.is_empty() {
+            let f64_ranges = live_range::build_live_ranges(
+                &f64_intervals,
+                &liveness.block_loop_depth,
+                func,
+            );
+            let mut xmm_allocator =
+                LinearScanAllocator::new(f64_ranges, config.xmm_regs.clone());
+            xmm_allocator.run();
+
+            for (vid, reg) in xmm_allocator.assignments {
+                assignments.insert(vid, reg);
+                // XMM regs (20+) are caller-saved, no prologue save needed
+            }
+        }
+    }
+
     let mut used_regs: Vec<PhysReg> = used_regs_set.iter().map(|&r| PhysReg(r)).collect();
     used_regs.sort_by_key(|r| r.0);
 

@@ -29,7 +29,15 @@ pub fn run_regalloc_and_merge_clobbers(
     used_callee_saved: &mut Vec<PhysReg>,
     allow_inline_asm_regalloc: bool,
 ) -> (FxHashMap<u32, PhysReg>, Option<super::super::liveness::LivenessResult>) {
-    let config = super::super::regalloc::RegAllocConfig { available_regs, caller_saved_regs, allow_inline_asm_regalloc, xmm_regs: Vec::new() };
+    // Detect x86-64 target by checking for x86 callee-saved PhysReg IDs (1-5).
+    // On x86-64, provide XMM registers for F64 allocation.
+    let xmm_regs = if available_regs.iter().any(|r| r.0 == 1) {
+        // x86-64: xmm2-xmm7 available for F64 values
+        vec![PhysReg(20), PhysReg(21), PhysReg(22), PhysReg(23), PhysReg(24), PhysReg(25)]
+    } else {
+        Vec::new()
+    };
+    let config = super::super::regalloc::RegAllocConfig { available_regs, caller_saved_regs, allow_inline_asm_regalloc, xmm_regs };
     let alloc_result = super::super::regalloc::allocate_registers(func, &config);
     *reg_assignments = alloc_result.assignments;
     *used_callee_saved = alloc_result.used_regs;
