@@ -2443,3 +2443,268 @@ pub(super) fn collapse_increment_chain(
     }
     changed
 }
+
+// ── Cascaded shift folding ───────────────────────────────────────────────────
+//
+// Folds a cascaded shift pattern where a value is shifted, copied, then shifted again:
+//
+//   movq %SRC, %TMP            →  movq %SRC, %DST
+//   shlq $A, %TMP              →  shlq $(A+B), %DST
+//   movq %TMP, %DST
+//   shlq $B, %DST
+//
+// Also matches when %TMP == %rax (accumulator pattern):
+//   shlq $A, %rax
+//   movq %rax, %DST
+//   shlq $B, %DST
+//
+// Saves 2 instructions per occurrence. Common in array address computation
+// where stride = element_size * vector_width (e.g., 8 * 4 = 32 for AVX2 doubles).
+
+pub(super) fn fold_cascaded_shifts(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+
+    while i < len {
+        if infos[i].is_nop() { i += 1; continue; }
+
+        let ti = infos[i].trimmed(store.get(i));
+
+        // Pattern 1: movq %SRC, %TMP; shlq $A, %TMP; movq %TMP, %DST; shlq $B, %DST
+        if ti.starts_with("movq %") && ti.contains(", %") && !ti.contains("(%") {
+            let comma = match ti.find(", %") { Some(c) => c, None => { i += 1; continue; } };
+            let src_name = &ti[5..comma];
+            let tmp_name = &ti[comma + 2..];
+            if src_name == tmp_name || !src_name.starts_with('%') { i += 1; continue; }
+            let src_fam = register_family_fast(src_name);
+            let tmp_fam = register_family_fast(tmp_name);
+            if src_fam == REG_NONE || tmp_fam == REG_NONE { i += 1; continue; }
+
+            // Next: shlq $A, %TMP
+            let j = next_non_nop(infos, i + 1, len);
+            if j >= len || infos[j].is_barrier() { i += 1; continue; }
+            let tj = infos[j].trimmed(store.get(j));
+            let shl_suffix = format!(", {}", tmp_name);
+            if !tj.starts_with("shlq $") || !tj.ends_with(&shl_suffix) { i += 1; continue; }
+            let shift_a: u32 = match tj[6..tj.len() - shl_suffix.len()].parse() {
+                Ok(s) => s, Err(_) => { i += 1; continue; }
+            };
+
+            // Next: movq %TMP, %DST
+            let k = next_non_nop(infos, j + 1, len);
+            if k >= len || infos[k].is_barrier() { i += 1; continue; }
+            let tk = infos[k].trimmed(store.get(k));
+            let mov_prefix = format!("movq {}, %", tmp_name);
+            if !tk.starts_with(&mov_prefix) { i += 1; continue; }
+            let dst_name = &tk[mov_prefix.len() - 1..]; // includes %
+            let dst_fam = register_family_fast(dst_name);
+            if dst_fam == REG_NONE || dst_fam == tmp_fam { i += 1; continue; }
+
+            // Next: shlq $B, %DST
+            let m = next_non_nop(infos, k + 1, len);
+            if m >= len || infos[m].is_barrier() { i += 1; continue; }
+            let tm = infos[m].trimmed(store.get(m));
+            let shl_dst = format!(", {}", dst_name);
+            if !tm.starts_with("shlq $") || !tm.ends_with(&shl_dst) { i += 1; continue; }
+            let shift_b: u32 = match tm[6..tm.len() - shl_dst.len()].parse() {
+                Ok(s) => s, Err(_) => { i += 1; continue; }
+            };
+
+            let total_shift = shift_a + shift_b;
+            if total_shift > 63 { i += 1; continue; }
+
+            // Check TMP is dead after this sequence
+            let tmp_bit = 1u16 << tmp_fam;
+            let mut tmp_dead = false;
+            let mut n = m + 1;
+            let mut chk = 0;
+            while n < len && chk < 8 {
+                if infos[n].is_nop() { n += 1; continue; }
+                if infos[n].is_barrier() { tmp_dead = true; break; }
+                if infos[n].reg_refs & tmp_bit != 0 {
+                    match infos[n].kind {
+                        LineKind::Other { dest_reg } if dest_reg == tmp_fam => { tmp_dead = true; break; }
+                        LineKind::LoadRbp { reg, .. } if reg == tmp_fam => { tmp_dead = true; break; }
+                        _ => break, // TMP read → not dead
+                    }
+                }
+                chk += 1;
+                n += 1;
+            }
+            if chk >= 8 { tmp_dead = true; }
+            if !tmp_dead { i += 1; continue; }
+
+            // Apply: movq %SRC, %DST + shlq $total, %DST
+            let new_mov = format!("    movq {}, {}", src_name, dst_name);
+            let new_shl = format!("    shlq ${}, {}", total_shift, dst_name);
+            replace_line(store, &mut infos[i], i, new_mov);
+            mark_nop(&mut infos[j]);
+            replace_line(store, &mut infos[k], k, new_shl);
+            mark_nop(&mut infos[m]);
+
+            changed = true;
+            i = m + 1;
+            continue;
+        }
+
+        i += 1;
+    }
+    changed
+}
+
+// ── Loop rotation ────────────────────────────────────────────────────────────
+//
+// Moves the loop condition from the header to the latch, eliminating one
+// unconditional branch per iteration:
+//
+//   .header:                    →  .header:            (preheader)
+//       <setup>                 →      <setup>
+//       <compare>               →      <compare>
+//       jCC .exit               →      jCC .exit
+//   .body:                      →  .body:              (rotated loop)
+//       <body>                  →      <body>
+//       jmp .header             →      <setup_copy>
+//                               →      <compare_copy>
+//                               →      j!CC .body
+//
+// Only applied when the header setup is 0-3 instructions (simple cases).
+// The jmp is replaced with a multi-line string (setup + cmp + inverted branch).
+
+pub(super) fn rotate_loops(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    let mut changed = false;
+
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() { i += 1; continue; }
+        if infos[i].kind != LineKind::Jmp { i += 1; continue; }
+        let jmp_text = infos[i].trimmed(store.get(i));
+        if !jmp_text.starts_with("jmp ") { i += 1; continue; }
+        let target = &jmp_text[4..];
+        let target_label = format!("{}:", target);
+
+        // Find the target label (must be before the jmp = back-edge)
+        let mut header_pos = None;
+        for lbl in 0..i {
+            if infos[lbl].kind == LineKind::Label {
+                if infos[lbl].trimmed(store.get(lbl)) == target_label {
+                    header_pos = Some(lbl);
+                    break;
+                }
+            }
+        }
+        let header = match header_pos {
+            Some(h) => h,
+            None => { i += 1; continue; }
+        };
+
+        // Validate: no ret/call in the loop body
+        let mut has_ret = false;
+        let mut has_call = false;
+        for chk in header..=i {
+            if infos[chk].is_nop() { continue; }
+            match infos[chk].kind {
+                LineKind::Ret => { has_ret = true; break; }
+                LineKind::Call => { has_call = true; }
+                _ => {}
+            }
+        }
+        if has_ret || has_call { i += 1; continue; }
+
+        // Collect non-NOP instructions between header label and the first conditional jump.
+        let mut header_instrs: Vec<usize> = Vec::new();
+        let mut cond_jmp_pos = None;
+        let mut body_label_pos = None;
+        let mut pos = header + 1;
+        while pos < i {
+            if infos[pos].is_nop() { pos += 1; continue; }
+            if infos[pos].kind == LineKind::CondJmp {
+                cond_jmp_pos = Some(pos);
+                // Find body label right after conditional jump
+                let mut bl = pos + 1;
+                while bl < i {
+                    if infos[bl].is_nop() { bl += 1; continue; }
+                    if infos[bl].kind == LineKind::Label {
+                        body_label_pos = Some(bl);
+                    }
+                    break;
+                }
+                break;
+            }
+            if infos[pos].kind == LineKind::Label { break; } // complex header
+            if infos[pos].is_barrier() { break; }
+            header_instrs.push(pos);
+            pos += 1;
+        }
+
+        let cjmp = match cond_jmp_pos {
+            Some(c) => c,
+            None => { i += 1; continue; }
+        };
+
+        // Only handle simple headers (0-3 setup instructions before the cond jmp)
+        if header_instrs.len() > 3 { i += 1; continue; }
+
+        // The instruction(s) before the cond jmp must include a compare/test.
+        // Find the compare in the header setup.
+        let has_cmp = header_instrs.iter().any(|&idx| {
+            let t = infos[idx].trimmed(store.get(idx));
+            t.starts_with("cmpl ") || t.starts_with("cmpq ") ||
+            t.starts_with("cmpb ") || t.starts_with("cmpw ") ||
+            t.starts_with("testl ") || t.starts_with("testq ") ||
+            matches!(infos[idx].kind, LineKind::Cmp)
+        });
+        if !has_cmp { i += 1; continue; }
+
+        // Get the conditional jump and invert it
+        let cjmp_text = infos[cjmp].trimmed(store.get(cjmp));
+        let (cond, _exit_label) = match cjmp_text.find(' ') {
+            Some(space) => (&cjmp_text[..space], &cjmp_text[space + 1..]),
+            None => { i += 1; continue; }
+        };
+
+        let inv_cond = match cond {
+            "je" => "jne", "jne" => "je",
+            "jl" => "jge", "jge" => "jl",
+            "jle" => "jg", "jg" => "jle",
+            "jb" => "jae", "jae" => "jb",
+            "jbe" => "ja", "ja" => "jbe",
+            "js" => "jns", "jns" => "js",
+            _ => { i += 1; continue; }
+        };
+
+        // Find the body label for the rotated backedge
+        let body_label = match body_label_pos {
+            Some(bl) => {
+                let bt = infos[bl].trimmed(store.get(bl));
+                bt.trim_end_matches(':').to_string()
+            }
+            None => { i += 1; continue; }
+        };
+
+        // Build the replacement: duplicate setup + compare + inverted branch to body
+        let mut replacement_lines = Vec::new();
+        for &setup_idx in &header_instrs {
+            let text = store.get(setup_idx).to_string();
+            replacement_lines.push(text.trim_end().to_string());
+        }
+        replacement_lines.push(format!("    {} {}", inv_cond, body_label));
+
+        let replacement = replacement_lines.join("\n");
+
+        // Replace the jmp with the duplicated latch
+        store.replace(i, replacement);
+        infos[i] = classify_line(store.get(i));
+
+        changed = true;
+        i += 1;
+    }
+    changed
+}

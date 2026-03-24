@@ -84,6 +84,7 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= local_patterns::coalesce_phi_register_copies(&mut store, &mut infos);
         changed |= local_patterns::fuse_signext_and_move(&mut store, &mut infos);
         changed |= local_patterns::collapse_increment_chain(&mut store, &mut infos);
+        changed |= local_patterns::fold_cascaded_shifts(&mut store, &mut infos);
         changed |= local_patterns::hoist_loop_invariant_gpr_load(&mut store, &mut infos);
         if local_changed || pass_count == 0 {
             changed |= push_pop::eliminate_push_pop_pairs(&store, &mut infos);
@@ -152,6 +153,12 @@ pub fn peephole_optimize(asm: String) -> String {
             pass_count3 += 1;
         }
     }
+
+    // Phase 4c: Loop rotation — move condition from header to latch.
+    // Must run after trampolines (which simplify loop structure) and before
+    // tail call optimization. Uses multi-line replacement, so no further
+    // line-level passes should depend on infos accuracy after this.
+    local_patterns::rotate_loops(&mut store, &mut infos);
 
     // Phase 5: Tail call optimization: convert `call X; epilogue; ret` to
     // `epilogue; jmp X`. This must run before callee-save elimination because
