@@ -96,8 +96,10 @@ impl X86Codegen {
                     match &args[si] {
                         Operand::Value(v) => {
                             if let Some(slot) = self.state.get_slot(v.0) {
-                                self.state.emit_fmt(format_args!("    pushq {}(%rbp)", slot.0 + 8));
-                                self.state.emit_fmt(format_args!("    pushq {}(%rbp)", slot.0));
+                                let sr1 = self.slot_ref(slot.0 + 8);
+                                let sr0 = self.slot_ref(slot.0);
+                                self.state.emit_fmt(format_args!("    pushq {}", sr1));
+                                self.state.emit_fmt(format_args!("    pushq {}", sr0));
                             } else {
                                 self.state.emit("    pushq $0");
                                 self.state.emit("    pushq $0");

@@ -555,8 +555,13 @@ impl X86Codegen {
         out.write_str(" %");
         out.write_str(reg);
         out.write_str(", ");
-        out.write_i64(slot.0);
-        out.write_str("(%rbp)");
+        if out.use_rsp_addressing {
+            out.write_i64(out.rsp_frame_size + slot.0);
+            out.write_str("(%rsp)");
+        } else {
+            out.write_i64(slot.0);
+            out.write_str("(%rbp)");
+        }
         out.newline();
     }
 
@@ -566,8 +571,13 @@ impl X86Codegen {
         out.write_str("    ");
         out.write_str(instr);
         out.write_str(" ");
-        out.write_i64(slot.0);
-        out.write_str("(%rbp), ");
+        if out.use_rsp_addressing {
+            out.write_i64(out.rsp_frame_size + slot.0);
+            out.write_str("(%rsp), ");
+        } else {
+            out.write_i64(slot.0);
+            out.write_str("(%rbp), ");
+        }
         out.write_str(dest_reg);
         out.newline();
     }

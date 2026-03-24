@@ -902,11 +902,13 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
             }
         })
     });
-    // Frame pointer omission detection. Currently disabled pending full RSP-relative
-    // addressing conversion (253 hardcoded (%rbp) references in the codegen).
-    // The infrastructure is ready — set to true to activate when all refs are converted.
+    // Frame pointer omission: eligible when no DynAlloca, not variadic, no inline asm %rbp.
+    // Currently disabled: 3 of 5 benchmarks crash due to remaining unconverted (%rbp) refs
+    // in format strings throughout the codegen and peephole pattern matchers. The AsmOutput
+    // helpers, alu.rs, memory.rs, asm_emitter.rs, f128.rs, calls.rs, and intrinsics.rs have
+    // been converted. Remaining: ~10 format strings in emit.rs (leaq, movsd, etc.) and
+    // peephole text-matching patterns that check for "(%rbp)" in assembly strings.
     cg.state().omit_frame_pointer = false; // !has_dyn_alloca && !func.is_variadic && !has_inline_asm_rbp;
-    let _ = has_inline_asm_rbp;
 
     // Calculate stack space and emit prologue
     let raw_space = cg.calculate_stack_space(func);

@@ -100,11 +100,12 @@ impl X86Codegen {
                     if let Some(slot) = self.state.get_slot(rhs_val.0) {
                         self.operand_to_rax(lhs);
                         let mnem = if op == IrBinOp::Add { "add" } else { "sub" };
+                        let sref = self.slot_ref(slot.0);
                         if use_32bit {
-                            self.state.emit_fmt(format_args!("    {}l {}(%rbp), %eax", mnem, slot.0));
+                            self.state.emit_fmt(format_args!("    {}l {}, %eax", mnem, sref));
                             if !is_unsigned { self.state.emit("    cltq"); }
                         } else {
-                            self.state.emit_fmt(format_args!("    {}q {}(%rbp), %rax", mnem, slot.0));
+                            self.state.emit_fmt(format_args!("    {}q {}, %rax", mnem, sref));
                         }
                         self.store_rax_to(dest);
                         return;
@@ -117,11 +118,12 @@ impl X86Codegen {
                     if self.dest_reg(&lhs_val).is_none() {
                         if let Some(slot) = self.state.get_slot(lhs_val.0) {
                             self.operand_to_rax(rhs);
+                            let sref = self.slot_ref(slot.0);
                             if use_32bit {
-                                self.state.emit_fmt(format_args!("    addl {}(%rbp), %eax", slot.0));
+                                self.state.emit_fmt(format_args!("    addl {}, %eax", sref));
                                 if !is_unsigned { self.state.emit("    cltq"); }
                             } else {
-                                self.state.emit_fmt(format_args!("    addq {}(%rbp), %rax", slot.0));
+                                self.state.emit_fmt(format_args!("    addq {}, %rax", sref));
                             }
                             self.store_rax_to(dest);
                             return;

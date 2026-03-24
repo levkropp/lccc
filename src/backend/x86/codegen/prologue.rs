@@ -425,7 +425,8 @@ impl X86Codegen {
             if let Some((slot, alloca_ty)) = self.state.param_alloca_slots[param_idx] {
                 let load_instr = Self::mov_load_for_type(alloca_ty);
                 let reg = Self::load_dest_reg(alloca_ty);
-                self.state.emit_fmt(format_args!("    {} {}(%rbp), {}", load_instr, slot.0, reg));
+                let sr = self.slot_ref(slot.0);
+                self.state.emit_fmt(format_args!("    {} {}, {}", load_instr, sr, reg));
                 self.store_rax_to(dest);
                 return;
             }
@@ -456,7 +457,8 @@ impl X86Codegen {
                 let src = stack_base + offset;
                 let load_instr = Self::mov_load_for_type(ty);
                 let reg = Self::load_dest_reg(ty);
-                self.state.emit_fmt(format_args!("    {} {}(%rbp), {}", load_instr, src, reg));
+                let sr = self.slot_ref(src);
+                self.state.emit_fmt(format_args!("    {} {}, {}", load_instr, sr, reg));
                 self.store_rax_to(dest);
             }
             _ => {}

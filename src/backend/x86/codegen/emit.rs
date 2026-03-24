@@ -301,6 +301,17 @@ impl X86Codegen {
         self.state.emit_cfi = opts.emit_cfi;
     }
 
+    /// Format a stack slot reference as "offset(%rbp)" or "offset(%rsp)" depending
+    /// on whether the frame pointer is omitted. Used by format! strings throughout
+    /// the codegen that need to reference stack slots directly.
+    pub(super) fn slot_ref(&self, rbp_offset: i64) -> String {
+        if self.state.out.use_rsp_addressing {
+            format!("{}(%rsp)", self.state.out.rsp_frame_size + rbp_offset)
+        } else {
+            format!("{}(%rbp)", rbp_offset)
+        }
+    }
+
     // --- x86 helper methods ---
 
     /// Get the callee-saved register assigned to an operand, if any.

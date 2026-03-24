@@ -128,7 +128,7 @@ impl InlineAsmEmitter for X86Codegen {
                             op.mem_addr = String::new();
                         } else {
                             // Normal alloca: stack slot IS the memory location
-                            op.mem_addr = format!("{}(%rbp)", slot.0);
+                            op.mem_addr = self.slot_ref(slot.0);
                         }
                     } else {
                         // Non-alloca: slot holds a pointer that needs indirection.
@@ -283,7 +283,7 @@ impl InlineAsmEmitter for X86Codegen {
                             IrType::F128 => "fldt",
                             _ => "fldl", // F64 and default
                         };
-                        self.state.emit_fmt(format_args!("    {} {}(%rbp)", fld_instr, slot.0));
+                        { let sr = self.slot_ref(slot.0); self.state.emit_fmt(format_args!("    {} {}", fld_instr, sr)); }
                     }
                 }
                 Operand::Const(c) => {
@@ -332,14 +332,14 @@ impl InlineAsmEmitter for X86Codegen {
                                 IrType::F64 => "movsd",
                                 _ => "movdqu",
                             };
-                            self.state.emit_fmt(format_args!("    {} {}(%rbp), %{}", load_instr, slot.0, reg));
+                            { let sr = self.slot_ref(slot.0); self.state.emit_fmt(format_args!("    {} {}, %{}", load_instr, sr, reg)); }
                         } else {
                             let load_instr = match ty {
                                 IrType::F32 => "movss",
                                 IrType::F64 => "movsd",
                                 _ => "movdqu",
                             };
-                            self.state.emit_fmt(format_args!("    {} {}(%rbp), %{}", load_instr, slot.0, reg));
+                            { let sr = self.slot_ref(slot.0); self.state.emit_fmt(format_args!("    {} {}, %{}", load_instr, sr, reg)); }
                         }
                     }
                 }
@@ -415,7 +415,7 @@ impl InlineAsmEmitter for X86Codegen {
                         } else {
                             format!("%{}", reg)
                         };
-                        self.state.emit_fmt(format_args!("    {} {}(%rbp), {}", load_instr, slot.0, dest_reg_str));
+                        { let sr = self.slot_ref(slot.0); self.state.emit_fmt(format_args!("    {} {}, {}", load_instr, sr, dest_reg_str)); }
                     }
                 }
             }
@@ -433,7 +433,7 @@ impl InlineAsmEmitter for X86Codegen {
                     _ => "fldl",
                 };
                 if self.state.is_alloca(ptr.0) {
-                    self.state.emit_fmt(format_args!("    {} {}(%rbp)", fld_instr, slot.0));
+                    { let sr = self.slot_ref(slot.0); self.state.emit_fmt(format_args!("    {} {}", fld_instr, sr)); }
                 } else {
                     let scratch = "rcx";
                     self.state.out.emit_instr_reg("    pushq", scratch);
@@ -458,14 +458,14 @@ impl InlineAsmEmitter for X86Codegen {
                         IrType::F64 => "movsd",
                         _ => "movdqu",
                     };
-                    self.state.emit_fmt(format_args!("    {} {}(%rbp), %{}", load_instr, slot.0, reg));
+                    { let sr = self.slot_ref(slot.0); self.state.emit_fmt(format_args!("    {} {}, %{}", load_instr, sr, reg)); }
                 } else {
                     let load_instr = Self::mov_load_for_type(ty);
                     let dest_reg = match ty {
                         IrType::U32 | IrType::F32 => format!("%{}", Self::reg_to_32(reg)),
                         _ => format!("%{}", reg),
                     };
-                    self.state.emit_fmt(format_args!("    {} {}(%rbp), {}", load_instr, slot.0, dest_reg));
+                    { let sr = self.slot_ref(slot.0); self.state.emit_fmt(format_args!("    {} {}, {}", load_instr, sr, dest_reg)); }
                 }
             } else {
                 // Non-alloca: stack slot holds a pointer — do indirect load
@@ -539,7 +539,7 @@ impl InlineAsmEmitter for X86Codegen {
                     _ => "fstpl", // F64 and default
                 };
                 if self.state.is_direct_slot(ptr.0) {
-                    self.state.emit_fmt(format_args!("    {} {}(%rbp)", fstp_instr, slot.0));
+                    { let sr = self.slot_ref(slot.0); self.state.emit_fmt(format_args!("    {} {}", fstp_instr, sr)); }
                 } else {
                     // Non-alloca: slot holds a pointer, store through it
                     let scratch = "rcx";
@@ -571,11 +571,11 @@ impl InlineAsmEmitter for X86Codegen {
                         IrType::I32 | IrType::U32 | IrType::F32 => format!("%{}", Self::reg_to_32(reg)),
                         _ => format!("%{}", reg),
                     };
-                    self.state.emit_fmt(format_args!("    {} {}, {}(%rbp)", store_instr, src_reg, slot.0));
+                    { let sr = self.slot_ref(slot.0); self.state.emit_fmt(format_args!("    {} {}, {}", store_instr, src_reg, sr)); }
                 } else if self.state.is_direct_slot(ptr.0) {
                     // Promoted asm output: movzbl already zero-extended, use
                     // full 8-byte store to match value_to_reg's movq load.
-                    self.state.emit_fmt(format_args!("    movq %{}, {}(%rbp)", reg, slot.0));
+                    { let sr = self.slot_ref(slot.0); self.state.emit_fmt(format_args!("    movq %{}, {}", reg, sr)); }
                 } else {
                     let scratch = if reg != "rcx" { "rcx" } else { "rdx" };
                     self.state.out.emit_instr_reg("    pushq", scratch);
@@ -609,7 +609,7 @@ impl InlineAsmEmitter for X86Codegen {
                         IrType::F64 => "movsd",
                         _ => "movdqu",
                     };
-                    self.state.emit_fmt(format_args!("    {} %{}, {}(%rbp)", store_instr, reg, slot.0));
+                    { let sr = self.slot_ref(slot.0); self.state.emit_fmt(format_args!("    {} %{}, {}", store_instr, reg, sr)); }
                 } else {
                     let store_instr = match ty {
                         IrType::F32 => "movss",
@@ -633,7 +633,7 @@ impl InlineAsmEmitter for X86Codegen {
                         IrType::I32 | IrType::U32 | IrType::F32 => format!("%{}", Self::reg_to_32(reg)),
                         _ => format!("%{}", reg),
                     };
-                    self.state.emit_fmt(format_args!("    {} {}, {}(%rbp)", store_instr, src_reg, slot.0));
+                    { let sr = self.slot_ref(slot.0); self.state.emit_fmt(format_args!("    {} {}, {}", store_instr, src_reg, sr)); }
                 } else {
                     // Promoted asm output value: the slot holds the value itself
                     // and value_to_reg loads it with movq (8 bytes), so we must
@@ -653,7 +653,7 @@ impl InlineAsmEmitter for X86Codegen {
                     }
                     // Use the 64-bit register name for the movq store
                     let reg64 = Self::reg_to_64(reg);
-                    self.state.emit_fmt(format_args!("    movq %{}, {}(%rbp)", reg64, slot.0));
+                    { let sr = self.slot_ref(slot.0); self.state.emit_fmt(format_args!("    movq %{}, {}", reg64, sr)); }
                 }
             } else {
                 // Non-alloca: slot holds a pointer, store through it.

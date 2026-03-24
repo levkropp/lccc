@@ -38,7 +38,7 @@ impl X86Codegen {
     /// Emit `fldt` from a resolved address (loading x87 80-bit to ST0).
     pub(super) fn emit_f128_fldt(&mut self, addr: &crate::backend::state::SlotAddr, ptr_id: u32, offset: i64) {
         match self.emit_f128_resolve_addr(addr, ptr_id, offset) {
-            Some(rbp_off) => self.state.emit_fmt(format_args!("    fldt {}(%rbp)", rbp_off)),
+            Some(rbp_off) => { let sr = self.slot_ref(rbp_off); self.state.emit_fmt(format_args!("    fldt {}", sr)); }
             None => self.state.emit("    fldt (%rcx)"),
         }
     }
@@ -46,7 +46,7 @@ impl X86Codegen {
     /// Emit `fstpt` to a resolved address (storing x87 ST0 as 80-bit).
     pub(super) fn emit_f128_fstpt(&mut self, addr: &crate::backend::state::SlotAddr, ptr_id: u32, offset: i64) {
         match self.emit_f128_resolve_addr(addr, ptr_id, offset) {
-            Some(rbp_off) => self.state.emit_fmt(format_args!("    fstpt {}(%rbp)", rbp_off)),
+            Some(rbp_off) => { let sr = self.slot_ref(rbp_off); self.state.emit_fmt(format_args!("    fstpt {}", sr)); }
             None => self.state.emit("    fstpt (%rcx)"),
         }
     }
