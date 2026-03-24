@@ -124,42 +124,68 @@ impl X86Codegen {
         if self.state.cf_protection_branch {
             self.state.emit("    endbr64");
         }
-        self.state.emit("    pushq %rbp");
-        if self.state.emit_cfi {
-            self.state.emit("    .cfi_def_cfa_offset 16");
-            self.state.emit("    .cfi_offset %rbp, -16");
-        }
-        self.state.emit("    movq %rsp, %rbp");
-        if self.state.emit_cfi {
-            self.state.emit("    .cfi_def_cfa_register %rbp");
-        }
 
-        // Save callee-saved registers with pushq (1 uop each, compact encoding).
-        // Pushes go right after movq %rsp, %rbp, occupying -8(%rbp), -16(%rbp), etc.
+        let omit_fp = self.state.omit_frame_pointer;
         let used_regs = self.used_callee_saved.clone();
-        for &reg in &used_regs {
-            let reg_name = phys_reg_name(reg);
-            self.state.emit_fmt(format_args!("    pushq %{}", reg_name));
-        }
 
-        // Allocate remaining stack space for local variables (frame_size includes
-        // callee-save space, but pushes already allocated that portion).
-        let local_size = frame_size - (used_regs.len() as i64 * 8);
-        if local_size > 0 {
-            const PAGE_SIZE: i64 = 4096;
-            if local_size > PAGE_SIZE {
-                let probe_label = self.state.fresh_label("stack_probe");
-                self.state.out.emit_instr_imm_reg("    movq", local_size, "r11");
-                self.state.out.emit_named_label(&probe_label);
-                self.state.out.emit_instr_imm_reg("    subq", PAGE_SIZE, "rsp");
-                self.state.emit("    orl $0, (%rsp)");
-                self.state.out.emit_instr_imm_reg("    subq", PAGE_SIZE, "r11");
-                self.state.out.emit_instr_imm_reg("    cmpq", PAGE_SIZE, "r11");
-                self.state.out.emit_jcc_label("    ja", &probe_label);
-                self.state.emit("    subq %r11, %rsp");
-                self.state.emit("    orl $0, (%rsp)");
-            } else {
-                self.state.out.emit_instr_imm_reg("    subq", local_size, "rsp");
+        if omit_fp {
+            // Frame-pointer-less prologue: allocate entire frame with subq,
+            // then save callee-saved registers into the frame using movq.
+            // Stack layout (RSP-relative):
+            //   [return addr]  ← old RSP
+            //   [callee saves] ← top of frame
+            //   [local vars]   ← RSP points here after subq
+            if frame_size > 0 {
+                self.state.out.emit_instr_imm_reg("    subq", frame_size, "rsp");
+                if self.state.emit_cfi {
+                    self.state.emit_fmt(format_args!("    .cfi_def_cfa_offset {}", frame_size + 8));
+                }
+            }
+            // Save callee-saved registers at the top of the frame (highest offsets)
+            for (i, &reg) in used_regs.iter().enumerate() {
+                let reg_name = phys_reg_name(reg);
+                let offset = frame_size - (i as i64 + 1) * 8;
+                self.state.emit_fmt(format_args!("    movq %{}, {}(%rsp)", reg_name, offset));
+            }
+            // Set AsmOutput to use RSP-relative addressing
+            self.state.out.use_rsp_addressing = true;
+            self.state.out.rsp_frame_size = frame_size;
+        } else {
+            // Traditional frame-pointer prologue
+            self.state.emit("    pushq %rbp");
+            if self.state.emit_cfi {
+                self.state.emit("    .cfi_def_cfa_offset 16");
+                self.state.emit("    .cfi_offset %rbp, -16");
+            }
+            self.state.emit("    movq %rsp, %rbp");
+            if self.state.emit_cfi {
+                self.state.emit("    .cfi_def_cfa_register %rbp");
+            }
+
+            // Save callee-saved registers with pushq
+            for &reg in &used_regs {
+                let reg_name = phys_reg_name(reg);
+                self.state.emit_fmt(format_args!("    pushq %{}", reg_name));
+            }
+
+            // Allocate remaining stack space for local variables
+            let local_size = frame_size - (used_regs.len() as i64 * 8);
+            if local_size > 0 {
+                const PAGE_SIZE: i64 = 4096;
+                if local_size > PAGE_SIZE {
+                    let probe_label = self.state.fresh_label("stack_probe");
+                    self.state.out.emit_instr_imm_reg("    movq", local_size, "r11");
+                    self.state.out.emit_named_label(&probe_label);
+                    self.state.out.emit_instr_imm_reg("    subq", PAGE_SIZE, "rsp");
+                    self.state.emit("    orl $0, (%rsp)");
+                    self.state.out.emit_instr_imm_reg("    subq", PAGE_SIZE, "r11");
+                    self.state.out.emit_instr_imm_reg("    cmpq", PAGE_SIZE, "r11");
+                    self.state.out.emit_jcc_label("    ja", &probe_label);
+                    self.state.emit("    subq %r11, %rsp");
+                    self.state.emit("    orl $0, (%rsp)");
+                } else {
+                    self.state.out.emit_instr_imm_reg("    subq", local_size, "rsp");
+                }
             }
         }
 
@@ -182,24 +208,31 @@ impl X86Codegen {
     pub(super) fn emit_epilogue_impl(&mut self, frame_size: i64) {
         let used_regs = self.used_callee_saved.clone();
         let num_saved = used_regs.len() as i64;
+        let omit_fp = self.state.omit_frame_pointer;
 
-        // Restore RSP to point at the pushed callee-saved registers.
-        // Stack layout: [%rbp] [push1 @ -8(%rbp)] [push2 @ -16(%rbp)] ... [locals]
-        // RSP currently points past locals. Set it to just before the last push.
-        if num_saved > 0 {
-            self.state.emit_fmt(format_args!("    leaq {}(%rbp), %rsp", -(num_saved * 8)));
+        if omit_fp {
+            // Frame-pointer-less epilogue: restore callee-saved regs from stack, then addq
+            for (i, &reg) in used_regs.iter().enumerate() {
+                let reg_name = phys_reg_name(reg);
+                let offset = frame_size - (i as i64 + 1) * 8;
+                self.state.emit_fmt(format_args!("    movq {}(%rsp), %{}", offset, reg_name));
+            }
+            if frame_size > 0 {
+                self.state.out.emit_instr_imm_reg("    addq", frame_size, "rsp");
+            }
         } else {
-            self.state.emit("    movq %rbp, %rsp");
+            // Traditional epilogue: restore from pushes, then popq %rbp
+            if num_saved > 0 {
+                self.state.emit_fmt(format_args!("    leaq {}(%rbp), %rsp", -(num_saved * 8)));
+            } else {
+                self.state.emit("    movq %rbp, %rsp");
+            }
+            for &reg in used_regs.iter().rev() {
+                let reg_name = phys_reg_name(reg);
+                self.state.emit_fmt(format_args!("    popq %{}", reg_name));
+            }
+            self.state.emit("    popq %rbp");
         }
-
-        // Pop callee-saved registers in reverse order
-        for &reg in used_regs.iter().rev() {
-            let reg_name = phys_reg_name(reg);
-            self.state.emit_fmt(format_args!("    popq %{}", reg_name));
-        }
-
-        // Restore frame pointer (popq %rbp was pushed first, so it's popped last)
-        self.state.emit("    popq %rbp");
         let _ = frame_size;
     }
 

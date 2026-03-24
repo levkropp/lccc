@@ -747,6 +747,13 @@ fn link_builtin_native(
 /// of going through `Display`/`write_fmt` machinery.
 pub struct AsmOutput {
     pub buf: String,
+    /// When true, stack slot references use RSP-relative addressing instead of RBP.
+    /// Set when the frame pointer is omitted (-fomit-frame-pointer).
+    pub use_rsp_addressing: bool,
+    /// Total frame size (needed to convert rbp-relative offsets to rsp-relative).
+    /// RBP-relative: offset(%rbp) where offset is negative
+    /// RSP-relative: (frame_size + offset)(%rsp) since RSP = RBP - frame_size
+    pub rsp_frame_size: i64,
 }
 
 /// Write an i64 directly into a String buffer using manual digit extraction.
@@ -799,7 +806,11 @@ fn write_u64_fast(buf: &mut String, val: u64) {
 impl AsmOutput {
     pub fn new() -> Self {
         // Pre-allocate 256KB to avoid repeated reallocations during codegen.
-        Self { buf: String::with_capacity(256 * 1024) }
+        Self {
+            buf: String::with_capacity(256 * 1024),
+            use_rsp_addressing: false,
+            rsp_frame_size: 0,
+        }
     }
 
     /// Emit a line of assembly.
@@ -852,13 +863,18 @@ impl AsmOutput {
     pub fn emit_instr_rbp_reg(&mut self, mnemonic: &str, offset: i64, reg: &str) {
         self.buf.push_str(mnemonic);
         self.buf.push(' ');
-        write_i64_fast(&mut self.buf, offset);
-        self.buf.push_str("(%rbp), %");
+        if self.use_rsp_addressing {
+            write_i64_fast(&mut self.buf, self.rsp_frame_size + offset);
+            self.buf.push_str("(%rsp), %");
+        } else {
+            write_i64_fast(&mut self.buf, offset);
+            self.buf.push_str("(%rbp), %");
+        }
         self.buf.push_str(reg);
         self.buf.push('\n');
     }
 
-    /// Emit: `    {mnemonic} %{reg}, {offset}(%rbp)`
+    /// Emit: `    {mnemonic} %{reg}, {offset}(%rbp)` (or rsp-relative when frame pointer omitted)
     /// Used for stores to stack slots.
     #[inline]
     pub fn emit_instr_reg_rbp(&mut self, mnemonic: &str, reg: &str, offset: i64) {
@@ -866,8 +882,13 @@ impl AsmOutput {
         self.buf.push_str(" %");
         self.buf.push_str(reg);
         self.buf.push_str(", ");
-        write_i64_fast(&mut self.buf, offset);
-        self.buf.push_str("(%rbp)");
+        if self.use_rsp_addressing {
+            write_i64_fast(&mut self.buf, self.rsp_frame_size + offset);
+            self.buf.push_str("(%rsp)");
+        } else {
+            write_i64_fast(&mut self.buf, offset);
+            self.buf.push_str("(%rbp)");
+        }
         self.buf.push('\n');
     }
 

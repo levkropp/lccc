@@ -902,7 +902,11 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
             }
         })
     });
-    cg.state().omit_frame_pointer = !has_dyn_alloca && !func.is_variadic && !has_inline_asm_rbp;
+    // Frame pointer omission detection. Currently disabled pending full RSP-relative
+    // addressing conversion (253 hardcoded (%rbp) references in the codegen).
+    // The infrastructure is ready — set to true to activate when all refs are converted.
+    cg.state().omit_frame_pointer = false; // !has_dyn_alloca && !func.is_variadic && !has_inline_asm_rbp;
+    let _ = has_inline_asm_rbp;
 
     // Calculate stack space and emit prologue
     let raw_space = cg.calculate_stack_space(func);
