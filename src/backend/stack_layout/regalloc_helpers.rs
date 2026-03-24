@@ -29,7 +29,7 @@ pub fn run_regalloc_and_merge_clobbers(
     used_callee_saved: &mut Vec<PhysReg>,
     allow_inline_asm_regalloc: bool,
 ) -> (FxHashMap<u32, PhysReg>, Option<super::super::liveness::LivenessResult>) {
-    let config = super::super::regalloc::RegAllocConfig { available_regs, caller_saved_regs, allow_inline_asm_regalloc };
+    let config = super::super::regalloc::RegAllocConfig { available_regs, caller_saved_regs, allow_inline_asm_regalloc, xmm_regs: Vec::new() };
     let alloc_result = super::super::regalloc::allocate_registers(func, &config);
     *reg_assignments = alloc_result.assignments;
     *used_callee_saved = alloc_result.used_regs;

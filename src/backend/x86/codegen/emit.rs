@@ -48,6 +48,14 @@ pub(super) const X86_CALLER_SAVED: [PhysReg; 6] = [
     PhysReg(14), PhysReg(15),
 ];
 
+/// x86-64 XMM registers available for F64 allocation.
+/// Caller-saved (SysV ABI), only for values that don't span calls.
+/// xmm0/xmm1 are reserved for the accumulator pattern and FP return values.
+pub(super) const X86_XMM_REGS: [PhysReg; 6] = [
+    PhysReg(20), PhysReg(21), PhysReg(22), PhysReg(23),
+    PhysReg(24), PhysReg(25),
+];
+
 /// Convert a 64-bit register name string to its 32-bit sub-register name.
 /// Used for `xorl %eXX, %eXX` zeroing idiom (shorter encoding, breaks dependencies).
 fn reg_name_to_32(name: &str) -> &'static str {
@@ -67,8 +75,15 @@ pub(super) fn phys_reg_name(reg: PhysReg) -> &'static str {
         1 => "rbx", 2 => "r12", 3 => "r13", 4 => "r14", 5 => "r15",
         10 => "r11", 11 => "r10", 12 => "r8", 13 => "r9",
         14 => "rdi", 15 => "rsi",
+        // XMM registers for F64 allocation
+        20 => "xmm2", 21 => "xmm3", 22 => "xmm4", 23 => "xmm5", 24 => "xmm6", 25 => "xmm7",
         _ => unreachable!("invalid x86 register index {}", reg.0),
     }
+}
+
+/// Check if a PhysReg is an XMM register (used for F64 values).
+pub(super) fn is_xmm_reg(reg: PhysReg) -> bool {
+    reg.0 >= 20 && reg.0 <= 25
 }
 
 /// Map a PhysReg index to its x86-64 32-bit sub-register name.
