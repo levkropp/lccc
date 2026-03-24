@@ -111,6 +111,13 @@ pub struct CodegenState {
     /// When true, the epilogue must restore SP from the frame pointer instead of
     /// adding back the compile-time frame size.
     pub has_dyn_alloca: bool,
+    /// Whether to omit the frame pointer for this function.
+    /// When true, %rbp is not used for stack frame addressing and can be
+    /// used as a general-purpose register. Stack slots use %rsp-relative addressing.
+    pub omit_frame_pointer: bool,
+    /// Total frame size (for RSP-relative addressing when omit_frame_pointer is true).
+    /// Set after calculate_stack_space completes.
+    pub frame_size: i64,
     /// Register value cache: tracks which IR values are in the accumulator and
     /// secondary registers to skip redundant loads.
     pub reg_cache: RegCache,
@@ -234,6 +241,8 @@ impl CodegenState {
             local_symbols: FxHashSet::default(),
             tls_symbols: FxHashSet::default(),
             has_dyn_alloca: false,
+            omit_frame_pointer: false,
+            frame_size: 0,
             reg_cache: RegCache::default(),
             function_return_thunk: false,
             indirect_branch_thunk: false,
@@ -319,6 +328,8 @@ impl CodegenState {
         self.i128_values.clear();
         self.wide_values.clear();
         self.has_dyn_alloca = false;
+        self.omit_frame_pointer = false;
+        self.frame_size = 0;
         self.reg_cache.invalidate_all();
         self.f128_direct_slots.clear();
         self.f128_load_sources.clear();
