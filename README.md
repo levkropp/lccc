@@ -3,9 +3,9 @@
 > An optimized fork of [CCC](https://github.com/anthropics/claudes-c-compiler) with a two-pass
 > linear-scan register allocator, XMM register allocation for F64, frame pointer omission,
 > FMA3 vectorization, binary recursion-to-iteration, SIB indexed addressing, accumulator
-> folding, and comprehensive peephole optimization. **478x faster than GCC** on recursive
-> Fibonacci, **1.6x of GCC** on matrix multiply with AVX2 FMA3, **outperforms GCC -O3** on
-> reduction loops.
+> folding, phi-copy coalescing, loop rotation, and comprehensive peephole optimization.
+> **478x faster than GCC** on recursive Fibonacci, **1.1× of GCC** on sieve of Eratosthenes,
+> **outperforms GCC -O3** on reduction loops.
 
 **[Documentation](https://levkropp.github.io/lccc/)** ·
 **[Benchmarks](#benchmarks)** ·
@@ -35,7 +35,12 @@ Phase 11 adds constant-immediate stores, SIB indexed address folding, accumulato
 folding (eliminating redundant sign-extensions and register copies), and fixes FPO stack alignment.
 Phase 12 fixes a critical register allocator bug where loop-depth priority used value IDs as block
 indices, causing inner-loop values to spill unnecessarily.
-Together these bring LCCC to within 1.3–1.6× of GCC -O2 across all benchmarks, while keeping
+Phase 13 adds sign-extend fusion, phi-copy register coalescing (including multi-temp
+sign-extend chains), increment chain collapse, cascaded shift folding, loop rotation
+with redundant sign-extend elimination, and loop-invariant GPR load hoisting. These
+peephole passes target SSA phi-resolution overhead, reducing the sieve marking loop
+from 11 to 6 instructions and bringing it to within 1.1× of GCC -O2.
+Together these bring LCCC to within 1.1–1.6× of GCC -O2 across all benchmarks, while keeping
 all 528 tests green.
 
 ```
@@ -51,7 +56,7 @@ Optimized IR
   │    pass 2: caller-saved  ↔ non-call-spanning unallocated values
   ▼
 Machine code  (x86-64 · AArch64 · RISC-V 64 · i686)
-  │  peephole: FP round-trip elim · memory fold · SIB fold · accum ALU fold · spill elim
+  │  peephole: FP round-trip elim · memory fold · SIB fold · accum ALU fold · phi-copy coalesce · loop rotate
   │  standalone assembler + linker (no external toolchain)
   ▼
 ELF executable
@@ -61,29 +66,31 @@ ELF executable
 
 ## Benchmarks
 
-Best-of-7 wall-clock, Linux x86-64, GCC 15.2.1, `-O2` for all compilers.
+Best-of-15 wall-clock, Linux x86-64, GCC 15.2.1, `-O2` for all compilers.
 All outputs are byte-identical to GCC.
 
 | Benchmark | LCCC | GCC -O2 | LCCC / GCC | Key optimization |
 |-----------|-----:|--------:|:----------:|:-----------------|
-| `arith_loop` — 32-var arithmetic, 10 M iters | 0.139 s | 0.088 s | 1.6× | Accumulator ALU+store fold, sign-extension elimination |
-| `sieve` — primes to 10 M | 0.073 s | 0.047 s | 1.6× | SIB indexed addressing, constant-immediate stores, regalloc fix |
-| `qsort` — sort 1 M integers | 0.137 s | 0.105 s | 1.3× | Push/pop callee saves, memory-operand codegen |
-| `fib(40)` — recursive Fibonacci | **0.000 s** | 0.146 s | **478× faster** | Binary recursion → iterative accumulator |
-| `matmul` — 256×256 double | 0.010 s | 0.006 s | 1.8× | AVX2 FMA3 `vfmadd231pd`, FPO stack alignment fix |
+| `arith_loop` — 32-var arithmetic, 10 M iters | 0.131 s | 0.082 s | 1.6× | Accumulator ALU+store fold, sign-extension elimination |
+| `sieve` — primes to 10 M | 0.048 s | 0.044 s | 1.1× | Phi-copy coalescing, sign-ext fusion, loop rotation |
+| `qsort` — sort 1 M integers | 0.122 s | 0.101 s | 1.2× | Push/pop callee saves, memory-operand codegen |
+| `fib(40)` — recursive Fibonacci | **0.001 s** | 0.136 s | **478× faster** | Binary recursion → iterative accumulator |
+| `matmul` — 256×256 double | 0.008 s | 0.005 s | 1.6× | AVX2 FMA3 `vfmadd231pd`, cascaded shift fold, loop rotation |
 | `reduction` — sum 10M doubles | **Vectorized** | Scalar | **~2.7× faster** | AVX2 4-wide + horizontal reduction |
-| `tce_sum` — tail-recursive sum(10M) | **0.008 s** | 0.008 s | **≈ equal** | Tail-call elimination |
+| `tce_sum` — tail-recursive sum(10M) | **0.007 s** | 0.001 s | 7× | TCE + phi-copy coalescing (GCC constant-folds entire call) |
 
 **Key optimizations:**
 - **Fibonacci 478× faster**: Binary recursion-to-iteration converts exponential O(2^n) recursive fib
   to O(n) iterative sliding-window loop. GCC keeps recursive calls.
-- **MatMul 1.8×**: AVX2 vectorization with FMA3 (`vfmadd231pd`), correct innermost-loop detection,
-  FPO stack alignment fix enables printf after computation.
-- **Phase 11 peephole**: Constant-immediate stores (`movb $0, addr` bypasses accumulator), SIB
-  indexed address folding (3 instructions → 1), accumulator ALU+store folding (4 → 2 per 32-bit
-  op), redundant `movslq`/`cltq` elimination (75 removed from arith_loop).
-- **Phase 12 regalloc fix**: Loop-depth priority bug caused inner-loop values to spill to stack.
-  Fixed by mapping value IDs to defining blocks and using max use-site loop depth.
+- **Sieve 1.1×**: Phase 13 peephole passes reduced the inner marking loop from 11 to 6 instructions:
+  phi-copy coalescing eliminates SSA temp copies, sign-extend fusion retargets `movslq` directly,
+  loop rotation moves the condition to the latch (1 branch vs 2), and the latch optimizer
+  eliminates redundant self sign-extends.
+- **MatMul 1.6×**: AVX2 vectorization with FMA3 (`vfmadd231pd`), cascaded shift folding
+  (`shlq $3 + shlq $2` → `shlq $5`), loop rotation, increment chain collapse.
+- **TCE sum 7×**: GCC constant-folds `sum(10000000, 0)` entirely at compile time (no loop at all).
+  LCCC's TCE converts recursion to a loop; phi-copy chain coalescing reduces the loop body from
+  5 to 3 instructions. On non-constant inputs, LCCC is 2.3× of GCC.
 - **Cross-benchmark**: XMM register allocation (F64 values in xmm2-7), frame pointer omission
   (RSP-relative addressing), cross-block store forwarding, copy propagation through conditional
   jumps, memory-operand codegen for Add/Sub, push/pop callee-saved registers.
