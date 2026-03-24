@@ -2689,11 +2689,126 @@ pub(super) fn rotate_loops(
             None => { i += 1; continue; }
         };
 
+        // Optimize the latch: detect redundant sign-extend pattern.
+        // If the header setup is `movslq %Xd, %Y; cmpl $imm, %Yd` and the body
+        // (just before the jmp) has `movslq %Xd, %X`, we can:
+        // - NOP the body's `movslq %Xd, %X` (redundant self sign-extend)
+        // - Retarget the latch's movslq to `movslq %Xd, %Y` (for next iter's index)
+        // - Use `cmpl $imm, %Xd` directly instead of `cmpl $imm, %Yd`
+        let mut nop_body_signext = None;
+        let mut optimized_latch = false;
+
+        if header_instrs.len() >= 2 {
+            // Check: first header instr is `movslq %Xd, %Y`
+            let first_setup = infos[header_instrs[0]].trimmed(store.get(header_instrs[0]));
+            if first_setup.starts_with("movslq %") {
+                if let Some(comma) = first_setup.find(", %") {
+                    let src_32 = &first_setup[7..comma]; // e.g., "%r12d"
+                    let dst_64 = &first_setup[comma + 2..]; // e.g., "%r14"
+                    // src_32 should be a 32-bit register like "%r12d"
+                    // Derive the 64-bit version by removing the 'd' suffix
+                    let src_64 = if src_32.ends_with('d') {
+                        let base = &src_32[..src_32.len() - 1];
+                        if base.starts_with("%r") && base.len() >= 3 {
+                            Some(base.to_string())
+                        } else if base == "%eax" { Some("%rax".to_string()) }
+                        else if base == "%ecx" { Some("%rcx".to_string()) }
+                        else if base == "%edx" { Some("%rdx".to_string()) }
+                        else if base == "%ebx" { Some("%rbx".to_string()) }
+                        else if base == "%esi" { Some("%rsi".to_string()) }
+                        else if base == "%edi" { Some("%rdi".to_string()) }
+                        else { None }
+                    } else { None };
+
+                    if let Some(ref src_64_name) = src_64 {
+                        // Look for `movslq %Xd, %X` in the body just before the jmp
+                        let self_signext = format!("movslq {}, {}", src_32, src_64_name);
+                        // Search backwards from the jmp for this pattern
+                        let mut search = if i > 0 { i - 1 } else { 0 };
+                        let mut search_count = 0;
+                        while search > header && search_count < 4 {
+                            if infos[search].is_nop() {
+                                if search == 0 { break; }
+                                search -= 1;
+                                continue;
+                            }
+                            let st = infos[search].trimmed(store.get(search));
+                            if st == self_signext {
+                                nop_body_signext = Some(search);
+                                break;
+                            }
+                            search_count += 1;
+                            if search == 0 { break; }
+                            search -= 1;
+                        }
+
+                        // Check: the compare uses %Yd (the destination of the movslq)
+                        if nop_body_signext.is_some() {
+                            let last_setup = header_instrs.last().unwrap();
+                            let cmp_text = infos[*last_setup].trimmed(store.get(*last_setup));
+                            let dst_32 = if dst_64.starts_with("%r") && dst_64.len() >= 3 {
+                                format!("{}d", dst_64)
+                            } else {
+                                // Classic regs: rax→eax, etc.
+                                match dst_64 {
+                                    "%rax" => "%eax".to_string(), "%rcx" => "%ecx".to_string(),
+                                    "%rdx" => "%edx".to_string(), "%rbx" => "%ebx".to_string(),
+                                    "%rsi" => "%esi".to_string(), "%rdi" => "%edi".to_string(),
+                                    _ => String::new(),
+                                }
+                            };
+                            if !dst_32.is_empty() && cmp_text.contains(&dst_32) {
+                                // Can optimize: replace cmpl's operand from %Yd to %Xd
+                                optimized_latch = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Build the replacement: duplicate setup + compare + inverted branch to body
         let mut replacement_lines = Vec::new();
-        for &setup_idx in &header_instrs {
-            let text = store.get(setup_idx).to_string();
-            replacement_lines.push(text.trim_end().to_string());
+        if optimized_latch {
+            // Optimized: skip the self sign-extend in the body, keep movslq to index reg,
+            // use source register directly in compare
+            if let Some(nop_idx) = nop_body_signext {
+                mark_nop(&mut infos[nop_idx]); // remove redundant movslq %Xd, %X
+            }
+            // Emit: movslq %Xd, %Y (for next iter's index)
+            let first_setup = store.get(header_instrs[0]).to_string();
+            replacement_lines.push(first_setup.trim_end().to_string());
+            // Emit remaining setup except the compare, then emit optimized compare
+            for &setup_idx in &header_instrs[1..header_instrs.len() - 1] {
+                let text = store.get(setup_idx).to_string();
+                replacement_lines.push(text.trim_end().to_string());
+            }
+            // Emit compare with source register instead of destination register
+            let first_text = infos[header_instrs[0]].trimmed(store.get(header_instrs[0]));
+            if let Some(comma) = first_text.find(", %") {
+                let src_32 = &first_text[7..comma]; // e.g., "%r12d"
+                let dst_64 = &first_text[comma + 2..]; // e.g., "%r14"
+                let dst_32 = if dst_64.starts_with("%r") && dst_64.len() >= 3 {
+                    format!("{}d", dst_64)
+                } else {
+                    match dst_64 {
+                        "%rax" => "%eax".to_string(), "%rcx" => "%ecx".to_string(),
+                        "%rdx" => "%edx".to_string(), "%rbx" => "%ebx".to_string(),
+                        "%rsi" => "%esi".to_string(), "%rdi" => "%edi".to_string(),
+                        _ => String::new(),
+                    }
+                };
+                let last_setup_idx = *header_instrs.last().unwrap();
+                let cmp_text = store.get(last_setup_idx).to_string();
+                let optimized_cmp = cmp_text.trim_end().replace(&dst_32, src_32);
+                replacement_lines.push(optimized_cmp);
+            }
+        } else {
+            // Standard: duplicate all setup instructions verbatim
+            for &setup_idx in &header_instrs {
+                let text = store.get(setup_idx).to_string();
+                replacement_lines.push(text.trim_end().to_string());
+            }
         }
         replacement_lines.push(format!("    {} {}", inv_cond, body_label));
 
