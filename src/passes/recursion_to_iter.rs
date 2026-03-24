@@ -414,3 +414,329 @@ fn find_cast_source(func: &IrFunction, val: Value) -> Option<Value> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::types::IrType;
+    use crate::ir::reexports::{
+        BasicBlock, BlockId, CallInfo, IrBinOp, IrCmpOp, IrConst, IrParam, Terminator, Value,
+    };
+
+    /// Build an IrFunction representing the canonical Fibonacci pattern:
+    /// ```c
+    /// long fib(int n) {
+    ///     if (n <= 1) return n;
+    ///     return fib(n - 1) + fib(n - 2);
+    /// }
+    /// ```
+    fn make_fib_func() -> IrFunction {
+        let params = vec![IrParam {
+            ty: IrType::I32,
+            struct_size: None,
+            struct_align: None,
+            struct_eightbyte_classes: Vec::new(),
+            riscv_float_class: None,
+        }];
+        let mut func = IrFunction::new("fib".to_string(), IrType::I64, params, false);
+        func.next_value_id = 20;
+        func.next_label = 3;
+
+        // Block 0 (entry): param_ref, compare n <= 1, branch
+        // %0 = param_ref 0 (i32)
+        // %1 = cast %0 i32 -> i64 (sign-extend for return type)
+        // %2 = cmp sle %1, 1
+        // br %2 -> block1 (base), block2 (recursive)
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::ParamRef { dest: Value(0), param_idx: 0, ty: IrType::I32 },
+                Instruction::Cast {
+                    dest: Value(1), src: Operand::Value(Value(0)),
+                    from_ty: IrType::I32, to_ty: IrType::I64,
+                },
+                Instruction::Cmp {
+                    dest: Value(2), op: IrCmpOp::Sle,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I64(1)),
+                    ty: IrType::I64,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(2)),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+            source_spans: Vec::new(),
+        });
+
+        // Block 1 (base case): return n
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: Vec::new(),
+            terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
+            source_spans: Vec::new(),
+        });
+
+        // Block 2 (recursive):
+        // %3 = sub %0, 1 (n-1)
+        // %4 = cast %3 i32 -> i64
+        // %5 = call fib(%4)  -> dest %6
+        // %7 = sub %0, 2 (n-2)
+        // %8 = cast %7 i32 -> i64
+        // %9 = call fib(%8) -> dest %10
+        // %11 = add %6, %10
+        // return %11
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![
+                Instruction::BinOp {
+                    dest: Value(3), op: IrBinOp::Sub,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                },
+                Instruction::Cast {
+                    dest: Value(4), src: Operand::Value(Value(3)),
+                    from_ty: IrType::I32, to_ty: IrType::I64,
+                },
+                Instruction::Call {
+                    func: "fib".to_string(),
+                    info: CallInfo {
+                        dest: Some(Value(6)),
+                        args: vec![Operand::Value(Value(3))],
+                        arg_types: vec![IrType::I32],
+                        return_type: IrType::I64,
+                        is_variadic: false,
+                        num_fixed_args: 1,
+                        struct_arg_sizes: vec![],
+                        struct_arg_aligns: vec![],
+                        struct_arg_classes: Vec::new(),
+                        struct_arg_riscv_float_classes: Vec::new(),
+                        is_sret: false,
+                        is_fastcall: false,
+                        ret_eightbyte_classes: Vec::new(),
+                    },
+                },
+                Instruction::BinOp {
+                    dest: Value(7), op: IrBinOp::Sub,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I32(2)),
+                    ty: IrType::I32,
+                },
+                Instruction::Cast {
+                    dest: Value(8), src: Operand::Value(Value(7)),
+                    from_ty: IrType::I32, to_ty: IrType::I64,
+                },
+                Instruction::Call {
+                    func: "fib".to_string(),
+                    info: CallInfo {
+                        dest: Some(Value(10)),
+                        args: vec![Operand::Value(Value(7))],
+                        arg_types: vec![IrType::I32],
+                        return_type: IrType::I64,
+                        is_variadic: false,
+                        num_fixed_args: 1,
+                        struct_arg_sizes: vec![],
+                        struct_arg_aligns: vec![],
+                        struct_arg_classes: Vec::new(),
+                        struct_arg_riscv_float_classes: Vec::new(),
+                        is_sret: false,
+                        is_fastcall: false,
+                        ret_eightbyte_classes: Vec::new(),
+                    },
+                },
+                Instruction::BinOp {
+                    dest: Value(11), op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(6)),
+                    rhs: Operand::Value(Value(10)),
+                    ty: IrType::I64,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(11)))),
+            source_spans: Vec::new(),
+        });
+
+        func
+    }
+
+    #[test]
+    fn test_fib_pattern_detected_and_transformed() {
+        let mut func = make_fib_func();
+        assert_eq!(func.blocks.len(), 3);
+        let transformed = recursion_to_iteration(&mut func);
+        assert_eq!(transformed, 1, "should transform Fibonacci pattern");
+        // After transformation: entry, base, preheader, header, body, exit = 6 blocks
+        assert_eq!(func.blocks.len(), 6, "iterative version should have 6 blocks");
+    }
+
+    #[test]
+    fn test_transformed_has_no_calls() {
+        let mut func = make_fib_func();
+        recursion_to_iteration(&mut func);
+        // The transformed function should contain zero Call instructions
+        let call_count: usize = func.blocks.iter()
+            .flat_map(|b| b.instructions.iter())
+            .filter(|inst| matches!(inst, Instruction::Call { .. }))
+            .count();
+        assert_eq!(call_count, 0, "iterative version should have no recursive calls");
+    }
+
+    #[test]
+    fn test_transformed_has_phi_nodes() {
+        let mut func = make_fib_func();
+        recursion_to_iteration(&mut func);
+        // The loop header should have phi nodes for the accumulators
+        let phi_count: usize = func.blocks.iter()
+            .flat_map(|b| b.instructions.iter())
+            .filter(|inst| matches!(inst, Instruction::Phi { .. }))
+            .count();
+        assert!(phi_count >= 3, "should have phi nodes for i, a, b (got {phi_count})");
+    }
+
+    #[test]
+    fn test_transformed_has_loop_structure() {
+        let mut func = make_fib_func();
+        recursion_to_iteration(&mut func);
+        // Should have at least one back-edge (Branch terminator pointing to an earlier block)
+        let has_back_edge = func.blocks.iter().any(|b| {
+            matches!(&b.terminator, Terminator::Branch(target) if
+                func.blocks.iter().position(|bb| bb.label == *target)
+                    .map_or(false, |pos| pos < func.blocks.iter().position(|bb| bb.label == b.label).unwrap()))
+        });
+        assert!(has_back_edge, "iterative version should have a loop back-edge");
+    }
+
+    #[test]
+    fn test_non_fib_not_transformed() {
+        // A function with only one recursive call (not binary recursion)
+        let params = vec![IrParam {
+            ty: IrType::I32,
+            struct_size: None,
+            struct_align: None,
+            struct_eightbyte_classes: Vec::new(),
+            riscv_float_class: None,
+        }];
+        let mut func = IrFunction::new("factorial".to_string(), IrType::I64, params, false);
+        func.next_value_id = 10;
+        func.next_label = 3;
+
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::ParamRef { dest: Value(0), param_idx: 0, ty: IrType::I32 },
+                Instruction::Cmp {
+                    dest: Value(1), op: IrCmpOp::Sle,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(1)),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: Vec::new(),
+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I64(1)))),
+            source_spans: Vec::new(),
+        });
+        // Only one recursive call — should not match
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![
+                Instruction::Call {
+                    func: "factorial".to_string(),
+                    info: CallInfo {
+                        dest: Some(Value(3)),
+                        args: vec![Operand::Value(Value(0))],
+                        arg_types: vec![IrType::I32],
+                        return_type: IrType::I64,
+                        is_variadic: false,
+                        num_fixed_args: 1,
+                        struct_arg_sizes: vec![],
+                        struct_arg_aligns: vec![],
+                        struct_arg_classes: Vec::new(),
+                        struct_arg_riscv_float_classes: Vec::new(),
+                        is_sret: false,
+                        is_fastcall: false,
+                        ret_eightbyte_classes: Vec::new(),
+                    },
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+            source_spans: Vec::new(),
+        });
+
+        let transformed = recursion_to_iteration(&mut func);
+        assert_eq!(transformed, 0, "single-recursive function should not be transformed");
+    }
+
+    #[test]
+    fn test_variadic_not_transformed() {
+        let params = vec![IrParam {
+            ty: IrType::I32,
+            struct_size: None,
+            struct_align: None,
+            struct_eightbyte_classes: Vec::new(),
+            riscv_float_class: None,
+        }];
+        let mut func = IrFunction::new("fib".to_string(), IrType::I64, params, true); // variadic
+        func.next_value_id = 20;
+        func.next_label = 3;
+        // Don't even need blocks — variadic check happens first
+        let transformed = recursion_to_iteration(&mut func);
+        assert_eq!(transformed, 0, "variadic functions should not be transformed");
+    }
+
+    #[test]
+    fn test_multi_param_not_transformed() {
+        // Two parameters — should be rejected (only single-param supported)
+        let params = vec![
+            IrParam {
+                ty: IrType::I32,
+                struct_size: None,
+                struct_align: None,
+                struct_eightbyte_classes: Vec::new(),
+                riscv_float_class: None,
+            },
+            IrParam {
+                ty: IrType::I32,
+                struct_size: None,
+                struct_align: None,
+                struct_eightbyte_classes: Vec::new(),
+                riscv_float_class: None,
+            },
+        ];
+        let mut func = IrFunction::new("fib2".to_string(), IrType::I64, params, false);
+        func.next_value_id = 20;
+        func.next_label = 3;
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: Vec::new(),
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        let transformed = recursion_to_iteration(&mut func);
+        assert_eq!(transformed, 0, "multi-param functions should not be transformed");
+    }
+
+    #[test]
+    fn test_declaration_not_transformed() {
+        let params = vec![IrParam {
+            ty: IrType::I32,
+            struct_size: None,
+            struct_align: None,
+            struct_eightbyte_classes: Vec::new(),
+            riscv_float_class: None,
+        }];
+        let mut func = IrFunction::new("fib".to_string(), IrType::I64, params, false);
+        func.is_declaration = true;
+        let transformed = recursion_to_iteration(&mut func);
+        assert_eq!(transformed, 0, "declarations should not be transformed");
+    }
+}

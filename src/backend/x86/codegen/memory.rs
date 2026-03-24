@@ -411,8 +411,63 @@ impl X86Codegen {
             return;
         }
 
+        // Constant-immediate store optimization: when storing a small constant,
+        // emit `movX $IMM, ADDR` directly instead of loading the constant into
+        // %rax and then storing through the accumulator. This saves 1-3 instructions
+        // (eliminates xorl/movq for zero, or movq $IMM for other constants, plus
+        // the emit_save_acc movq %rax, %rdx for indirect stores).
+        if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128) {
+            if let Operand::Const(c) = val {
+                if let Some(imm) = c.to_i64() {
+                    // Only use immediate form when value fits in i32 (x86 mov mem,imm limitation)
+                    if imm >= i32::MIN as i64 && imm <= i32::MAX as i64 {
+                        if self.try_emit_const_store(imm as i32, ptr, ty) {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
         // Fall back to default store logic
         crate::backend::traits::emit_store_default(self, val, ptr, ty);
+    }
+
+    /// Try to emit a constant-immediate store: `movX $IMM, ADDR`.
+    /// Bypasses the accumulator entirely, saving 1-3 instructions.
+    fn try_emit_const_store(&mut self, imm: i32, ptr: &Value, ty: IrType) -> bool {
+        let store_instr = Self::mov_store_for_type(ty);
+        let addr = self.state.resolve_slot_addr(ptr.0);
+
+        match addr {
+            Some(SlotAddr::Direct(slot)) => {
+                // Store constant directly to stack slot: movX $IMM, N(%rsp/%rbp)
+                let out = &mut self.state.out;
+                out.write_str("    ");
+                out.write_str(store_instr);
+                out.write_str(" $");
+                out.write_i64(imm as i64);
+                out.write_str(", ");
+                if out.use_rsp_addressing {
+                    out.write_i64(out.rsp_frame_size + slot.0);
+                    out.write_str("(%rsp)");
+                } else {
+                    out.write_i64(slot.0);
+                    out.write_str("(%rbp)");
+                }
+                out.newline();
+                self.state.reg_cache.invalidate_all();
+                true
+            }
+            Some(SlotAddr::Indirect(slot)) => {
+                // Pointer is in a stack slot — load pointer to %rcx, then store immediate
+                self.emit_load_ptr_from_slot_impl(slot, ptr.0);
+                self.state.emit_fmt(format_args!("    {} ${}, (%rcx)", store_instr, imm));
+                self.state.reg_cache.invalidate_all();
+                true
+            }
+            _ => false, // OverAligned or no slot — fall back to default
+        }
     }
 
     pub(super) fn emit_load_impl(&mut self, dest: &Value, ptr: &Value, ty: IrType) {
@@ -466,7 +521,60 @@ impl X86Codegen {
             }
             return;
         }
-        // Non-F128: use the default GEP fold logic.
+        // Non-F128: try constant-immediate store optimization first.
+        if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128) {
+            if let Operand::Const(c) = val {
+                if let Some(imm) = c.to_i64() {
+                    if imm >= i32::MIN as i64 && imm <= i32::MAX as i64 {
+                        let store_instr = Self::mov_store_for_type(ty);
+                        let imm32 = imm as i32;
+                        let addr = self.state.resolve_slot_addr(base.0);
+                        match addr {
+                            Some(SlotAddr::Direct(slot)) => {
+                                let folded_slot = StackSlot(slot.0 + offset);
+                                let out = &mut self.state.out;
+                                out.write_str("    ");
+                                out.write_str(store_instr);
+                                out.write_str(" $");
+                                out.write_i64(imm32 as i64);
+                                out.write_str(", ");
+                                if out.use_rsp_addressing {
+                                    out.write_i64(out.rsp_frame_size + folded_slot.0);
+                                    out.write_str("(%rsp)");
+                                } else {
+                                    out.write_i64(folded_slot.0);
+                                    out.write_str("(%rbp)");
+                                }
+                                out.newline();
+                                self.state.reg_cache.invalidate_all();
+                                return;
+                            }
+                            Some(SlotAddr::Indirect(slot)) => {
+                                if let Some(&reg) = self.reg_assignments.get(&base.0) {
+                                    let reg_name = phys_reg_name(reg);
+                                    if offset != 0 {
+                                        self.state.emit_fmt(format_args!("    {} ${}, {}(%{})", store_instr, imm32, offset, reg_name));
+                                    } else {
+                                        self.state.emit_fmt(format_args!("    {} ${}, (%{})", store_instr, imm32, reg_name));
+                                    }
+                                } else {
+                                    self.emit_load_ptr_from_slot_impl(slot, base.0);
+                                    if offset != 0 {
+                                        self.emit_add_offset_to_addr_reg_impl(offset);
+                                    }
+                                    self.state.emit_fmt(format_args!("    {} ${}, (%rcx)", store_instr, imm32));
+                                }
+                                self.state.reg_cache.invalidate_all();
+                                return;
+                            }
+                            _ => {} // fall through to default path
+                        }
+                    }
+                }
+            }
+        }
+
+        // Default GEP fold logic.
         self.operand_to_rax(val);
         let addr = self.state.resolve_slot_addr(base.0);
         if let Some(addr) = addr {
