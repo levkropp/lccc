@@ -1984,24 +1984,38 @@ pub(super) fn coalesce_phi_register_copies(
             let tmp_bit = 1u16 << tmp_family;
 
             // Scan forward for the copy-back: movq %TMP, %SRC
-            // Within a window of 6 non-NOP instructions
+            // Also track chains: if TMP is sign-extended to TMP2 (movslq %TMPd, %TMP2),
+            // accept movq %TMP2, %SRC as the copy-back too.
+            // Within a window of 8 non-NOP instructions.
             let copy_back_pat = format!("movq {}, {}", tmp_reg, src_reg);
             let mut j = i + 1;
             let mut instr_count = 0;
             let mut src_referenced = false;
             let mut has_implicit_hazard = false;
             let mut copy_back_pos = None;
+            // Chain tracking: if TMP gets sign-extended to a different register
+            let mut chain_family: RegId = REG_NONE;
+            let mut chain_bit: u16 = 0;
 
-            while j < len && instr_count < 6 {
+            while j < len && instr_count < 8 {
                 if infos[j].is_nop() { j += 1; continue; }
                 if infos[j].is_barrier() { break; }
 
                 let tj = infos[j].trimmed(store.get(j));
 
-                // Check for copy-back
+                // Check for direct copy-back: movq %TMP, %SRC
                 if tj == copy_back_pat {
                     copy_back_pos = Some(j);
                     break;
+                }
+
+                // Check for chain copy-back: movq %TMP2, %SRC (where TMP2 came from movslq %TMPd, %TMP2)
+                if chain_family != REG_NONE {
+                    let chain_wb = format!("movq {}, {}", REG_NAMES[0][chain_family as usize], src_reg);
+                    if tj == chain_wb {
+                        copy_back_pos = Some(j);
+                        break;
+                    }
                 }
 
                 // Check SRC is not referenced between copy-out and copy-back
@@ -2010,17 +2024,24 @@ pub(super) fn coalesce_phi_register_copies(
                     break;
                 }
 
-                // Check for implicit register hazards
-                if has_implicit_reg_usage(tj) {
-                    // Could be unsafe if src or tmp overlaps implicit regs
-                    has_implicit_hazard = true;
-                    break;
+                // Track sign-extend chain: movslq %TMPd, %OTHER
+                if chain_family == REG_NONE && tj.starts_with("movslq ") {
+                    let tmp_32 = REG_NAMES[1][tmp_family as usize];
+                    let chain_prefix = format!("movslq {}, %", tmp_32);
+                    if tj.starts_with(&chain_prefix) {
+                        let other_reg = &tj[chain_prefix.len() - 1..];
+                        let other_fam = register_family_fast(other_reg);
+                        if other_fam != REG_NONE && other_fam != tmp_family && other_fam != src_family && other_fam > 1 {
+                            chain_family = other_fam;
+                            chain_bit = 1u16 << chain_family;
+                        }
+                    }
                 }
 
-                // Verify TMP is actually used (not just passing through)
-                if infos[j].reg_refs & tmp_bit == 0 {
-                    // Instruction doesn't reference TMP — could be unrelated
-                    // but still OK as long as it doesn't reference SRC
+                // Check for implicit register hazards
+                if has_implicit_reg_usage(tj) {
+                    has_implicit_hazard = true;
+                    break;
                 }
 
                 instr_count += 1;
@@ -2033,47 +2054,51 @@ pub(super) fn coalesce_phi_register_copies(
 
             let cb = copy_back_pos.unwrap();
 
-            // Verify TMP is dead after the copy-back.
-            // Look at the next few instructions: TMP must be overwritten or we hit a barrier.
+            // Verify TMP (and chain TMP2 if present) are dead after the copy-back.
+            let check_bits = tmp_bit | chain_bit;
             let mut tmp_dead = false;
             let mut n = cb + 1;
             let mut chk_count = 0;
             while n < len && chk_count < 8 {
                 if infos[n].is_nop() { n += 1; continue; }
                 if infos[n].is_barrier() {
-                    // At a barrier (label, jmp, ret, etc.), TMP is effectively dead
-                    // for local analysis purposes
                     tmp_dead = true;
                     break;
                 }
-                if infos[n].reg_refs & tmp_bit != 0 {
-                    // TMP is referenced after copy-back
+                if infos[n].reg_refs & check_bits != 0 {
+                    // Check each referenced temp
+                    let mut is_write = false;
                     match infos[n].kind {
-                        // TMP is overwritten → dead
-                        LineKind::Other { dest_reg } if dest_reg == tmp_family => { tmp_dead = true; break; }
-                        LineKind::LoadRbp { reg, .. } if reg == tmp_family => { tmp_dead = true; break; }
-                        _ => {
-                            // TMP is read after copy-back → can't coalesce
-                            break;
-                        }
+                        LineKind::Other { dest_reg } if dest_reg == tmp_family || dest_reg == chain_family => { is_write = true; }
+                        LineKind::LoadRbp { reg, .. } if reg == tmp_family || reg == chain_family => { is_write = true; }
+                        _ => {}
+                    }
+                    if !is_write {
+                        break; // TMP or chain reg read after copy-back → can't coalesce
                     }
                 }
                 chk_count += 1;
                 n += 1;
             }
-            // If we scanned 8 instructions without finding a ref to TMP, assume dead
             if chk_count >= 8 { tmp_dead = true; }
 
             if !tmp_dead { i += 1; continue; }
 
             // Apply: remove copy-out, replace TMP with SRC in intermediate ops, remove copy-back
+            // For chain coalescing, also replace TMP2 with SRC
             mark_nop(&mut infos[i]);
             for mid in (i + 1)..cb {
                 if infos[mid].is_nop() { continue; }
-                if infos[mid].reg_refs & tmp_bit != 0 {
-                    let old_text = store.get(mid).to_string();
-                    let new_text = replace_reg_family(&old_text, tmp_family, src_family);
-                    if new_text != old_text {
+                let needs_replace = infos[mid].reg_refs & (tmp_bit | chain_bit) != 0;
+                if needs_replace {
+                    let mut new_text = store.get(mid).to_string();
+                    if infos[mid].reg_refs & tmp_bit != 0 {
+                        new_text = replace_reg_family(&new_text, tmp_family, src_family);
+                    }
+                    if chain_family != REG_NONE && infos[mid].reg_refs & chain_bit != 0 {
+                        new_text = replace_reg_family(&new_text, chain_family, src_family);
+                    }
+                    if new_text != store.get(mid) {
                         replace_line(store, &mut infos[mid], mid, new_text);
                     }
                 }
