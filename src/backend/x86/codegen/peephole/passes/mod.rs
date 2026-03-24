@@ -81,6 +81,10 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= local_patterns::eliminate_dead_sign_extensions(&mut store, &mut infos);
         changed |= local_patterns::fold_base_index_addressing(&mut store, &mut infos);
         changed |= local_patterns::fold_accumulator_alu_store(&mut store, &mut infos);
+        changed |= local_patterns::coalesce_phi_register_copies(&mut store, &mut infos);
+        changed |= local_patterns::fuse_signext_and_move(&mut store, &mut infos);
+        changed |= local_patterns::collapse_increment_chain(&mut store, &mut infos);
+        changed |= local_patterns::hoist_loop_invariant_gpr_load(&mut store, &mut infos);
         if local_changed || pass_count == 0 {
             changed |= push_pop::eliminate_push_pop_pairs(&store, &mut infos);
             changed |= push_pop::eliminate_binop_push_pop_pattern(&mut store, &mut infos);
@@ -117,6 +121,9 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= dead_code::eliminate_dead_stores(&store, &mut infos);
             changed2 |= memory_fold::fold_memory_operands(&mut store, &mut infos);
             changed2 |= local_patterns::fold_base_index_addressing(&mut store, &mut infos);
+            changed2 |= local_patterns::coalesce_phi_register_copies(&mut store, &mut infos);
+            changed2 |= local_patterns::fuse_signext_and_move(&mut store, &mut infos);
+            changed2 |= local_patterns::collapse_increment_chain(&mut store, &mut infos);
             pass_count2 += 1;
         }
     }
@@ -139,6 +146,9 @@ pub fn peephole_optimize(asm: String) -> String {
             changed3 |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);
             changed3 |= dead_code::eliminate_dead_stores(&store, &mut infos);
             changed3 |= memory_fold::fold_memory_operands(&mut store, &mut infos);
+            changed3 |= local_patterns::coalesce_phi_register_copies(&mut store, &mut infos);
+            changed3 |= local_patterns::fuse_signext_and_move(&mut store, &mut infos);
+            changed3 |= local_patterns::collapse_increment_chain(&mut store, &mut infos);
             pass_count3 += 1;
         }
     }
