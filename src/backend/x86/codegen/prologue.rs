@@ -90,7 +90,16 @@ impl X86Codegen {
             false,
         );
 
-        let mut space = calculate_stack_space_common(&mut self.state, func, 0, |space, alloc_size, align| {
+        // When omitting the frame pointer, local slots must start AFTER the callee-save area
+        // to avoid overlapping. In push mode, pushes are separate from the subq frame,
+        // so locals can start at offset 0. In RSP mode, callee saves are movq'd into the
+        // frame at offsets -8..-N*8, so locals must start at -N*8-8.
+        let callee_save_reserve = if self.state.omit_frame_pointer {
+            (self.used_callee_saved.len() as i64) * 8
+        } else {
+            0
+        };
+        let mut space = calculate_stack_space_common(&mut self.state, func, callee_save_reserve, |space, alloc_size, align| {
             let effective_align = if align > 0 { align.max(8) } else { 8 };
             let alloc = (alloc_size + 7) & !7;
             let new_space = ((space + alloc + effective_align - 1) / effective_align) * effective_align;
@@ -141,11 +150,18 @@ impl X86Codegen {
                     self.state.emit_fmt(format_args!("    .cfi_def_cfa_offset {}", frame_size + 8));
                 }
             }
-            // Save callee-saved registers at the top of the frame (highest offsets)
+            // Save callee-saved registers at the same offsets the push prologue
+            // would use: -8(%rbp), -16(%rbp), etc. These translate to
+            // (frame_size-8)(%rsp), (frame_size-16)(%rsp), etc.
+            // These offsets overlap with the stack layout's register-allocated
+            // value slots, which is correct — the stack layout assigned those
+            // slots to the callee-saved-register values, so writing the register
+            // value there is the intended initialization.
             for (i, &reg) in used_regs.iter().enumerate() {
                 let reg_name = phys_reg_name(reg);
-                let offset = frame_size - (i as i64 + 1) * 8;
-                self.state.emit_fmt(format_args!("    movq %{}, {}(%rsp)", reg_name, offset));
+                let rbp_offset = -((i as i64 + 1) * 8);
+                let rsp_offset = frame_size + rbp_offset;
+                self.state.emit_fmt(format_args!("    movq %{}, {}(%rsp)", reg_name, rsp_offset));
             }
             // Set AsmOutput to use RSP-relative addressing
             self.state.out.use_rsp_addressing = true;

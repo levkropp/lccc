@@ -16,6 +16,16 @@
 use super::super::types::*;
 use super::helpers::is_valid_gp_reg;
 
+/// Format a stack offset string for text matching/generation.
+/// Checks context to decide between (%rbp) and (%rsp).
+fn stack_offset_str(offset: i32, context: &str) -> String {
+    if context.contains("(%rsp)") {
+        format!("{}(%rsp)", offset)
+    } else {
+        format!("{}(%rbp)", offset)
+    }
+}
+
 pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let mut changed = false;
     let len = store.len();
@@ -532,7 +542,9 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
                         ("movq %rcx, %xmm1", "%xmm1")
                     };
                     if line_j == expected {
-                        let new_text = format!("    movsd {}(%rbp), {}", offset, xmm_str);
+                        let load_text = infos[i].trimmed(store.get(i));
+                        let base = if load_text.contains("(%rsp)") { "rsp" } else { "rbp" };
+                        let new_text = format!("    movsd {}(%{}), {}", offset, base, xmm_str);
                         replace_line(store, &mut infos[i], i, new_text);
                         mark_nop(&mut infos[j]);
                         changed = true;
@@ -554,7 +566,9 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
                         let mut k = j + 1;
                         while k < len && infos[k].is_nop() { k += 1; }
                         if !rax_is_live_at(store, infos, k, len) {
-                            let new_text = format!("    movsd %xmm0, {}(%rbp)", offset);
+                            let store_text = infos[j].trimmed(store.get(j));
+                            let base = if store_text.contains("(%rsp)") { "rsp" } else { "rbp" };
+                            let new_text = format!("    movsd %xmm0, {}(%{})", offset, base);
                             mark_nop(&mut infos[i]);
                             replace_line(store, &mut infos[j], j, new_text);
                             changed = true;
@@ -710,7 +724,9 @@ pub(super) fn fold_ptr_deref_through_stack(
                 while j < len && j < i + 4 && infos[j].is_nop() { j += 1; }
                 if j >= len { i += 1; continue; }
                 if let LineKind::StoreRbp { reg: 0, offset, size: MoveSize::Q } = infos[j].kind {
-                    let offset_str = format!("{}(%rbp)", offset);
+                    let store_text = infos[j].trimmed(store.get(j));
+                    let base = if store_text.contains("(%rsp)") { "rsp" } else { "rbp" };
+                    let offset_str = format!("{}(%{})", offset, base);
                     let ptr_mem = format!("(%{})", ptr_reg);
 
                     // Scan forward from j+1 for first FP use of O(%rbp).
@@ -827,7 +843,7 @@ pub(super) fn eliminate_fp_spill_around_load(
         let line_i = infos[i].trimmed(store.get(i));
 
         // Match I: "movsd %xmm0, <offset>(%rbp)"
-        if line_i.starts_with("movsd %xmm0, ") && line_i.ends_with("(%rbp)") {
+        if line_i.starts_with("movsd %xmm0, ") && (line_i.ends_with("(%rbp)") || line_i.ends_with("(%rsp)")) {
             let mem_operand = &line_i[13..]; // after "movsd %xmm0, " (13 chars)
             // Extract numeric offset from e.g. "-48(%rbp)"
             let paren_pos = mem_operand.find('(');
@@ -961,18 +977,20 @@ pub(super) fn promote_loop_invariant_fp_load(
             if infos[pos].is_nop() { continue; }
             let t = infos[pos].trimmed(store.get(pos));
             if !t.starts_with("movsd ") || !t.ends_with(", %xmm0") { continue; }
-            // Check it's a stack load: "movsd -N(%rbp), %xmm0"
+            // Check it's a stack load: "movsd -N(%rbp), %xmm0" or "movsd N(%rsp), %xmm0"
             let src = &t[6..t.len() - 7]; // between "movsd " and ", %xmm0"
-            if !src.ends_with("(%rbp)") { continue; }
+            if !src.ends_with("(%rbp)") && !src.ends_with("(%rsp)") { continue; }
             let offset_str = src.to_string();
 
             // Check -O(%rbp) is NOT written in the loop body [body_start..=i].
+            // Extract numeric offset from the source string (e.g., "-24(%rbp)" → -24)
+            let numeric_offset_end = offset_str.find('(').unwrap_or(offset_str.len());
+            let numeric_offset: i32 = offset_str[..numeric_offset_end].parse().unwrap_or(0);
             let mut written_in_body = false;
             for chk in body_start + 1..i {
                 if infos[chk].is_nop() { continue; }
                 if let LineKind::StoreRbp { offset: o, .. } = infos[chk].kind {
-                    let s = format!("{}(%rbp)", o);
-                    if s == offset_str { written_in_body = true; break; }
+                    if o == numeric_offset { written_in_body = true; break; }
                 }
                 // Also check text for movsd stores to this offset.
                 let ct = infos[chk].trimmed(store.get(chk));
@@ -1012,8 +1030,7 @@ pub(super) fn promote_loop_invariant_fp_load(
                 // Labels are OK to cross — we're looking for ANY store to this offset
                 // that dominates the loop header.
                 if let LineKind::StoreRbp { reg: 0, offset: o, .. } = infos[ph].kind {
-                    let s = format!("{}(%rbp)", o);
-                    if s == offset_str {
+                    if o == numeric_offset {
                         preheader_store = Some(ph);
                         break;
                     }
@@ -1169,7 +1186,8 @@ fn rbp_offset_dead_after(
     len: usize,
     offset: i64,
 ) -> bool {
-    let offset_str = format!("{}(%rbp)", offset);
+    let offset_str_rbp = format!("{}(%rbp)", offset);
+    let offset_str_rsp = format!("{}(%rsp)", offset);
     let mut i = start;
     let mut count = 0;
     while i < len && count < 32 {
@@ -1184,7 +1202,7 @@ fn rbp_offset_dead_after(
             if i64::from(o) == offset { return true; }
         }
         // If text contains the offset string (potential read), not dead.
-        if t.contains(&offset_str) {
+        if t.contains(&offset_str_rbp) || t.contains(&offset_str_rsp) {
             return false;
         }
         i += 1;
