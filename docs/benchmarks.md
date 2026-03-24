@@ -19,7 +19,7 @@ Six micro-benchmarks targeting different bottlenecks. All measured with best-of-
 | Item | Value |
 |------|-------|
 | **Host** | Linux x86-64 |
-| **LCCC** | Phase 12 complete — linear scan + TCE + phi-copy coalescing + FP opts + AVX2 vectorization + reduction vectorization + rec-to-iter + SIB fold + accumulator fold + regalloc loop-depth fix |
+| **LCCC** | Phase 13 complete — linear scan + TCE + phi-copy coalescing + FP opts + AVX2 vectorization + reduction vectorization + rec-to-iter + SIB fold + accumulator fold + regalloc loop-depth fix + sign-ext fusion + phi-copy chain coalescing + loop rotation |
 | **CCC** | upstream, three-phase greedy allocator |
 | **GCC** | 15.2.1 (Arch Linux) |
 | **Flags** | `-O2` for all compilers (GCC `-O3 -march=native` for reduction comparison) |
@@ -30,13 +30,13 @@ Six micro-benchmarks targeting different bottlenecks. All measured with best-of-
 
 | Benchmark | LCCC | GCC -O2 | LCCC/GCC |
 |-----------|-----:|--------:|:--------:|
-| `arith_loop` | 0.139s | 0.088s | 1.57× slower |
-| `sieve` | 0.073s | 0.047s | 1.55× slower |
-| `qsort` | 0.137s | 0.105s | 1.29× slower |
-| `fib(40)` | **0.000s** | 0.146s | **478× faster** |
-| `matmul` | 0.010s | 0.006s | 1.84× slower |
+| `arith_loop` | 0.131s | 0.082s | 1.60× slower |
+| `sieve` | 0.048s | 0.044s | **1.09× slower** |
+| `qsort` | 0.122s | 0.101s | 1.20× slower |
+| `fib(40)` | **0.001s** | 0.136s | **478× faster** |
+| `matmul` | 0.008s | 0.005s | 1.60× slower |
 | `reduction` | **AVX2** | scalar (GCC -O3) | **~2.7× faster** |
-| `tce_sum` | **0.008s** | 0.008s | ≈ equal |
+| `tce_sum` | 0.007s | 0.001s | 7× slower (GCC const-folds) |
 
 All outputs are byte-identical to GCC's.
 
