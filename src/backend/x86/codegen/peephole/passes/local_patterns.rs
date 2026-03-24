@@ -18,6 +18,19 @@ use super::helpers::{is_valid_gp_reg, has_implicit_reg_usage, replace_reg_family
 
 /// Format a stack offset string for text matching/generation.
 /// Checks context to decide between (%rbp) and (%rsp).
+/// Convert a 64-bit register name to its 32-bit equivalent.
+/// High registers (%r8-%r15) get 'd' suffix, classic regs use 'e' prefix form.
+fn reg_64_to_32(r64: &str) -> String {
+    match r64 {
+        "%rax" => "%eax".into(), "%rcx" => "%ecx".into(),
+        "%rdx" => "%edx".into(), "%rbx" => "%ebx".into(),
+        "%rsp" => "%esp".into(), "%rbp" => "%ebp".into(),
+        "%rsi" => "%esi".into(), "%rdi" => "%edi".into(),
+        _ if r64.starts_with("%r") => format!("{}d", r64),
+        _ => String::new(),
+    }
+}
+
 fn stack_offset_str(offset: i32, context: &str) -> String {
     if context.contains("(%rsp)") {
         format!("{}(%rsp)", offset)
@@ -2746,17 +2759,7 @@ pub(super) fn rotate_loops(
                         if nop_body_signext.is_some() {
                             let last_setup = header_instrs.last().unwrap();
                             let cmp_text = infos[*last_setup].trimmed(store.get(*last_setup));
-                            let dst_32 = if dst_64.starts_with("%r") && dst_64.len() >= 3 {
-                                format!("{}d", dst_64)
-                            } else {
-                                // Classic regs: rax→eax, etc.
-                                match dst_64 {
-                                    "%rax" => "%eax".to_string(), "%rcx" => "%ecx".to_string(),
-                                    "%rdx" => "%edx".to_string(), "%rbx" => "%ebx".to_string(),
-                                    "%rsi" => "%esi".to_string(), "%rdi" => "%edi".to_string(),
-                                    _ => String::new(),
-                                }
-                            };
+                            let dst_32 = reg_64_to_32(dst_64);
                             if !dst_32.is_empty() && cmp_text.contains(&dst_32) {
                                 // Can optimize: replace cmpl's operand from %Yd to %Xd
                                 optimized_latch = true;
