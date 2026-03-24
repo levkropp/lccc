@@ -637,15 +637,20 @@ pub(super) fn parse_store_to_rbp_str(s: &str) -> Option<(&str, &str, MoveSize)> 
     if !src.starts_with('%') {
         return None;
     }
-    if !dst.ends_with("(%rbp)") {
-        return None;
+    // Accept both (%rbp) and (%rsp) for frame pointer / frame-pointer-less modes
+    if dst.ends_with("(%rbp)") {
+        let offset = &dst[..dst.len() - 6];
+        return Some((src, offset, size));
     }
-    let offset = &dst[..dst.len() - 6];
-
-    Some((src, offset, size))
+    if dst.ends_with("(%rsp)") {
+        let offset = &dst[..dst.len() - 6];
+        return Some((src, offset, size));
+    }
+    None
 }
 
-/// Parse `movX offset(%rbp), %reg` or `movslq offset(%rbp), %reg` (load from rbp).
+/// Parse `movX offset(%rbp), %reg` or `movX offset(%rsp), %reg`
+/// or `movslq offset(%rbp), %reg` (load from stack frame).
 /// Returns (offset_str, register_str, size).
 pub(super) fn parse_load_from_rbp_str(s: &str) -> Option<(&str, &str, MoveSize)> {
     let (rest, size) = strip_mov_prefix(s, true)?;
@@ -654,15 +659,20 @@ pub(super) fn parse_load_from_rbp_str(s: &str) -> Option<(&str, &str, MoveSize)>
     let src = src.trim();
     let dst = dst.trim();
 
-    if !src.ends_with("(%rbp)") {
-        return None;
-    }
-    let offset = &src[..src.len() - 6];
     if !dst.starts_with('%') {
         return None;
     }
 
-    Some((offset, dst, size))
+    // Accept both (%rbp) and (%rsp) for frame pointer / frame-pointer-less modes
+    if src.ends_with("(%rbp)") {
+        let offset = &src[..src.len() - 6];
+        return Some((offset, dst, size));
+    }
+    if src.ends_with("(%rsp)") {
+        let offset = &src[..src.len() - 6];
+        return Some((offset, dst, size));
+    }
+    None
 }
 
 // Re-export the shared LineStore: zero-allocation line storage that keeps
@@ -804,12 +814,13 @@ pub(super) fn has_indirect_memory_access(s: &str) -> bool {
 pub(super) fn parse_rbp_offset(s: &str) -> i32 {
     let bytes = s.as_bytes();
     let len = bytes.len();
-    // Search for "(%rbp)" pattern
+    // Search for "(%rbp)" or "(%rsp)" pattern (both used for stack frame refs)
     let mut found_offset = RBP_OFFSET_NONE;
     let mut i = 0;
     while i + 5 < len {
         if bytes[i] == b'(' && bytes[i + 1] == b'%'
-            && bytes[i + 2] == b'r' && bytes[i + 3] == b'b' && bytes[i + 4] == b'p'
+            && bytes[i + 2] == b'r'
+            && ((bytes[i + 3] == b'b' && bytes[i + 4] == b'p') || (bytes[i + 3] == b's' && bytes[i + 4] == b'p'))
             && bytes[i + 5] == b')'
         {
             // Found "(%rbp)" at position i. Parse the offset before '('.

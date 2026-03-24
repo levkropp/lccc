@@ -239,8 +239,13 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::ReturnAddress => {
-                // __builtin_return_address(0): return address is at (%rbp)+8
-                self.state.emit("    movq 8(%rbp), %rax");
+                // __builtin_return_address(0): return address is above the frame
+                if self.state.out.use_rsp_addressing {
+                    let off = self.state.out.rsp_frame_size;
+                    self.state.emit_fmt(format_args!("    movq {}(%rsp), %rax", off));
+                } else {
+                    self.state.emit("    movq 8(%rbp), %rax");
+                }
                 if let Some(d) = dest {
                     self.store_rax_to(d);
                 }
