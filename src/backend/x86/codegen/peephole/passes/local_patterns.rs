@@ -14,7 +14,7 @@
 //!   7. eliminate_redundant_xorl_zero: xorl %eax,%eax when %rax already zero
 
 use super::super::types::*;
-use super::helpers::is_valid_gp_reg;
+use super::helpers::{is_valid_gp_reg, has_implicit_reg_usage, replace_reg_family, is_callee_saved_reg};
 
 /// Format a stack offset string for text matching/generation.
 /// Checks context to decide between (%rbp) and (%rsp).
@@ -1798,6 +1798,648 @@ pub(super) fn fuse_movq_ext_truncation(store: &mut LineStore, infos: &mut [LineI
         changed = true;
         i = j + 1;
         continue;
+    }
+    changed
+}
+
+// ── Sign-extend + move fusion ────────────────────────────────────────────────
+//
+// Fuses a sign-extend to %rax followed by a move from %rax to another register,
+// when %rax is not needed afterward (or only used for a 32-bit compare that can
+// be redirected to the original source register).
+//
+// Pattern A (rax dead):
+//   movslq %Xd, %rax       →  movslq %Xd, %Y
+//   movq %rax, %Y
+//
+// Pattern B (rax used only in cmpl):
+//   movslq %Xd, %rax       →  movslq %Xd, %Y
+//   movq %rax, %Y              cmpl $imm, %Xd
+//   cmpl $imm, %eax
+//
+// Also handles cltq (= movslq %eax, %rax) as the sign-extend source.
+
+pub(super) fn fuse_signext_and_move(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+
+    while i < len {
+        if infos[i].is_nop() { i += 1; continue; }
+
+        // Match: movslq %Xd, %rax (or cltq)
+        let ti = infos[i].trimmed(store.get(i));
+        let src_family = if ti.starts_with("movslq %") && ti.ends_with(", %rax") {
+            let src_32 = &ti[7..ti.len() - 6]; // between "movslq " and ", %rax"
+            if !src_32.starts_with('%') { i += 1; continue; }
+            let fam = register_family_fast(src_32);
+            if fam == REG_NONE || fam == 0 { i += 1; continue; }
+            fam
+        } else if ti == "cltq" {
+            0u8 // cltq sign-extends %eax → %rax, src is rax family itself
+        } else {
+            i += 1; continue;
+        };
+
+        // For cltq, we can't retarget (src == dest == rax family), skip
+        if src_family == 0 { i += 1; continue; }
+
+        // Next non-NOP: must be movq %rax, %Y
+        let j = next_non_nop(infos, i + 1, len);
+        if j >= len || infos[j].is_barrier() { i += 1; continue; }
+
+        let tj = infos[j].trimmed(store.get(j));
+        if !tj.starts_with("movq %rax, %") { i += 1; continue; }
+        let dest_reg = &tj[11..]; // after "movq %rax, " (includes %)
+        let dest_family = register_family_fast(dest_reg);
+        if dest_family == REG_NONE || dest_family == 0 || dest_family == src_family {
+            i += 1; continue;
+        }
+
+        // Check if %rax is dead after j, or only used in a redirectable cmpl.
+        // Scan forward from j+1 within the basic block.
+        let src_32_name = REG_NAMES[1][src_family as usize];
+        let mut rax_dead = true;
+        let mut cmpl_line: Option<usize> = None;
+        let mut n = j + 1;
+        while n < len && n < j + 12 {
+            if infos[n].is_nop() { n += 1; continue; }
+            if infos[n].is_barrier() { break; }
+            // Check if this instruction references rax
+            if infos[n].reg_refs & 1 != 0 {
+                // rax is referenced. Check if it's a write (rax overwritten → dead)
+                match infos[n].kind {
+                    LineKind::Other { dest_reg: 0 } => break, // rax overwritten → dead
+                    LineKind::LoadRbp { reg: 0, .. } => break, // rax loaded → dead
+                    _ => {}
+                }
+                // Check if it's a cmpl $imm, %eax
+                let tn = infos[n].trimmed(store.get(n));
+                if tn.starts_with("cmpl $") && tn.ends_with(", %eax") && cmpl_line.is_none() {
+                    // Check src_family is not modified between i and n
+                    let src_bit = 1u16 << src_family;
+                    let mut src_modified = false;
+                    for chk in (i + 1)..n {
+                        if infos[chk].is_nop() { continue; }
+                        if infos[chk].reg_refs & src_bit == 0 { continue; }
+                        match infos[chk].kind {
+                            LineKind::Other { dest_reg: d } if d == src_family => { src_modified = true; break; }
+                            LineKind::LoadRbp { reg: r, .. } if r == src_family => { src_modified = true; break; }
+                            LineKind::StoreRbp { reg: r, .. } if r == src_family => {} // store reads, doesn't modify
+                            _ => {} // read-only reference is fine
+                        }
+                    }
+                    if !src_modified {
+                        cmpl_line = Some(n);
+                        n += 1;
+                        continue;
+                    }
+                }
+                // rax is used in a non-redirectable way → not dead
+                rax_dead = false;
+                break;
+            }
+            n += 1;
+        }
+
+        if !rax_dead && cmpl_line.is_none() { i += 1; continue; }
+
+        // Apply the transformation
+        let dest_reg_stripped = &dest_reg[1..]; // without leading %
+        let new_signext = format!("    movslq {}, %{}", src_32_name, dest_reg_stripped);
+        replace_line(store, &mut infos[i], i, new_signext);
+        mark_nop(&mut infos[j]); // remove movq %rax, %Y
+
+        // If there's a cmpl to redirect, do it
+        if let Some(cmp_idx) = cmpl_line {
+            let tc = infos[cmp_idx].trimmed(store.get(cmp_idx));
+            let new_cmp = format!("    {}", tc.replace(", %eax", &format!(", {}", src_32_name)));
+            replace_line(store, &mut infos[cmp_idx], cmp_idx, new_cmp);
+        }
+
+        changed = true;
+        i = j + 1;
+    }
+    changed
+}
+
+// ── Phi-copy register coalescing ─────────────────────────────────────────────
+//
+// Eliminates temporary register copies used for SSA phi resolution:
+//
+//   movq %SRC, %TMP        →  <ops directly on SRC>
+//   ... ops on %TMP ...
+//   movq %TMP, %SRC
+//
+// Conditions:
+//   - SRC is not read or written between the copy-out and copy-back
+//   - TMP is dead after the copy-back (next barrier or TMP overwritten)
+//   - No implicit register hazards (div, mul, etc.)
+//   - Window limited to 6 instructions to keep analysis local
+
+pub(super) fn coalesce_phi_register_copies(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+
+    while i < len {
+        if infos[i].is_nop() { i += 1; continue; }
+
+        // Match: movq %SRC, %TMP where both are GP regs, SRC != TMP
+        let ti = infos[i].trimmed(store.get(i));
+        if !ti.starts_with("movq %") { i += 1; continue; }
+        if let Some(comma) = ti.find(", %") {
+            let src_reg = &ti[5..comma]; // includes leading %
+            let tmp_reg = &ti[comma + 2..]; // includes leading %
+            if src_reg == tmp_reg || src_reg.contains('(') { i += 1; continue; }
+
+            let src_family = register_family_fast(src_reg);
+            let tmp_family = register_family_fast(tmp_reg);
+            if src_family == REG_NONE || src_family > REG_GP_MAX { i += 1; continue; }
+            if tmp_family == REG_NONE || tmp_family > REG_GP_MAX { i += 1; continue; }
+            // Don't coalesce rax(0) or rcx(1) as SRC — they're accumulator regs
+            // with heavy implicit use
+            if src_family <= 1 || tmp_family <= 1 { i += 1; continue; }
+
+            let src_bit = 1u16 << src_family;
+            let tmp_bit = 1u16 << tmp_family;
+
+            // Scan forward for the copy-back: movq %TMP, %SRC
+            // Within a window of 6 non-NOP instructions
+            let copy_back_pat = format!("movq {}, {}", tmp_reg, src_reg);
+            let mut j = i + 1;
+            let mut instr_count = 0;
+            let mut src_referenced = false;
+            let mut has_implicit_hazard = false;
+            let mut copy_back_pos = None;
+
+            while j < len && instr_count < 6 {
+                if infos[j].is_nop() { j += 1; continue; }
+                if infos[j].is_barrier() { break; }
+
+                let tj = infos[j].trimmed(store.get(j));
+
+                // Check for copy-back
+                if tj == copy_back_pat {
+                    copy_back_pos = Some(j);
+                    break;
+                }
+
+                // Check SRC is not referenced between copy-out and copy-back
+                if infos[j].reg_refs & src_bit != 0 {
+                    src_referenced = true;
+                    break;
+                }
+
+                // Check for implicit register hazards
+                if has_implicit_reg_usage(tj) {
+                    // Could be unsafe if src or tmp overlaps implicit regs
+                    has_implicit_hazard = true;
+                    break;
+                }
+
+                // Verify TMP is actually used (not just passing through)
+                if infos[j].reg_refs & tmp_bit == 0 {
+                    // Instruction doesn't reference TMP — could be unrelated
+                    // but still OK as long as it doesn't reference SRC
+                }
+
+                instr_count += 1;
+                j += 1;
+            }
+
+            if src_referenced || has_implicit_hazard || copy_back_pos.is_none() {
+                i += 1; continue;
+            }
+
+            let cb = copy_back_pos.unwrap();
+
+            // Verify TMP is dead after the copy-back.
+            // Look at the next few instructions: TMP must be overwritten or we hit a barrier.
+            let mut tmp_dead = false;
+            let mut n = cb + 1;
+            let mut chk_count = 0;
+            while n < len && chk_count < 8 {
+                if infos[n].is_nop() { n += 1; continue; }
+                if infos[n].is_barrier() {
+                    // At a barrier (label, jmp, ret, etc.), TMP is effectively dead
+                    // for local analysis purposes
+                    tmp_dead = true;
+                    break;
+                }
+                if infos[n].reg_refs & tmp_bit != 0 {
+                    // TMP is referenced after copy-back
+                    match infos[n].kind {
+                        // TMP is overwritten → dead
+                        LineKind::Other { dest_reg } if dest_reg == tmp_family => { tmp_dead = true; break; }
+                        LineKind::LoadRbp { reg, .. } if reg == tmp_family => { tmp_dead = true; break; }
+                        _ => {
+                            // TMP is read after copy-back → can't coalesce
+                            break;
+                        }
+                    }
+                }
+                chk_count += 1;
+                n += 1;
+            }
+            // If we scanned 8 instructions without finding a ref to TMP, assume dead
+            if chk_count >= 8 { tmp_dead = true; }
+
+            if !tmp_dead { i += 1; continue; }
+
+            // Apply: remove copy-out, replace TMP with SRC in intermediate ops, remove copy-back
+            mark_nop(&mut infos[i]);
+            for mid in (i + 1)..cb {
+                if infos[mid].is_nop() { continue; }
+                if infos[mid].reg_refs & tmp_bit != 0 {
+                    let old_text = store.get(mid).to_string();
+                    let new_text = replace_reg_family(&old_text, tmp_family, src_family);
+                    if new_text != old_text {
+                        replace_line(store, &mut infos[mid], mid, new_text);
+                    }
+                }
+            }
+            mark_nop(&mut infos[cb]);
+
+            changed = true;
+            i = cb + 1;
+            continue;
+        }
+        i += 1;
+    }
+    changed
+}
+
+// ── Loop-invariant GPR load hoisting ─────────────────────────────────────────
+//
+// Hoists stack loads that are invariant across a loop body to just before the
+// loop header. Generalizes promote_loop_invariant_fp_load to GPR loads.
+//
+// Pattern:
+//   .LBB_header:
+//     ...
+//   .LBB_body:
+//     movq OFFSET(%rsp), %REG   ← invariant load (OFFSET not written in loop)
+//     ...use %REG...
+//     jmp .LBB_header            ← back-edge
+//
+// Transformed to:
+//   movq OFFSET(%rsp), %REG     ← hoisted before header
+//   .LBB_header:
+//     ...
+//   .LBB_body:
+//     ...use %REG...             ← load removed
+//     jmp .LBB_header
+
+pub(super) fn hoist_loop_invariant_gpr_load(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    let mut changed = false;
+
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() { i += 1; continue; }
+        if infos[i].kind != LineKind::Jmp { i += 1; continue; }
+        let jmp_text = infos[i].trimmed(store.get(i));
+        if !jmp_text.starts_with("jmp ") { i += 1; continue; }
+        let target = &jmp_text[4..];
+        let target_label = format!("{}:", target);
+
+        // Find the target label (must be before the jmp = back-edge)
+        let mut header_pos = None;
+        for lbl in 0..i {
+            if infos[lbl].kind == LineKind::Label {
+                if infos[lbl].trimmed(store.get(lbl)) == target_label {
+                    header_pos = Some(lbl);
+                    break;
+                }
+            }
+        }
+        let header = match header_pos {
+            Some(h) => h,
+            None => { i += 1; continue; }
+        };
+
+        // Validate this is a real loop: the range [header..=i] must not contain
+        // a ret instruction (which would indicate the range spans the epilogue
+        // and is not a natural loop body).
+        let mut has_ret = false;
+        let mut has_call = false;
+        for chk in header..=i {
+            if infos[chk].is_nop() { continue; }
+            match infos[chk].kind {
+                LineKind::Ret => { has_ret = true; break; }
+                LineKind::Call => { has_call = true; }
+                _ => {}
+            }
+        }
+        if has_ret { i += 1; continue; }
+
+        // Loop body is [header..=i]. Find the body start (first label after header).
+        let mut body_start = header;
+        for pos in header + 1..i {
+            if infos[pos].kind == LineKind::Label {
+                body_start = pos;
+                break;
+            }
+        }
+
+        // Scan body for movq OFFSET(%rsp), %REG (or %rbp) candidates.
+        // Only hoist one load per loop per pass (to avoid interactions).
+        // Skip loops with function calls — caller-saved regs could be clobbered.
+        if has_call { i += 1; continue; }
+        let mut hoisted_one = false;
+        for pos in body_start + 1..i {
+            if hoisted_one { break; }
+            if infos[pos].is_nop() { continue; }
+
+            // Match: movq OFFSET(%rsp), %REG or movq OFFSET(%rbp), %REG
+            let t = infos[pos].trimmed(store.get(pos));
+            if !t.starts_with("movq ") { continue; }
+            // Parse: "movq SRC, %DST"
+            let after_movq = &t[5..];
+            let comma = match after_movq.find(", %") {
+                Some(c) => c,
+                None => continue,
+            };
+            let src_part = &after_movq[..comma];
+            let dst_part = &after_movq[comma + 2..]; // includes %
+
+            // Source must be a stack slot
+            if !src_part.ends_with("(%rsp)") && !src_part.ends_with("(%rbp)") { continue; }
+            // Destination must be a GP register
+            let dst_family = register_family_fast(dst_part);
+            if dst_family == REG_NONE || dst_family > REG_GP_MAX { continue; }
+            // Don't hoist into rax/rcx (accumulator) or rsp/rbp
+            // Skip rax (primary accumulator), rsp, rbp (frame registers)
+            if dst_family == 0 || dst_family == 4 || dst_family == 5 { continue; }
+
+            // Parse the numeric offset
+            let offset_end = src_part.find('(').unwrap_or(src_part.len());
+            let numeric_offset: i32 = src_part[..offset_end].parse().unwrap_or(i32::MIN);
+            if numeric_offset == i32::MIN { continue; }
+
+            // Check: the stack slot is NOT written anywhere in [header..=i]
+            let mut slot_written = false;
+            for chk in header..=i {
+                if infos[chk].is_nop() { continue; }
+                if let LineKind::StoreRbp { offset: o, .. } = infos[chk].kind {
+                    if o == numeric_offset { slot_written = true; break; }
+                }
+                // Also check Other instructions that store to this offset
+                let ct = infos[chk].trimmed(store.get(chk));
+                if ct.ends_with(src_part) && (ct.starts_with("movq ") || ct.starts_with("movl ")
+                    || ct.starts_with("movb ") || ct.starts_with("movw ")) {
+                    // This could be a store TO this slot
+                    if let Some(c) = ct.find(", ") {
+                        if ct[c + 2..] == *src_part {
+                            slot_written = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if slot_written { continue; }
+
+            // Check: the destination register is NOT written by any other instruction
+            // in [header..=i] besides this load. Also check it's not used as a
+            // destination in any other instruction.
+            let dst_bit = 1u16 << dst_family;
+            let mut reg_written_elsewhere = false;
+            for chk in header..=i {
+                if chk == pos { continue; } // skip the load itself
+                if infos[chk].is_nop() { continue; }
+                match infos[chk].kind {
+                    LineKind::Other { dest_reg } if dest_reg == dst_family => {
+                        reg_written_elsewhere = true;
+                        break;
+                    }
+                    LineKind::LoadRbp { reg, .. } if reg == dst_family => {
+                        reg_written_elsewhere = true;
+                        break;
+                    }
+                    LineKind::Call => {
+                        // Calls clobber caller-saved regs. If dst is caller-saved, bail.
+                        if !is_callee_saved_reg(dst_family) {
+                            reg_written_elsewhere = true;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if reg_written_elsewhere { continue; }
+
+            // All checks passed. Hoist the load before the header.
+            let load_text = store.get(pos).to_string();
+            // Insert by replacing the header label line with: load + \n + label
+            let header_text = store.get(header).to_string();
+            let new_header = format!("{}\n{}", load_text.trim_end(), header_text.trim_end());
+            store.replace(header, new_header);
+            // Re-classify header (it's now multi-line but LineStore handles this)
+            // Actually, LineStore doesn't handle multi-line. We need a different approach.
+            // Instead: find an insertion point before the header and use it.
+
+            // Better approach: replace the header label with load + label on same logical slot
+            // by using the slot just before header if it exists.
+            // Revert: just mark the body load as NOP and insert before header.
+            store.replace(header, header_text); // undo
+
+            // Find a NOP slot before header, or use the line just before header
+            // by prepending the load instruction.
+            // Simplest: convert the load at `pos` to NOP, and insert the load
+            // at a position just before the header label.
+            // Since LineStore doesn't support insertion, we'll use the approach
+            // from promote_loop_invariant_fp_load: find a preheader instruction
+            // to append after.
+            // Actually, let's find if there's a preceding NOP or unused line.
+
+            // Alternative: find the store that wrote this value before the loop.
+            // Replace that store's destination from stack to register directly.
+            // But that's complex. Let's just look for any NOP before header.
+            let mut insert_pos = None;
+            if header > 0 {
+                for p in (0..header).rev() {
+                    if infos[p].is_nop() {
+                        insert_pos = Some(p);
+                        break;
+                    }
+                    // Don't go past function boundaries
+                    if infos[p].kind == LineKind::Directive {
+                        let dt = infos[p].trimmed(store.get(p));
+                        if dt.starts_with(".size ") || dt.starts_with(".globl ") || dt.starts_with(".type ") {
+                            break;
+                        }
+                    }
+                    // Stop if we hit a non-trivial instruction without finding a NOP
+                    if p < header.saturating_sub(20) { break; }
+                }
+            }
+
+            if let Some(ins) = insert_pos {
+                // Use the NOP slot to place our hoisted load
+                replace_line(store, &mut infos[ins], ins, load_text.trim_end().to_string());
+                mark_nop(&mut infos[pos]); // remove original load
+                changed = true;
+                hoisted_one = true;
+            }
+            // If no NOP slot found, skip this optimization
+        }
+
+        i += 1;
+    }
+    changed
+}
+
+// ── Increment chain collapse ─────────────────────────────────────────────────
+//
+// Collapses a common SSA phi-resolution pattern for loop counter increments:
+//
+//   leaq 1(%SRC), %TMP1       →  addl $1, %SRCd
+//   movslq %TMP1d, %TMP2      →  movslq %SRCd, %SRC
+//   movq %TMP2, %SRC          →  (removed)
+//
+// Saves 1 instruction per loop iteration. Common in loop counter increments.
+
+pub(super) fn collapse_increment_chain(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+
+    while i < len {
+        if infos[i].is_nop() { i += 1; continue; }
+
+        // Match: leaq DISP(%SRC), %TMP1
+        let ti = infos[i].trimmed(store.get(i));
+        if !ti.starts_with("leaq ") { i += 1; continue; }
+
+        let after_leaq = &ti[5..];
+        let paren_open = match after_leaq.find('(') {
+            Some(p) => p,
+            None => { i += 1; continue; }
+        };
+        let disp_str = &after_leaq[..paren_open];
+        let paren_close = match after_leaq.find(')') {
+            Some(p) => p,
+            None => { i += 1; continue; }
+        };
+        let src_reg = &after_leaq[paren_open + 1..paren_close];
+        let after_paren = &after_leaq[paren_close + 1..];
+        if !after_paren.starts_with(", %") { i += 1; continue; }
+        let tmp1_reg_name = &after_paren[2..];
+
+        let src_family = register_family_fast(src_reg);
+        let tmp1_family = register_family_fast(tmp1_reg_name);
+        if src_family == REG_NONE || src_family > REG_GP_MAX { i += 1; continue; }
+        if tmp1_family == REG_NONE || tmp1_family > REG_GP_MAX { i += 1; continue; }
+        if src_family == tmp1_family || src_family <= 1 { i += 1; continue; }
+
+        let disp: i32 = match disp_str.parse() {
+            Ok(d) => d,
+            Err(_) => { i += 1; continue; }
+        };
+
+        // Next non-NOP: movslq %TMP1d, %TMP2
+        let j = next_non_nop(infos, i + 1, len);
+        if j >= len || infos[j].is_barrier() { i += 1; continue; }
+
+        let tj = infos[j].trimmed(store.get(j));
+        let tmp1_32 = REG_NAMES[1][tmp1_family as usize];
+        let expected_prefix = format!("movslq {}, %", tmp1_32);
+        if !tj.starts_with(&expected_prefix) { i += 1; continue; }
+        let tmp2_reg_str = &tj[expected_prefix.len() - 1..];
+        let tmp2_family = register_family_fast(tmp2_reg_str);
+        if tmp2_family == REG_NONE || tmp2_family > REG_GP_MAX { i += 1; continue; }
+
+        // Search for movq %TMP2, %SRC within a window of 4 non-NOP instructions
+        let src_64 = REG_NAMES[0][src_family as usize];
+        let expected_wb = format!("movq {}, {}", tmp2_reg_str, src_64);
+        let mut k = j + 1;
+        let mut wb_found = false;
+        let mut wb_count = 0;
+        while k < len && wb_count < 4 {
+            if infos[k].is_nop() { k += 1; continue; }
+            if infos[k].is_barrier() { break; }
+            let tk = infos[k].trimmed(store.get(k));
+            if tk == expected_wb { wb_found = true; break; }
+            wb_count += 1;
+            k += 1;
+        }
+        if !wb_found { i += 1; continue; }
+
+        // Check SRC not referenced between i+1 and k
+        let src_bit = 1u16 << src_family;
+        let mut src_ref = false;
+        for mid in (i + 1)..k {
+            if infos[mid].is_nop() { continue; }
+            if infos[mid].reg_refs & src_bit != 0 { src_ref = true; break; }
+        }
+        if src_ref { i += 1; continue; }
+
+        // Check TMPs dead after k
+        let tmp1_bit = 1u16 << tmp1_family;
+        let tmp2_bit = 1u16 << tmp2_family;
+        let mut tmps_dead = false;
+        let mut n = k + 1;
+        let mut chk = 0;
+        while n < len && chk < 8 {
+            if infos[n].is_nop() { n += 1; continue; }
+            if infos[n].is_barrier() { tmps_dead = true; break; }
+            if infos[n].reg_refs & tmp1_bit != 0 {
+                match infos[n].kind {
+                    LineKind::Other { dest_reg } if dest_reg == tmp1_family => {}
+                    LineKind::LoadRbp { reg, .. } if reg == tmp1_family => {}
+                    _ => break,
+                }
+            }
+            if tmp2_family != tmp1_family && infos[n].reg_refs & tmp2_bit != 0 {
+                match infos[n].kind {
+                    LineKind::Other { dest_reg } if dest_reg == tmp2_family => {}
+                    LineKind::LoadRbp { reg, .. } if reg == tmp2_family => {}
+                    _ => break,
+                }
+            }
+            chk += 1;
+            n += 1;
+        }
+        if chk >= 8 { tmps_dead = true; }
+        if !tmps_dead { i += 1; continue; }
+
+        // Flags safety check
+        let post = next_non_nop(infos, k + 1, len);
+        if post < len && !infos[post].is_barrier() {
+            let tp = infos[post].trimmed(store.get(post));
+            if tp.starts_with("ja") || tp.starts_with("jb") ||
+               tp.starts_with("je") || tp.starts_with("jn") ||
+               tp.starts_with("jg") || tp.starts_with("jl") ||
+               tp.starts_with("js") || tp.starts_with("jo") ||
+               tp.starts_with("set") || tp.starts_with("cmov") ||
+               tp.starts_with("adc") || tp.starts_with("sbb") {
+                i += 1; continue;
+            }
+        }
+
+        // Apply
+        let src_32 = REG_NAMES[1][src_family as usize];
+        let new_add = format!("    addl ${}, {}", disp, src_32);
+        let new_ext = format!("    movslq {}, {}", src_32, src_64);
+        replace_line(store, &mut infos[i], i, new_add);
+        replace_line(store, &mut infos[j], j, new_ext);
+        mark_nop(&mut infos[k]);
+
+        changed = true;
+        i = k + 1;
     }
     changed
 }
