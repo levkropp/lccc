@@ -1472,15 +1472,16 @@ fn insert_remainder_loop(
     }
 
     // Step 2: Create vec_exit block
-    // Computes j_rem_start = j_vec_final * vec_width
+    // Convert byte-offset IV back to element index for the scalar remainder loop:
+    // j_rem_start = byte_off_final / 8 (sizeof(double))
     let vec_exit_block = BasicBlock {
         label: vec_exit_label,
         instructions: vec![
             Instruction::BinOp {
                 dest: j_rem_start,
-                op: IrBinOp::Mul,
-                lhs: Operand::Value(pattern.iv),  // Final value of vectorized IV
-                rhs: Operand::Const(IrConst::I32(vec_width as i32)),
+                op: IrBinOp::SDiv,
+                lhs: Operand::Value(pattern.iv),  // Final byte offset
+                rhs: Operand::Const(IrConst::I32(8)),  // sizeof(double)
                 ty: IrType::I32,
             },
         ],
@@ -2232,16 +2233,22 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
         eprintln!("[VEC]   Loop contains blocks: {:?}", pattern.loop_blocks);
     }
 
-    // Step 1: Modify ALL comparisons in the loop that compare IV-derived values against the limit
-    // For AVX2: divide limit by 4 instead of 2
+    // Step 1: Convert loop IV from element index to byte offset.
+    // Instead of j=0..N/4 with GEP offset j*32, use byte_off=0..N*8 step 32.
+    // This eliminates the multiply in the inner loop (the biggest single win: -8 instructions).
+    //
+    // Changes:
+    //   - Loop limit: N/4 → N*8 (byte limit)
+    //   - IV increment: +1 → +32 (bytes per AVX2 iteration = 4 doubles × 8 bytes)
+    //   - GEP offset multiply: eliminated (IV IS the byte offset)
     {
-        // First, create the quartered limit value
-        let quartered_limit = match &pattern.limit {
-            Operand::Const(IrConst::I32(n)) => Operand::Const(IrConst::I32(*n / 4)),
-            Operand::Const(IrConst::I64(n)) => Operand::Const(IrConst::I64(*n / 4)),
+        // First, create the byte limit value (N * 8 bytes per double)
+        let byte_limit = match &pattern.limit {
+            Operand::Const(IrConst::I32(n)) => Operand::Const(IrConst::I32(*n * 8)),
+            Operand::Const(IrConst::I64(n)) => Operand::Const(IrConst::I64(*n * 8)),
             Operand::Value(limit_val) => {
-                // Dynamic limit: insert division in header
-                let div_dest = Value(next_val_id);
+                // Dynamic limit: insert multiply by 8 (sizeof(double)) in header
+                let mul_dest = Value(next_val_id);
                 next_val_id += 1;
 
                 let limit_ty = match &func.blocks[pattern.header_idx].instructions[pattern.exit_cmp_inst_idx] {
@@ -2249,25 +2256,25 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
                     _ => IrType::I64,
                 };
 
-                let div_inst = Instruction::BinOp {
-                    dest: div_dest,
-                    op: IrBinOp::UDiv,
+                let mul_inst = Instruction::BinOp {
+                    dest: mul_dest,
+                    op: IrBinOp::Mul,
                     lhs: Operand::Value(*limit_val),
                     rhs: Operand::Const(match limit_ty {
-                        IrType::I32 => IrConst::I32(4),  // Changed from 2
-                        IrType::I64 => IrConst::I64(4),  // Changed from 2
-                        _ => IrConst::I64(4),            // Changed from 2
+                        IrType::I32 => IrConst::I32(8),
+                        IrType::I64 => IrConst::I64(8),
+                        _ => IrConst::I64(8),
                     }),
                     ty: limit_ty,
                 };
 
-                func.blocks[pattern.header_idx].instructions.insert(pattern.exit_cmp_inst_idx, div_inst);
+                func.blocks[pattern.header_idx].instructions.insert(pattern.exit_cmp_inst_idx, mul_inst);
 
                 if debug {
-                    eprintln!("[VEC]   Inserted division for dynamic limit: udiv %N, 4 => Value({})", div_dest.0);
+                    eprintln!("[VEC]   Inserted multiply for dynamic byte limit: N * 8 => Value({})", mul_dest.0);
                 }
 
-                Operand::Value(div_dest)
+                Operand::Value(mul_dest)
             }
             _ => {
                 if debug {
@@ -2311,18 +2318,18 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
                             eprintln!("[VEC]   -> This is an IV comparison (will modify)");
                         }
 
-                        // Modify the comparison to use quartered limit
+                        // Modify the comparison to use byte limit (N * 8)
                         if modifies_lhs {
-                            *rhs = quartered_limit.clone();
+                            *rhs = byte_limit.clone();
                             changes += 1;
                             if debug {
-                                eprintln!("[VEC]   -> Modified comparison RHS to {:?}", quartered_limit);
+                                eprintln!("[VEC]   -> Modified comparison RHS to {:?}", byte_limit);
                             }
                         } else if modifies_rhs {
-                            *lhs = quartered_limit.clone();
+                            *lhs = byte_limit.clone();
                             changes += 1;
                             if debug {
-                                eprintln!("[VEC]   -> Modified comparison LHS to {:?}", quartered_limit);
+                                eprintln!("[VEC]   -> Modified comparison LHS to {:?}", byte_limit);
                             }
                         }
                     }
@@ -2331,13 +2338,14 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
         }
     }
 
-    // Step 2: Modify GEP offset calculation from IV*8 to IV*32 (4 elements × 8 bytes)
-    // Handle both explicit multiplies and strength-reduced pointer increments
+    // Step 2: Convert GEP offset to use byte-offset IV directly.
+    // The IV now represents a byte offset (0, 32, 64, ...) instead of an element index.
+    // Replace IV*8 multiplies with a Copy (the IV IS the byte offset).
+    // Also change the IV increment from +1 to +32.
     {
-        let mut found_any_mul = false;
-        let mut modified_any_increment = false;
-
-        // First, try to find and modify explicit IV * 8 multiplies to IV * 32
+        // 2a: Eliminate the IV * 8 multiply by replacing it with a Copy of the IV.
+        // The multiply's source (the IV or a cast of it) already holds the byte offset.
+        let mut eliminated_mul = false;
         for &block_idx in &innermost_blocks {
             let block = &mut func.blocks[block_idx];
             for inst in &mut block.instructions {
@@ -2346,162 +2354,84 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
                     op: IrBinOp::Mul,
                     lhs,
                     rhs,
-                    ty: _,
+                    ty,
                 } = inst
                 {
-                    found_any_mul = true;
-                    // Check if this multiply involves IV-derived values and scale factor 8
-                    let lhs_is_iv_derived = if let Operand::Value(v) = lhs {
-                        iv_derived.contains(v)
+                    let lhs_is_iv = if let Operand::Value(v) = lhs {
+                        iv_derived.contains(v) || gep_ivs.contains(v)
                     } else {
                         false
                     };
                     let rhs_is_8 = matches!(rhs, Operand::Const(IrConst::I64(8)) | Operand::Const(IrConst::I32(8)));
 
-                    if lhs_is_iv_derived && rhs_is_8 {
-                        // Change 8 to 32 (process 4 doubles = 32 bytes)
-                        *rhs = match rhs {
-                            Operand::Const(IrConst::I64(_)) => Operand::Const(IrConst::I64(32)),
-                            Operand::Const(IrConst::I32(_)) => Operand::Const(IrConst::I32(32)),
-                            _ => Operand::Const(IrConst::I64(32)),
+                    if lhs_is_iv && rhs_is_8 {
+                        // Replace multiply with a Copy: the IV already holds the byte offset
+                        let mul_dest = *dest;
+                        let src = lhs.clone();
+                        *inst = Instruction::Copy {
+                            dest: mul_dest,
+                            src,
                         };
+                        eliminated_mul = true;
                         changes += 1;
-                        modified_any_increment = true;
                         if debug {
-                            eprintln!("[VEC]   Changed GEP stride from 8 to 32 for Value({})", dest.0);
+                            eprintln!("[VEC]   Eliminated IV*8 multiply for Value({}) (IV is now byte offset)", mul_dest.0);
                         }
                     }
                 }
-            }
-        }
+                // Also handle Shl by 3 (= multiply by 8)
+                if let Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::Shl,
+                    lhs,
+                    rhs,
+                    ty: _,
+                } = inst
+                {
+                    let lhs_is_iv = if let Operand::Value(v) = lhs {
+                        iv_derived.contains(v) || gep_ivs.contains(v)
+                    } else {
+                        false
+                    };
+                    let rhs_is_3 = matches!(rhs, Operand::Const(IrConst::I64(3)) | Operand::Const(IrConst::I32(3)));
 
-        // If no IV*8 multiplies found, the loop is strength-reduced
-        // Look for pointer increments (ptr + 8) and change them to (ptr + 32)
-        if !modified_any_increment {
-            if debug {
-                eprintln!("[VEC]   No IV*8 multiplies found, searching for strength-reduced pointer increments");
-            }
-
-            // Build a set of pointer values that are used in GEPs for C and B arrays
-            let mut pointer_values = FxHashSet::default();
-            pointer_values.insert(pattern.c_gep);
-            pointer_values.insert(pattern.b_gep);
-
-            // Track pointer values through the loop (they flow through adds and GEPs)
-            for &block_idx in &innermost_blocks {
-                let block = &func.blocks[block_idx];
-                for inst in &block.instructions {
-                    match inst {
-                        Instruction::GetElementPtr { dest, base, .. } => {
-                            if pointer_values.contains(base) || pointer_values.contains(dest) {
-                                pointer_values.insert(*dest);
-                                pointer_values.insert(*base);
-                            }
-                        }
-                        Instruction::BinOp {
-                            dest,
-                            op: IrBinOp::Add,
-                            lhs,
-                            rhs: _,
-                            ty: _,
-                        } => {
-                            if let Operand::Value(lhs_val) = lhs {
-                                if pointer_values.contains(lhs_val) {
-                                    pointer_values.insert(*dest);
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            // Now find adds with constant 8 and change to 32
-            for &block_idx in &innermost_blocks {
-                let block = &mut func.blocks[block_idx];
-                for inst in &mut block.instructions {
-                    if let Instruction::BinOp {
-                        dest,
-                        op: IrBinOp::Add,
-                        lhs,
-                        rhs,
-                        ty: _,
-                    } = inst
-                    {
-                        let is_pointer = if let Operand::Value(v) = lhs {
-                            pointer_values.contains(v)
-                        } else {
-                            false
+                    if lhs_is_iv && rhs_is_3 {
+                        let shl_dest = *dest;
+                        let src = lhs.clone();
+                        *inst = Instruction::Copy {
+                            dest: shl_dest,
+                            src,
                         };
-                        let is_8 = matches!(rhs, Operand::Const(IrConst::I64(8)) | Operand::Const(IrConst::I32(8)));
-
-                        if is_pointer && is_8 {
-                            *rhs = match rhs {
-                                Operand::Const(IrConst::I64(_)) => Operand::Const(IrConst::I64(32)),  // Changed from 16
-                                Operand::Const(IrConst::I32(_)) => Operand::Const(IrConst::I32(32)),  // Changed from 16
-                                _ => Operand::Const(IrConst::I64(32)),                                 // Changed from 16
-                            };
-                            changes += 1;
-                            modified_any_increment = true;
-                            if debug {
-                                eprintln!("[VEC]   Changed pointer increment from 8 to 32 for Value({})", dest.0);
-                            }
+                        eliminated_mul = true;
+                        changes += 1;
+                        if debug {
+                            eprintln!("[VEC]   Eliminated IV<<3 shift for Value({}) (IV is now byte offset)", shl_dest.0);
                         }
                     }
                 }
             }
         }
 
-        // Last resort: insert explicit multiply by 4 before GEPs
-        if !modified_any_increment {
-            if debug {
-                eprintln!("[VEC]   No explicit strides found, inserting multiply by 4 before GEPs");
-            }
-
-            let mut geps_to_modify = Vec::new();
-            for &block_idx in &innermost_blocks {
-                let block = &func.blocks[block_idx];
-                for (inst_idx, inst) in block.instructions.iter().enumerate() {
-                    if let Instruction::GetElementPtr { dest, base: _, offset, ty } = inst {
-                        if *dest == pattern.b_gep || *dest == pattern.c_gep {
-                            if let Operand::Value(offset_val) = offset {
-                                geps_to_modify.push((block_idx, inst_idx, *offset_val, *ty));
-                            }
-                        }
-                    }
-                }
-            }
-
-            for (block_idx, inst_idx, offset_val, offset_ty) in geps_to_modify.into_iter().rev() {
-                let mul_dest = Value(next_val_id);
-                next_val_id += 1;
-
-                let mul_inst = Instruction::BinOp {
-                    dest: mul_dest,
-                    op: IrBinOp::Mul,
-                    lhs: Operand::Value(offset_val),
-                    rhs: Operand::Const(IrConst::I64(4)),  // Changed from 2
-                    ty: offset_ty,
-                };
-
-                // Insert mul before the GEP
-                func.blocks[block_idx].instructions.insert(inst_idx, mul_inst);
-
-                // Update the GEP's offset (now at inst_idx + 1 due to insertion)
-                if let Instruction::GetElementPtr { offset, .. } = &mut func.blocks[block_idx].instructions[inst_idx + 1] {
-                    *offset = Operand::Value(mul_dest);
+        // 2b: Change the IV increment from +1 to +32 (4 doubles × 8 bytes).
+        // The IV increment is at pattern.iv_inc_idx in the latch block.
+        {
+            let latch = &mut func.blocks[pattern.latch_idx];
+            if pattern.iv_inc_idx < latch.instructions.len() {
+                if let Instruction::BinOp { op: IrBinOp::Add, rhs, .. } = &mut latch.instructions[pattern.iv_inc_idx] {
+                    *rhs = match rhs {
+                        Operand::Const(IrConst::I32(_)) => Operand::Const(IrConst::I32(32)),
+                        _ => Operand::Const(IrConst::I64(32)),
+                    };
                     changes += 1;
-                    modified_any_increment = true;
                     if debug {
-                        eprintln!("[VEC]   Inserted mul and updated GEP offset: Value({}) = Value({}) * 4",
-                            mul_dest.0, offset_val.0);
+                        eprintln!("[VEC]   Changed IV increment from +1 to +32");
                     }
                 }
             }
+        }
 
-            if debug && !modified_any_increment {
-                eprintln!("[VEC]   Warning: Could not modify GEP offsets");
-            }
+        if debug && !eliminated_mul {
+            eprintln!("[VEC]   Warning: Could not find IV*8 multiply to eliminate");
         }
     }
 
