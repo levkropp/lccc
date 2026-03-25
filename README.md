@@ -75,7 +75,7 @@ All outputs are byte-identical to GCC.
 | `sieve` — primes to 10 M | 0.048 s | 0.044 s | 1.1× | Phi-copy coalescing, sign-ext fusion, loop rotation |
 | `qsort` — sort 1 M integers | 0.122 s | 0.101 s | 1.2× | Push/pop callee saves, memory-operand codegen |
 | `fib(40)` — recursive Fibonacci | **0.001 s** | 0.136 s | **478× faster** | Binary recursion → iterative accumulator |
-| `matmul` — 256×256 double | 0.008 s | 0.005 s | 1.6× | AVX2 FMA3 `vfmadd231pd`, cascaded shift fold, loop rotation |
+| `matmul` — 256×256 double | 0.006 s | 0.005 s | **1.2×** | AVX2 FMA3 `vfmadd231pd`, byte-offset IV, IVSR correctness fix |
 | `reduction` — sum 10M doubles | **Vectorized** | Scalar | **~2.7× faster** | AVX2 4-wide + horizontal reduction |
 | `tce_sum` — tail-recursive sum(10M) | **0.007 s** | 0.001 s | 7× | TCE + phi-copy coalescing (GCC constant-folds entire call) |
 
@@ -91,8 +91,10 @@ All outputs are byte-identical to GCC.
   phi-copy coalescing eliminates SSA temp copies, sign-extend fusion retargets `movslq` directly,
   loop rotation moves the condition to the latch (1 branch vs 2), and the latch optimizer
   eliminates redundant self sign-extends.
-- **MatMul 1.6×**: AVX2 vectorization with FMA3 (`vfmadd231pd`), cascaded shift folding
-  (`shlq $3 + shlq $2` → `shlq $5`), loop rotation, increment chain collapse.
+- **MatMul 1.2×**: AVX2 vectorization with FMA3 (`vfmadd231pd`). Phase 16 converted
+  the inner loop IV from element index (j*32) to byte offset (step 32), eliminating the
+  shift from the critical path. Fixed IVSR correctness bug that caused wrong output on
+  nested-loop 2D array patterns.
 - **TCE sum 7×**: GCC constant-folds `sum(10000000, 0)` entirely at compile time (no loop at all).
   LCCC's TCE converts recursion to a loop; phi-copy chain coalescing reduces the loop body from
   5 to 3 instructions. On non-constant inputs, LCCC is 2.3× of GCC.
