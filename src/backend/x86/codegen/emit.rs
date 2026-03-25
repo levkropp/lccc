@@ -457,6 +457,54 @@ impl X86Codegen {
         }
     }
 
+    /// Load an operand into a target register using 32-bit movl (for I32/U32).
+    /// Uses movl instead of movq for both register-to-register and stack loads,
+    /// reducing memory bandwidth and breaking false dependencies.
+    pub(super) fn operand_to_reg_32(&mut self, op: &Operand, target: PhysReg) {
+        let target_name = phys_reg_name(target);
+        let target_32 = phys_reg_name_32(target);
+        match op {
+            Operand::Const(c) => {
+                match c {
+                    IrConst::I8(0) | IrConst::I16(0) | IrConst::I32(0) | IrConst::I64(0) | IrConst::Zero =>
+                        self.state.emit_fmt(format_args!("    xorl %{0}, %{0}", target_32)),
+                    IrConst::I8(v) => self.state.emit_fmt(format_args!("    movl ${}, %{}", *v as i32, target_32)),
+                    IrConst::I16(v) => self.state.emit_fmt(format_args!("    movl ${}, %{}", *v as i32, target_32)),
+                    IrConst::I32(v) => self.state.emit_fmt(format_args!("    movl ${}, %{}", *v, target_32)),
+                    _ => {
+                        self.operand_to_callee_reg(op, target);
+                        return;
+                    }
+                }
+            }
+            Operand::Value(v) => {
+                if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                    if reg.0 != target.0 {
+                        if is_xmm_reg(reg) {
+                            let xmm_name = phys_reg_name(reg);
+                            self.state.emit_fmt(format_args!("    movq %{}, %{}", xmm_name, target_name));
+                        } else {
+                            let src_32 = phys_reg_name_32(reg);
+                            self.state.emit_fmt(format_args!("    movl %{}, %{}", src_32, target_32));
+                        }
+                    }
+                } else if let Some(slot) = self.state.get_slot(v.0) {
+                    if self.state.is_alloca(v.0) {
+                        // Allocas are addresses, use 64-bit
+                        self.operand_to_callee_reg(op, target);
+                        return;
+                    } else {
+                        self.state.out.emit_instr_rbp_reg("    movl", slot.0, target_32);
+                    }
+                } else if self.state.reg_cache.acc_has(v.0, false) || self.state.reg_cache.acc_has(v.0, true) {
+                    self.state.emit_fmt(format_args!("    movl %eax, %{}", target_32));
+                } else {
+                    self.state.emit_fmt(format_args!("    xorl %{0}, %{0}", target_32));
+                }
+            }
+        }
+    }
+
     /// Load an operand into %rax. Uses the register cache to skip the load
     /// if the value is already in %rax.
     pub(super) fn operand_to_rax(&mut self, op: &Operand) {
@@ -567,6 +615,77 @@ impl X86Codegen {
         }
         // After storing to dest, %rax still holds dest's value
         self.state.reg_cache.set_acc(dest.0, false);
+    }
+
+    /// Store %eax (32-bit) to a value's location using movl instead of movq.
+    /// Breaks false dependencies on upper 32 bits and halves memory bandwidth
+    /// for stack spills. Only safe when all subsequent loads of this value also
+    /// use 32-bit form (movl or movslq).
+    pub(super) fn store_eax_to(&mut self, dest: &Value) {
+        if let Some(&reg) = self.reg_assignments.get(&dest.0) {
+            if is_xmm_reg(reg) {
+                let reg_name = phys_reg_name(reg);
+                self.state.emit_fmt(format_args!("    movq %rax, %{}", reg_name));
+            } else {
+                // GPR register: movl %eax, %regd (zero-extends upper 32 bits)
+                let reg_name_32 = phys_reg_name_32(reg);
+                self.state.emit_fmt(format_args!("    movl %eax, %{}", reg_name_32));
+            }
+        } else if let Some(slot) = self.state.get_slot(dest.0) {
+            // No register: store 32 bits to stack slot.
+            self.state.out.emit_instr_reg_rbp("    movl", "eax", slot.0);
+        }
+        self.state.reg_cache.set_acc(dest.0, false);
+    }
+
+    /// Load a value to %eax using movl (32-bit) from stack, or movl %regd, %eax
+    /// from a register. Pairs with store_eax_to for consistent 32-bit spill/reload.
+    pub(super) fn operand_to_eax(&mut self, op: &Operand) {
+        match op {
+            Operand::Const(c) => {
+                self.state.reg_cache.invalidate_acc();
+                match c {
+                    IrConst::I8(v) if *v == 0 => self.state.emit("    xorl %eax, %eax"),
+                    IrConst::I16(v) if *v == 0 => self.state.emit("    xorl %eax, %eax"),
+                    IrConst::I32(v) if *v == 0 => self.state.emit("    xorl %eax, %eax"),
+                    IrConst::I64(0) => self.state.emit("    xorl %eax, %eax"),
+                    IrConst::I8(v) => self.state.out.emit_instr_imm_reg("    movl", *v as i64, "eax"),
+                    IrConst::I16(v) => self.state.out.emit_instr_imm_reg("    movl", *v as i64, "eax"),
+                    IrConst::I32(v) => self.state.out.emit_instr_imm_reg("    movl", *v as i64, "eax"),
+                    IrConst::Zero => self.state.emit("    xorl %eax, %eax"),
+                    _ => {
+                        // Fallback to 64-bit for other const types
+                        self.operand_to_rax(op);
+                        return;
+                    }
+                }
+            }
+            Operand::Value(v) => {
+                let is_alloca = self.state.is_alloca(v.0);
+                if self.state.reg_cache.acc_has(v.0, is_alloca) {
+                    return; // cache hit
+                }
+                if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                    if is_xmm_reg(reg) {
+                        let reg_name = phys_reg_name(reg);
+                        self.state.emit_fmt(format_args!("    movq %{}, %rax", reg_name));
+                    } else {
+                        // GPR: movl %regd, %eax (32-bit)
+                        let reg_name_32 = phys_reg_name_32(reg);
+                        self.state.emit_fmt(format_args!("    movl %{}, %eax", reg_name_32));
+                    }
+                    self.state.reg_cache.set_acc(v.0, false);
+                } else if self.state.get_slot(v.0).is_some() {
+                    // Load from stack using movl (32-bit)
+                    let slot = self.state.get_slot(v.0).unwrap();
+                    self.state.out.emit_instr_rbp_reg("    movl", slot.0, "eax");
+                    self.state.reg_cache.set_acc(v.0, is_alloca);
+                } else {
+                    self.state.emit("    xorl %eax, %eax");
+                    self.state.reg_cache.invalidate_acc();
+                }
+            }
+        }
     }
 
     /// Check if a scale value is valid for x86-64 SIB (Scale-Index-Base) encoding.
@@ -1230,8 +1349,6 @@ impl X86Codegen {
             self.operand_to_callee_reg(lhs, dest_phys);
             if op == IrBinOp::Mul {
                 // LEA strength reduction: replace imul by 3/5/9 with lea.
-                // lea (%reg, %reg, scale), %reg computes reg + reg*scale = reg*(scale+1).
-                // lea has 1-cycle latency vs 3 cycles for imul on modern x86.
                 if let Some(scale) = Self::lea_scale_for_mul(imm) {
                     if use_32bit {
                         self.state.emit_fmt(format_args!(
