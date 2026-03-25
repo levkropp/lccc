@@ -1,7 +1,8 @@
 //! X86Codegen: prologue, epilogue, parameter storage.
 
-use crate::ir::reexports::{IrBinOp, IrFunction, Instruction, Terminator, Value};
+use crate::ir::reexports::{IrBinOp, IrFunction, Instruction, Operand, Terminator, Value};
 use crate::common::types::IrType;
+use crate::common::fx_hash::FxHashSet;
 use crate::backend::call_abi::{ParamClass, classify_params};
 use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
 use crate::backend::regalloc::PhysReg;
@@ -57,6 +58,7 @@ impl X86Codegen {
         let mut has_gep = false;       // GEP → indirect stores → emit_save_acc uses rdx
         let mut has_switch = false;    // Switch → jump tables use rdx
         let mut has_select = false;    // Select → cmov path uses rdx
+        let mut has_i32_widening = false; // Cast from I32/U32 to I64/pointer → needs sign-ext
         for block in &func.blocks {
             for inst in &block.instructions {
                 match inst {
@@ -78,6 +80,11 @@ impl X86Codegen {
                         if matches!(from_ty, IrType::I128 | IrType::U128)
                             || matches!(to_ty, IrType::I128 | IrType::U128) {
                             has_i128_ops = true;
+                        }
+                        // Detect I32/U32 widening to 64-bit: requires sign-extension.
+                        if matches!(from_ty, IrType::I32 | IrType::U32)
+                            && matches!(to_ty, IrType::I64 | IrType::U64 | IrType::Ptr) {
+                            has_i32_widening = true;
                         }
                     }
                     Instruction::Cmp { ty, .. }
@@ -112,6 +119,35 @@ impl X86Codegen {
         if !has_div_rem && !has_i128_ops && !has_gep && !has_switch && !has_select {
             caller_saved_regs.push(PhysReg(16)); // rdx
         }
+
+        // Build set of I32 values that need sign-extension (used in 64-bit contexts).
+        // Values NOT in this set can skip movslq after 32-bit register ALU ops.
+        // A value needs sext if it's: (a) a Cast source going to I64/U64/Ptr,
+        // (b) an operand of GetElementPtr, or (c) used in a 64-bit BinOp/Cmp.
+        let mut needs_sext_set: FxHashSet<u32> = FxHashSet::default();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::Cast { src, from_ty, to_ty, .. } => {
+                        if matches!(from_ty, IrType::I32 | IrType::U32)
+                            && matches!(to_ty, IrType::I64 | IrType::U64 | IrType::Ptr) {
+                            if let Operand::Value(v) = src {
+                                needs_sext_set.insert(v.0);
+                            }
+                        }
+                    }
+                    Instruction::GetElementPtr { base, offset, .. } => {
+                        needs_sext_set.insert(base.0);
+                        if let Operand::Value(v) = offset {
+                            needs_sext_set.insert(v.0);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.skip_i32_sext = !has_gep && needs_sext_set.is_empty();
+        self.needs_sext_values = needs_sext_set;
 
         let (reg_assigned, cached_liveness) = crate::backend::generation::run_regalloc_and_merge_clobbers(
             func, available_regs, caller_saved_regs, &asm_clobbered_regs,
