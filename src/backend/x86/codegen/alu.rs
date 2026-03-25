@@ -90,6 +90,36 @@ impl X86Codegen {
             return;
         }
 
+        // Memory-destination add: for in-place updates (a += expr) where dest/lhs share
+        // a stack slot and rhs is in a register. Emits `addl %reg, mem` which does NOT
+        // modify any register — breaks the serial %rax dependency chain for ILP.
+        // This is the key optimization for arith_loop: consecutive updates become
+        // independent since they no longer serialize through %rax.
+        if op == IrBinOp::Add {
+            if let Operand::Value(lhs_val) = lhs {
+                if self.dest_reg(dest).is_none() && self.dest_reg(lhs_val).is_none() {
+                    if let (Some(dest_slot), Some(lhs_slot)) =
+                        (self.state.get_slot(dest.0), self.state.get_slot(lhs_val.0))
+                    {
+                        if dest_slot.0 == lhs_slot.0 {
+                            if let Some(rhs_phys) = self.operand_reg(rhs) {
+                                let sref = self.slot_ref(dest_slot.0);
+                                if use_32bit {
+                                    let rhs_32 = super::emit::phys_reg_name_32(rhs_phys);
+                                    self.state.emit_fmt(format_args!("    addl %{}, {}", rhs_32, sref));
+                                } else {
+                                    let rhs_64 = super::emit::phys_reg_name(rhs_phys);
+                                    self.state.emit_fmt(format_args!("    addq %{}, {}", rhs_64, sref));
+                                }
+                                // NO cache invalidation — addl %reg,mem doesn't modify any register
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Memory-operand optimization: for Add/Sub/Mul, use memory source directly
         // instead of loading rhs into %rcx first.
         // Pattern: addq -N(%rbp), %rax  (saves one movq load instruction)
