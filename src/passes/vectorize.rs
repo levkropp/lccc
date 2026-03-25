@@ -2435,14 +2435,15 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
         }
     }
 
-    // Step 3: Replace the body accumulation with FmaF64x4
+    // Step 3: Replace the body accumulation with FmaF64x4.
+    // The A[i][k] load+broadcast is inside the FMA intrinsic but is loop-invariant.
+    // TODO: Hoist to preheader using BroadcastLoadF64 + FmaF64x4Hoisted intrinsics.
     {
         let body = &mut func.blocks[pattern.body_idx];
 
-        // Create FmaF64x4 intrinsic: writes directly to memory, no dest value.
         let intrinsic = Instruction::Intrinsic {
             dest: None,
-            op: IntrinsicOp::FmaF64x4,  // Changed from FmaF64x2
+            op: IntrinsicOp::FmaF64x4,
             dest_ptr: Some(pattern.c_gep),
             args: vec![
                 Operand::Value(pattern.a_ptr),
@@ -2450,26 +2451,20 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
             ],
         };
 
-        // Find the store instruction by scanning (store_idx may be stale after Step 2 insertions).
         let store_pos = body.instructions.iter().position(|inst| {
             matches!(inst, Instruction::Store { ptr, .. } if *ptr == pattern.c_gep)
         });
 
         if let Some(pos) = store_pos {
             body.instructions.insert(pos, intrinsic);
-            body.instructions.remove(pos + 1); // Remove the old store
+            body.instructions.remove(pos + 1);
         } else {
-            // Fallback: append intrinsic
             body.instructions.push(intrinsic);
         }
         changes += 1;
         if debug {
-            eprintln!("[VEC]   Inserted FmaF64x4 intrinsic, dest_ptr=Value({}), args=[Value({}), Value({})]",
-                pattern.c_gep.0, pattern.a_ptr.0, pattern.b_gep.0);
+            eprintln!("[VEC]   Inserted FmaF64x4 intrinsic");
         }
-
-        // The old load/mul/add instructions are now dead (their sole consumer, the store,
-        // was removed). DCE will clean them up in a subsequent pass iteration.
     }
 
     // Step 4: Create remainder loop blocks for N % 4 != 0
