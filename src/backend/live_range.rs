@@ -132,6 +132,10 @@ pub struct LinearScanAllocator {
 
     // Whether to enable interval splitting (advanced feature)
     pub enable_splitting: bool,
+
+    // Rotation index for register selection: start searching from this index
+    // instead of 0 to distribute consecutive allocations across different registers.
+    pub next_reg_idx: usize,
 }
 
 impl LinearScanAllocator {
@@ -147,6 +151,7 @@ impl LinearScanAllocator {
             available_regs,
             next_spill_slot: 0,
             enable_splitting: false,
+            next_reg_idx: 0,
         }
     }
 
@@ -204,7 +209,7 @@ impl LinearScanAllocator {
     /// 1. If there's a register hint from Copy sources, try that first
     /// 2. Find a register that's free for the entire duration of the range
     /// 3. If none, return None (caller will spill)
-    pub fn find_free_register(&self, range: &LiveRange) -> Option<PhysReg> {
+    pub fn find_free_register(&mut self, range: &LiveRange) -> Option<PhysReg> {
         // Try register hint first (for coalescing with Copy sources)
         if let Some(hint) = range.reg_hint {
             if self.is_register_free(hint, range.start)
@@ -214,8 +219,14 @@ impl LinearScanAllocator {
             }
         }
 
-        // Find any free register
-        for &reg in &self.available_regs {
+        // Find any free register, rotating the start index to distribute
+        // consecutive allocations across different registers for ILP.
+        let n = self.available_regs.len();
+        if n == 0 { return None; }
+        let start = self.next_reg_idx % n;
+        for offset in 0..n {
+            let idx = (start + offset) % n;
+            let reg = self.available_regs[idx];
             // Check if this register is free at the start of the range
             if self.is_register_free(reg, range.start) {
                 // Also check that no active interval uses this register
@@ -223,7 +234,6 @@ impl LinearScanAllocator {
                     .active
                     .iter()
                     .filter(|a| {
-                        // Check if any active interval uses this register
                         if let Some(assigned_reg) = self.assignments.get(&a.range.value_id) {
                             *assigned_reg == reg
                         } else {
@@ -233,6 +243,7 @@ impl LinearScanAllocator {
                     .all(|a| !a.range.overlaps_with(range));
 
                 if reg_free_throughout {
+                    self.next_reg_idx = idx + 1;
                     return Some(reg);
                 }
             }
