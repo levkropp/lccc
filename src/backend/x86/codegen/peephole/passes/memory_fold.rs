@@ -41,7 +41,7 @@ fn parse_alu_reg_reg(trimmed: &str) -> Option<(&str, &str, RegId, RegId)> {
         || b.starts_with(b"cmp")
     {
         3
-    } else if b.starts_with(b"test") {
+    } else if b.starts_with(b"test") || b.starts_with(b"imul") {
         4
     } else if b.starts_with(b"or")
         && b.len() > 2
