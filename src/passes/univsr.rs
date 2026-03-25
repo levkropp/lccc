@@ -603,7 +603,72 @@ fn revert_pointer_iv(func: &mut IrFunction, ptr_iv: &IvsrPointerIV) -> bool {
     // Update next_value_id cache
     func.next_value_id = next_val_id;
 
+    // Remove the dead pointer IV cycle: the pointer phi and its increment GEP.
+    // After reverting all uses to indexed addressing, the pointer phi and its
+    // backedge increment form a self-referencing cycle that DCE can't remove.
+    // If the pointer IV register is reused by the indexed addressing base,
+    // the increment corrupts the base address. Break the cycle by removing
+    // the increment GEP (replacing with a harmless Copy of the phi).
+    remove_dead_pointer_iv_cycle(func, ptr_iv);
+
     true
+}
+
+/// Remove the dead pointer IV cycle after reverting to indexed addressing.
+///
+/// After Un-IVSR transforms all Load/Store uses to use indexed GEPs, the pointer
+/// phi and its increment GEP form a dead cycle:
+///   %ptr = Phi(%init, %ptr_next)
+///   %ptr_next = GEP(%ptr, stride)
+///
+/// Standard DCE can't remove cycles (both values appear "used" by each other).
+/// If the register allocator assigns the pointer phi to the same register as the
+/// indexed GEP's base pointer, the increment corrupts the base address.
+///
+/// Fix: find the increment GEP (%ptr_next = GEP(%ptr, stride)) and replace it
+/// with a harmless Copy of the phi itself. This breaks the data dependency while
+/// preserving SSA validity. DCE can then remove both the Copy and the phi.
+fn remove_dead_pointer_iv_cycle(func: &mut IrFunction, ptr_iv: &IvsrPointerIV) {
+    let phi_id = ptr_iv.ptr_phi_dest.0;
+    let debug = std::env::var("CCC_DEBUG_UNIVSR").is_ok();
+
+    // Strategy: replace the pointer phi itself with a Copy of the base pointer.
+    // This breaks the phi→increment→phi cycle completely. The increment GEP
+    // then reads a constant base (not the incrementing pointer), making it dead
+    // code that DCE can remove.
+
+    for block in &mut func.blocks {
+        for inst in &mut block.instructions {
+            // Replace the phi with a Copy of the base pointer
+            if let Instruction::Phi { dest, .. } = inst {
+                if dest.0 == phi_id {
+                    if debug {
+                        eprintln!("[Un-IVSR]     Removing phi Value({}) → Copy of base Value({})",
+                                  phi_id, ptr_iv.base_ptr.0);
+                    }
+                    *inst = Instruction::Copy {
+                        dest: ptr_iv.ptr_phi_dest,
+                        src: Operand::Value(ptr_iv.base_ptr),
+                    };
+                    // Don't return — also need to handle the increment GEP
+                }
+            }
+            // Replace the increment GEP with a Copy (makes it dead code)
+            if let Instruction::GetElementPtr { dest, base, offset: Operand::Const(_), .. } = inst {
+                if base.0 == phi_id {
+                    if debug {
+                        eprintln!("[Un-IVSR]     Removing GEP({}) base=Value({})",
+                                  dest.0, base.0);
+                    }
+                    let gep_dest = *dest;
+                    *inst = Instruction::Copy {
+                        dest: gep_dest,
+                        src: Operand::Value(ptr_iv.base_ptr),
+                    };
+                }
+            }
+        }
+    }
 }
 
 /// Create an offset calculation instruction (multiply or shift)
