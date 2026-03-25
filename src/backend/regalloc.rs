@@ -263,6 +263,18 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // resolve_slot_addr() directly (not register-aware).
     remove_ineligible_operands(func, &mut eligible, config);
 
+    // --- 3-channel multiply ILP ---
+    //
+    // For loops with many multiply-accumulate patterns (a += b*c), we want 3
+    // independent multiply chains to fully utilize the CPU's multiply port
+    // (which has 3-cycle latency but 1-cycle throughput). The linear scan
+    // naturally provides 2 temp registers via rotation. By excluding every
+    // 3rd fusible multiply temp from allocation, it falls through to the
+    // accumulator path (%eax) in the codegen, creating a 3rd channel.
+    //
+    // Pattern: r12, rbx, %eax, r12, rbx, %eax, ...
+    exclude_every_third_mul_temp(func, &mut eligible);
+
     // --- Phi register coalescing ---
     //
     // For loop-carried phi variables, the backedge source value (the new value
@@ -700,13 +712,16 @@ fn find_best_callee_reg(
     best_already_used.or(best_new)
 }
 
-/// Exclude multiply temp values that are consumed by multiply-add fusion.
+/// Exclude every 3rd fusible multiply temp from register allocation.
 ///
-/// A value is a fused multiply temp if:
-/// 1. It is produced by BinOp::Mul (integer, not float/i128)
-/// 2. It has exactly one use across the entire function
-/// 3. That one use is as an operand of a BinOp::Add in the immediately following instruction
-fn exclude_fused_mul_temps(func: &IrFunction, eligible: &mut FxHashSet<u32>) {
+/// This creates a 3-channel multiply ILP pattern:
+/// - Channel 1: register-allocated temp (e.g., r12) via standard path
+/// - Channel 2: register-allocated temp (e.g., rbx) via standard path
+/// - Channel 3: unregistered temp → accumulator path (%eax) via mul-add fusion
+///
+/// With 3 independent multiply chains, the CPU can fully utilize the multiply
+/// port's throughput (1 imul/cycle) despite its 3-cycle latency.
+fn exclude_every_third_mul_temp(func: &IrFunction, eligible: &mut FxHashSet<u32>) {
     // Count uses per value
     let mut use_count: FxHashMap<u32, u32> = FxHashMap::default();
     for block in &func.blocks {
@@ -724,9 +739,10 @@ fn exclude_fused_mul_temps(func: &IrFunction, eligible: &mut FxHashSet<u32>) {
         });
     }
 
+    // Collect fusible multiply temps in program order
+    let mut fusible_temps: Vec<u32> = Vec::new();
     for block in &func.blocks {
         for (idx, inst) in block.instructions.iter().enumerate() {
-            // Look for BinOp::Mul with integer type
             let (mul_dest, mul_ty) = match inst {
                 Instruction::BinOp { dest, op: crate::ir::reexports::IrBinOp::Mul, ty, .. } => (dest, ty),
                 _ => continue,
@@ -734,18 +750,30 @@ fn exclude_fused_mul_temps(func: &IrFunction, eligible: &mut FxHashSet<u32>) {
             if mul_ty.is_float() || matches!(mul_ty, IrType::I128 | IrType::U128) {
                 continue;
             }
-            // Must have exactly 1 use
             if use_count.get(&mul_dest.0).copied().unwrap_or(0) != 1 {
                 continue;
             }
-            // Next instruction must be BinOp::Add that uses this multiply result
             if let Some(Instruction::BinOp { op: crate::ir::reexports::IrBinOp::Add, lhs, rhs, ty: add_ty, .. }) = block.instructions.get(idx + 1) {
                 let mul_is_operand = matches!(lhs, Operand::Value(v) if v.0 == mul_dest.0)
                     || matches!(rhs, Operand::Value(v) if v.0 == mul_dest.0);
                 if mul_is_operand && mul_ty == add_ty {
-                    eligible.remove(&mul_dest.0);
+                    fusible_temps.push(mul_dest.0);
                 }
             }
+        }
+    }
+
+    // Only apply the 3-channel pattern when there are enough fusible temps
+    // to benefit from ILP (at least 6 = two full rotations).
+    if fusible_temps.len() < 6 {
+        return;
+    }
+
+    // Exclude every 3rd temp (indices 2, 5, 8, 11, ...) from register allocation.
+    // These will use the accumulator path (%eax) via multiply-add fusion.
+    for (i, &temp_id) in fusible_temps.iter().enumerate() {
+        if i % 3 == 2 {
+            eligible.remove(&temp_id);
         }
     }
 }

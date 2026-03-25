@@ -1046,10 +1046,18 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
         // CondBranch terminator, emit a fused compare-and-conditional-jump
         // instead of materializing the boolean result to a register/stack slot.
         let fuse_idx = detect_cmp_branch_fusion(block, &value_use_counts);
+        let mul_add_fusions = detect_mul_add_fusions(block, &value_use_counts);
+        let mut skip_fused_add = false;
 
         for (idx, inst) in block.instructions.iter().enumerate() {
             if Some(idx) == fuse_idx {
                 // Skip this Cmp -- it will be emitted fused with the terminator
+                continue;
+            }
+            // Skip the Add that was already emitted as part of a fused Mul-Add.
+            // This flag is set by the Mul handler below when fusion fires.
+            if skip_fused_add {
+                skip_fused_add = false;
                 continue;
             }
             // Skip GEP instructions whose offset has been folded into Load/Store.
@@ -1072,6 +1080,26 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
                 if let Some(span) = block.source_spans.get(idx) {
                     emit_loc_directive(cg, span, source_mgr.expect("debug mode requires source manager"), file_table,
                                        &mut last_debug_file, &mut last_debug_line);
+                }
+            }
+
+            // Multiply-add fusion: when a Mul's result is not register-allocated
+            // and feeds directly into the next Add, emit a fused 3-instruction
+            // sequence through %eax. This creates a 3rd multiply ILP channel
+            // alongside the 2 register-allocated temp channels (r12, rbx).
+            if let Instruction::BinOp { dest, op: crate::ir::reexports::IrBinOp::Mul, lhs, rhs, ty } = inst {
+                if mul_add_fusions.contains(&(idx + 1)) {
+                    // Only fuse if the multiply temp is NOT register-allocated.
+                    // If it IS registered, the standard register-direct path is better.
+                    if cg.get_phys_reg_for_value(dest.0).is_none() {
+                        if let Some(Instruction::BinOp { dest: add_dest, lhs: add_lhs, rhs: add_rhs, ty: add_ty, .. }) = block.instructions.get(idx + 1) {
+                            let mul_is_lhs = matches!(add_lhs, Operand::Value(v) if v.0 == dest.0);
+                            let acc_op = if mul_is_lhs { add_rhs } else { add_lhs };
+                            cg.emit_fused_mul_add(dest, lhs, rhs, acc_op, add_dest, *add_ty);
+                            skip_fused_add = true; // skip the next Add instruction
+                            continue;
+                        }
+                    }
                 }
             }
 
