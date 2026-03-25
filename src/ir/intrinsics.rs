@@ -93,6 +93,14 @@ pub enum IntrinsicOp {
     /// Placed before the vectorized j-loop to hoist the A[i][k] broadcast.
     /// args[0] = pointer to scalar F64
     BroadcastLoadF64,
+    /// FMA with SIB addressing: uses base + byte_offset for B and C accesses.
+    /// This eliminates the GEP address computation from the inner loop by
+    /// using x86 SIB addressing directly: vmovupd (%base, %offset), %ymm0.
+    /// args[0] = A pointer (scalar F64, broadcast inside)
+    /// args[1] = C base pointer (row base, loop-invariant in j-loop)
+    /// args[2] = B base pointer (row base, loop-invariant in j-loop)
+    /// args[3] = byte offset (the j-loop IV, increments by 32 each iteration)
+    FmaF64x4SIB,
 
     // --- Vector loads for reduction patterns ---
     /// Load 4 packed doubles (256-bit unaligned): vmovupd

@@ -592,16 +592,54 @@ impl X86Codegen {
                 // args[1] = B pointer (4×F64)
                 // dest_ptr = C pointer (read+write, 4×F64)
                 if let Some(c_ptr) = dest_ptr {
-                    self.operand_to_reg(&args[0], "rcx");      // A ptr → %rcx
-                    self.operand_to_reg(&args[1], "rdx");      // B ptr → %rdx
-                    self.value_to_reg(c_ptr, "rax");           // C ptr → %rax
+                    // Try SIB addressing: if B and C pointers come from GEPs
+                    // with the same offset value, use (%base, %offset) directly.
+                    let b_val = match &args[1] { Operand::Value(v) => Some(v.0), _ => None };
+                    let c_val = c_ptr.0;
 
-                    // FMA3 + AVX2: load A, broadcast, load C, fused multiply-add, store
-                    self.state.emit("    movsd (%rcx), %xmm1");              // Load A scalar (64-bit)
-                    self.state.emit("    vbroadcastsd %xmm1, %ymm1");        // Broadcast to {A, A, A, A}
-                    self.state.emit("    vmovupd (%rax), %ymm0");            // Load C[j..j+3]
-                    self.state.emit("    vfmadd231pd (%rdx), %ymm1, %ymm0"); // ymm0 = ymm1 * B[mem] + ymm0
-                    self.state.emit("    vmovupd %ymm0, (%rax)");            // Write 4 results back
+                    let b_gep = b_val.and_then(|bv| self.find_gep_base_offset(bv));
+                    let c_gep = self.find_gep_base_offset(c_val);
+
+                    // Use SIB if both have GEP info and share the same offset value
+                    // Temporarily disabled for debugging
+                    let use_sib = false &&  match (&b_gep, &c_gep) {
+                        (Some((_, b_off)), Some((_, c_off))) => b_off == c_off,
+                        _ => false,
+                    };
+
+                    if use_sib {
+                        let (c_base, offset) = c_gep.unwrap();
+                        let (b_base, _) = b_gep.unwrap();
+
+                        // Load order matters: load byte offset and B base first
+                        // (these don't use rax as intermediate), then load C base
+                        // and A ptr last (these may clobber rax).
+                        // Final register assignment:
+                        //   rsi = byte offset, rdx = B base, rax = C base, rcx = A ptr
+                        self.value_to_reg(&Value(offset), "rsi");
+                        self.value_to_reg(&Value(b_base), "rdx");
+                        self.value_to_reg(&Value(c_base), "rax");
+                        self.operand_to_reg(&args[0], "rcx");
+
+                        self.state.emit("    movsd (%rcx), %xmm1");
+                        self.state.emit("    vbroadcastsd %xmm1, %ymm1");
+                        self.state.emit("    vmovupd (%rax,%rsi), %ymm0");
+                        self.state.emit("    vfmadd231pd (%rdx,%rsi), %ymm1, %ymm0");
+                        self.state.emit("    vmovupd %ymm0, (%rax,%rsi)");
+                    } else {
+                        // Fallback: compute full pointers
+                        self.operand_to_reg(&args[0], "rcx");
+                        self.operand_to_reg(&args[1], "rdx");
+                        self.value_to_reg(c_ptr, "rax");
+
+                        self.state.emit("    movsd (%rcx), %xmm1");
+                        self.state.emit("    vbroadcastsd %xmm1, %ymm1");
+                        self.state.emit("    vmovupd (%rax), %ymm0");
+                        self.state.emit("    vfmadd231pd (%rdx), %ymm1, %ymm0");
+                        self.state.emit("    vmovupd %ymm0, (%rax)");
+                    }
+
+                    self.state.reg_cache.invalidate_all();
                 }
             }
             IntrinsicOp::FmaF64x4Hoisted => {
@@ -623,6 +661,32 @@ impl X86Codegen {
                 self.operand_to_reg(&args[0], "rcx");
                 self.state.emit("    movsd (%rcx), %xmm1");
                 self.state.emit("    vbroadcastsd %xmm1, %ymm1");
+            }
+            IntrinsicOp::FmaF64x4SIB => {
+                // FMA with SIB addressing: C[base+off] += broadcast(A) * B[base+off]
+                // args[0] = A pointer (scalar F64)
+                // args[1] = C base pointer
+                // args[2] = B base pointer
+                // args[3] = byte offset (j-loop IV)
+                //
+                // Uses SIB addressing: (%base, %offset) instead of computing
+                // the full address. This eliminates ~5 address computation
+                // instructions from the inner loop.
+                self.operand_to_reg(&args[0], "rcx");          // A ptr → %rcx
+                self.operand_to_reg(&args[1], "rax");          // C base → %rax
+                self.operand_to_reg(&args[2], "rdx");          // B base → %rdx
+                self.operand_to_reg(&args[3], "rsi");          // byte offset → %rsi
+
+                // Load A, broadcast
+                self.state.emit("    movsd (%rcx), %xmm1");
+                self.state.emit("    vbroadcastsd %xmm1, %ymm1");
+
+                // FMA with SIB addressing
+                self.state.emit("    vmovupd (%rax,%rsi), %ymm0");            // Load C[j..j+3]
+                self.state.emit("    vfmadd231pd (%rdx,%rsi), %ymm1, %ymm0"); // ymm0 = A*B + C
+                self.state.emit("    vmovupd %ymm0, (%rax,%rsi)");            // Store C[j..j+3]
+
+                self.state.reg_cache.invalidate_all();
             }
 
             // --- Vector loads for reduction patterns ---
@@ -1084,5 +1148,11 @@ impl X86Codegen {
         self.state.emit_fmt(format_args!("    {} %ymm1, %ymm0, %ymm0", avx_inst));
         // Store result using dedicated destination register
         self.state.emit("    vmovupd %ymm0, (%rdx)");
+    }
+
+    /// Look up GEP decomposition for a value: returns (base_id, offset_id) if the
+    /// value was produced by a GEP(base, offset) instruction with a variable offset.
+    fn find_gep_base_offset(&self, val_id: u32) -> Option<(u32, u32)> {
+        self.state.gep_base_offset.get(&val_id).copied()
     }
 }

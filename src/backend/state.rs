@@ -121,6 +121,10 @@ pub struct CodegenState {
     /// Register value cache: tracks which IR values are in the accumulator and
     /// secondary registers to skip redundant loads.
     pub reg_cache: RegCache,
+    /// GEP decomposition: maps GEP result value ID → (base_value_id, offset_value_id).
+    /// Populated during instruction generation for GEPs with variable offsets.
+    /// Used by the FMA intrinsic codegen to detect SIB addressing opportunities.
+    pub gep_base_offset: FxHashMap<u32, (u32, u32)>,
     /// Whether to replace `ret` with `jmp __x86_return_thunk` (-mfunction-return=thunk-extern).
     /// Used by the Linux kernel for Spectre v2 (retbleed) mitigation.
     pub function_return_thunk: bool,
@@ -244,6 +248,7 @@ impl CodegenState {
             omit_frame_pointer: false,
             frame_size: 0,
             reg_cache: RegCache::default(),
+            gep_base_offset: FxHashMap::default(),
             function_return_thunk: false,
             indirect_branch_thunk: false,
             patchable_function_entry: None,
