@@ -2435,9 +2435,9 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
         }
     }
 
-    // Step 3: Replace the body accumulation with FmaF64x4.
-    // The A[i][k] load+broadcast is inside the FMA intrinsic but is loop-invariant.
-    // TODO: Hoist to preheader using BroadcastLoadF64 + FmaF64x4Hoisted intrinsics.
+    // Step 3: Replace the body with FmaF64x4.
+    // The FMA codegen handles SIB addressing automatically when it detects
+    // that its pointer arguments come from GEP instructions.
     {
         let body = &mut func.blocks[pattern.body_idx];
 

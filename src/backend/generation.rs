@@ -1202,6 +1202,10 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction, gep_fold_m
             }
         }
         Instruction::GetElementPtr { dest, base, offset, .. } => {
+            // Record GEP decomposition for SIB addressing in FMA intrinsics
+            if let Operand::Value(off_val) = offset {
+                cg.state().gep_base_offset.insert(dest.0, (base.0, off_val.0));
+            }
             cg.emit_gep(dest, base, offset);
         }
         Instruction::GlobalAddr { dest, name } => {

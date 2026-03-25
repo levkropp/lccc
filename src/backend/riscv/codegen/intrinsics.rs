@@ -282,7 +282,7 @@ impl RiscvCodegen {
             | IntrinsicOp::Pinsrb128 | IntrinsicOp::Pextrb128
             | IntrinsicOp::Pinsrq128 | IntrinsicOp::Pextrq128
             | IntrinsicOp::FmaF64x2 | IntrinsicOp::FmaF64x4
-            | IntrinsicOp::FmaF64x4Hoisted | IntrinsicOp::BroadcastLoadF64
+            | IntrinsicOp::FmaF64x4Hoisted | IntrinsicOp::BroadcastLoadF64 | IntrinsicOp::FmaF64x4SIB
             | IntrinsicOp::LoadF64x4 | IntrinsicOp::LoadF64x2
             | IntrinsicOp::LoadI32x8 | IntrinsicOp::LoadI32x4
             | IntrinsicOp::AddF64x4 | IntrinsicOp::AddF64x2

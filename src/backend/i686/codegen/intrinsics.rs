@@ -156,7 +156,7 @@ impl I686Codegen {
             }
             // FmaF64x2, FmaF64x4, and reduction intrinsics are x86-64 SSE2/AVX2 intrinsics; not implemented on i686.
             IntrinsicOp::FmaF64x2 | IntrinsicOp::FmaF64x4 |
-            IntrinsicOp::FmaF64x4Hoisted | IntrinsicOp::BroadcastLoadF64 |
+            IntrinsicOp::FmaF64x4Hoisted | IntrinsicOp::BroadcastLoadF64 | IntrinsicOp::FmaF64x4SIB |
             IntrinsicOp::LoadF64x4 | IntrinsicOp::LoadF64x2 |
             IntrinsicOp::LoadI32x8 | IntrinsicOp::LoadI32x4 |
             IntrinsicOp::AddF64x4 | IntrinsicOp::AddF64x2 |
