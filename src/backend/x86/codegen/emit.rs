@@ -13,7 +13,7 @@ use crate::ir::reexports::{
     Value,
 };
 use crate::common::types::{AddressSpace, IrType};
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::backend::common::PtrDirective;
 use crate::backend::state::{CodegenState, StackSlot};
 use crate::backend::traits::ArchCodegen;
@@ -214,6 +214,12 @@ pub struct X86Codegen {
     pub(super) no_sse: bool,
     /// Current function being generated (needed for indexed addressing detection).
     pub(super) current_func: Option<*const IrFunction>,
+    /// When true, skip movslq sign-extension after 32-bit ALU ops on registers
+    /// for values NOT in needs_sext_values. Set when no GEPs and no widening casts.
+    pub(super) skip_i32_sext: bool,
+    /// Set of value IDs that need sign-extension because they're used in 64-bit
+    /// contexts (Cast to I64, GEP operands). Values NOT in this set can skip movslq.
+    pub(super) needs_sext_values: FxHashSet<u32>,
     /// IVSR pointer detection results: maps pointer phi value ID to its metadata
     pub(super) ivsr_pointers: FxHashMap<u32, IvsrPointerInfo>,
     /// Maps IVSR pointer phi to original loop counter value ID
@@ -248,6 +254,8 @@ impl X86Codegen {
             reg_assignments: FxHashMap::default(),
             used_callee_saved: Vec::new(),
             no_sse: false,
+            skip_i32_sext: false,
+            needs_sext_values: FxHashSet::default(),
             current_func: None,
             ivsr_pointers: FxHashMap::default(),
             pointer_to_counter: FxHashMap::default(),
@@ -341,6 +349,19 @@ impl X86Codegen {
         if !is_unsigned {
             self.state.out.emit_instr_reg_reg("    movslq", name_32, name_64);
         }
+    }
+
+    /// Like emit_sext32_if_needed but skips movslq when the destination value
+    /// has no 64-bit uses (not in needs_sext_values).
+    pub(super) fn emit_sext32_for_value(&mut self, name_32: &str, name_64: &str, is_unsigned: bool, dest_id: u32) {
+        if is_unsigned { return; }
+        // Per-value check: if we computed the set and this value isn't in it, skip
+        if !self.needs_sext_values.is_empty() && !self.needs_sext_values.contains(&dest_id) {
+            return;
+        }
+        // Function-level fallback: skip if no values need sext at all
+        if self.skip_i32_sext { return; }
+        self.state.out.emit_instr_reg_reg("    movslq", name_32, name_64);
     }
 
     /// Emit a comparison instruction, optionally using 32-bit form for I32/U32 types.
@@ -1340,7 +1361,7 @@ impl X86Codegen {
 
     /// Register-direct path for simple ALU ops (add/sub/and/or/xor/mul).
     pub(super) fn emit_alu_reg_direct(&mut self, op: IrBinOp, lhs: &Operand, rhs: &Operand,
-                           dest_phys: PhysReg, use_32bit: bool, is_unsigned: bool) {
+                           dest_phys: PhysReg, use_32bit: bool, is_unsigned: bool, dest_value_id: u32) {
         let dest_name = phys_reg_name(dest_phys);
         let dest_name_32 = phys_reg_name_32(dest_phys);
 
@@ -1353,14 +1374,14 @@ impl X86Codegen {
                     if use_32bit {
                         self.state.emit_fmt(format_args!(
                             "    leal (%{}, %{}, {}), %{}", dest_name_32, dest_name_32, scale, dest_name_32));
-                        self.emit_sext32_if_needed(dest_name_32, dest_name, is_unsigned);
+                        self.emit_sext32_for_value(dest_name_32, dest_name, is_unsigned, dest_value_id);
                     } else {
                         self.state.emit_fmt(format_args!(
                             "    leaq (%{}, %{}, {}), %{}", dest_name, dest_name, scale, dest_name));
                     }
                 } else if use_32bit {
                     self.state.emit_fmt(format_args!("    imull ${}, %{}, %{}", imm, dest_name_32, dest_name_32));
-                    self.emit_sext32_if_needed(dest_name_32, dest_name, is_unsigned);
+                    self.emit_sext32_for_value(dest_name_32, dest_name, is_unsigned, dest_value_id);
                 } else {
                     self.state.emit_fmt(format_args!("    imulq ${}, %{}, %{}", imm, dest_name, dest_name));
                 }
@@ -1368,7 +1389,7 @@ impl X86Codegen {
                 let mnemonic = alu_mnemonic(op);
                 if use_32bit && matches!(op, IrBinOp::Add | IrBinOp::Sub) {
                     self.state.emit_fmt(format_args!("    {}l ${}, %{}", mnemonic, imm, dest_name_32));
-                    self.emit_sext32_if_needed(dest_name_32, dest_name, is_unsigned);
+                    self.emit_sext32_for_value(dest_name_32, dest_name, is_unsigned, dest_value_id);
                 } else {
                     self.state.emit_fmt(format_args!("    {}q ${}, %{}", mnemonic, imm, dest_name));
                 }
@@ -1397,7 +1418,7 @@ impl X86Codegen {
         if op == IrBinOp::Mul {
             if use_32bit {
                 self.state.out.emit_instr_reg_reg("    imull", &rhs_reg_name_32, dest_name_32);
-                self.emit_sext32_if_needed(dest_name_32, dest_name, is_unsigned);
+                self.emit_sext32_for_value(dest_name_32, dest_name, is_unsigned, dest_value_id);
             } else {
                 self.state.out.emit_instr_reg_reg("    imulq", &rhs_reg_name, dest_name);
             }
@@ -1405,7 +1426,7 @@ impl X86Codegen {
             let mnemonic = alu_mnemonic(op);
             if use_32bit && matches!(op, IrBinOp::Add | IrBinOp::Sub) {
                 self.state.emit_fmt(format_args!("    {}l %{}, %{}", mnemonic, rhs_reg_name_32, dest_name_32));
-                self.emit_sext32_if_needed(dest_name_32, dest_name, is_unsigned);
+                self.emit_sext32_for_value(dest_name_32, dest_name, is_unsigned, dest_value_id);
             } else {
                 self.state.emit_fmt(format_args!("    {}q %{}, %{}", mnemonic, rhs_reg_name, dest_name));
             }

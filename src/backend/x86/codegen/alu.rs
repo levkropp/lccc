@@ -76,7 +76,7 @@ impl X86Codegen {
             let is_simple_alu = matches!(op, IrBinOp::Add | IrBinOp::Sub | IrBinOp::And
                 | IrBinOp::Or | IrBinOp::Xor | IrBinOp::Mul);
             if is_simple_alu {
-                self.emit_alu_reg_direct(op, lhs, rhs, dest_phys, use_32bit, is_unsigned);
+                self.emit_alu_reg_direct(op, lhs, rhs, dest_phys, use_32bit, is_unsigned, dest.0);
                 return;
             }
             if matches!(op, IrBinOp::Shl | IrBinOp::AShr | IrBinOp::LShr) {
