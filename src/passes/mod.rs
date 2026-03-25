@@ -147,30 +147,16 @@ fn run_gvn_licm_ivsr_shared(
         // Run IVSR with shared analysis.
         // LICM hoists instructions to preheaders but does not add/remove blocks,
         // so CFG analysis is still valid.
-        if run_ivsr {
-            let t0 = if time_passes { Some(std::time::Instant::now()) } else { None };
-            let n = iv_strength_reduce::ivsr_with_analysis(func, &cfg);
-            if let Some(t0) = t0 {
-                eprintln!("[PASS] iter={} iv_strength_reduce (func {}): {:.4}s ({} changes)", iter, func.name, t0.elapsed().as_secs_f64(), n);
-            }
-            if n > 0 {
-                ivsr_total += n;
-                if i < changed.len() { changed[i] = true; }
-            }
-
-            // Run Un-IVSR immediately after IVSR to revert pointer IVs
-            // for targets with indexed addressing (x86-64 SIB).
-            // This must run BEFORE phi elimination so we can still detect
-            // the IVSR pointer phi pattern.
-            let t0 = if time_passes { Some(std::time::Instant::now()) } else { None };
-            let n = univsr::run_univsr(func);
-            if let Some(t0) = t0 {
-                eprintln!("[PASS] iter={} un-ivsr (func {}): {:.4}s ({} changes)", iter, func.name, t0.elapsed().as_secs_f64(), n);
-            }
-            if n > 0 {
-                if i < changed.len() { changed[i] = true; }
-            }
-        }
+        // IVSR and Un-IVSR disabled: IVSR creates pointer IVs that replace
+        // index-based GEP addressing with pointer arithmetic. However, when
+        // the original GEP also uses indexed offsets (e.g., in nested loops
+        // where the outer loop's row base and the inner loop's column offset
+        // interact), the pointer increment compounds with the existing offset,
+        // doubling effective addresses. This causes correctness bugs in matmul
+        // and other multi-dimensional array patterns.
+        // TODO: Fix IVSR to correctly handle GEPs in nested loop contexts
+        // where the base pointer is itself a loop-variant value.
+        let _ = run_ivsr; // suppress unused warning
     }
 
     if time_passes {
