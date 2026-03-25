@@ -1820,6 +1820,7 @@ impl ArchCodegen for X86Codegen {
         fn emit_int_bswap(&mut self, ty: IrType) => emit_int_bswap_impl;
         fn emit_int_popcount(&mut self, ty: IrType) => emit_int_popcount_impl;
         fn emit_int_binop(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) => emit_int_binop_impl;
+        fn emit_fused_mul_add(&mut self, mul_dest: &Value, mul_lhs: &Operand, mul_rhs: &Operand, acc: &Operand, add_dest: &Value, ty: IrType) => emit_fused_mul_add_impl;
         fn emit_copy_i128(&mut self, dest: &Value, src: &Operand) => emit_copy_i128_impl;
         // comparison
         fn emit_f128_cmp(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand) => emit_f128_cmp_impl;

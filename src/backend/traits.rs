@@ -351,6 +351,20 @@ pub trait ArchCodegen {
         self.emit_int_binop(dest, op, lhs, rhs, ty);
     }
 
+    /// Emit a fused multiply-add: dest = acc + (mul_lhs * mul_rhs).
+    ///
+    /// The multiply result stays in the accumulator register (%eax/%rax) and is
+    /// added directly to the accumulator operand. This avoids register-allocating
+    /// the multiply temp, freeing registers for ILP.
+    ///
+    /// Default implementation falls back to separate mul + add.
+    fn emit_fused_mul_add(&mut self, _mul_dest: &Value, mul_lhs: &Operand, mul_rhs: &Operand,
+                          acc: &Operand, add_dest: &Value, ty: IrType) {
+        // Default: emit mul then add separately via the standard paths.
+        self.emit_int_binop(_mul_dest, IrBinOp::Mul, mul_lhs, mul_rhs, ty);
+        self.emit_int_binop(add_dest, IrBinOp::Add, acc, &Operand::Value(Value(_mul_dest.0)), ty);
+    }
+
     /// Emit a float binary operation (add/sub/mul/div).
     fn emit_float_binop(&mut self, dest: &Value, op: FloatOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
         let mnemonic = self.emit_float_binop_mnemonic(op);

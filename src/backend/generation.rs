@@ -482,6 +482,71 @@ fn detect_cmp_branch_fusion(block: &BasicBlock, use_counts: &[u32]) -> Option<us
     }
 }
 
+/// Detect multiply-add fusion opportunities within a block.
+///
+/// Finds `BinOp::Mul` instructions whose result is used exactly once as an
+/// operand of the immediately following `BinOp::Add` instruction. When fused,
+/// the multiply result stays in %eax (the accumulator) and is added directly
+/// to the accumulator variable, avoiding the multiply temp being register-
+/// allocated (which would consume a callee-saved register needed for ILP).
+///
+/// Returns a set of instruction indices that should be skipped because they
+/// will be handled by the preceding Mul's fused emission.
+fn detect_mul_add_fusions(block: &BasicBlock, use_counts: &[u32]) -> FxHashSet<usize> {
+    let mut skip_set = FxHashSet::default();
+
+    for (idx, inst) in block.instructions.iter().enumerate() {
+        // Look for BinOp::Mul
+        let (mul_dest, mul_ty) = match inst {
+            Instruction::BinOp { dest, op: crate::ir::reexports::IrBinOp::Mul, ty, .. } => (dest, ty),
+            _ => continue,
+        };
+
+        // Only fuse integer multiplies (not float, not i128)
+        if mul_ty.is_float() || matches!(mul_ty, IrType::I128 | IrType::U128) {
+            continue;
+        }
+
+        // Multiply result must have exactly 1 use
+        let mul_uses = if (mul_dest.0 as usize) < use_counts.len() {
+            use_counts[mul_dest.0 as usize]
+        } else {
+            0
+        };
+        if mul_uses != 1 {
+            continue;
+        }
+
+        // Next instruction must be a BinOp::Add that uses the multiply result
+        let next_idx = idx + 1;
+        if next_idx >= block.instructions.len() {
+            continue;
+        }
+        let next_inst = &block.instructions[next_idx];
+        let (add_lhs, add_rhs, add_ty) = match next_inst {
+            Instruction::BinOp { op: crate::ir::reexports::IrBinOp::Add, lhs, rhs, ty, .. } => (lhs, rhs, ty),
+            _ => continue,
+        };
+
+        // The multiply result must be one of the add operands
+        let mul_is_lhs = matches!(add_lhs, Operand::Value(v) if v.0 == mul_dest.0);
+        let mul_is_rhs = matches!(add_rhs, Operand::Value(v) if v.0 == mul_dest.0);
+        if !mul_is_lhs && !mul_is_rhs {
+            continue;
+        }
+
+        // Types must be compatible
+        if mul_ty != add_ty {
+            continue;
+        }
+
+        // Mark the add instruction to be skipped — it will be emitted fused with the mul
+        skip_set.insert(next_idx);
+    }
+
+    skip_set
+}
+
 /// Generate assembly for a module using the given architecture's codegen.
 /// Generate assembly for an IR module with debug info support.
 /// Sets `debug_info` on the codegen state before proceeding.
