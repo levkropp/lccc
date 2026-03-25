@@ -254,6 +254,96 @@ impl X86Codegen {
         if use_32bit { self.store_eax_to(dest); } else { self.store_rax_to(dest); }
     }
 
+    /// Fused multiply-add: add_dest = acc + (mul_lhs * mul_rhs).
+    ///
+    /// Emits a 3-instruction sequence: load one mul operand to %eax, multiply
+    /// by the other (memory-source or register-source), then add %eax to the
+    /// accumulator (register-dest or memory-dest).
+    pub(super) fn emit_fused_mul_add_impl(
+        &mut self, _mul_dest: &Value,
+        mul_lhs: &Operand, mul_rhs: &Operand,
+        acc: &Operand, add_dest: &Value, ty: IrType,
+    ) {
+        let use_32bit = ty == IrType::I32 || ty == IrType::U32;
+
+        // Step 1: Compute mul_lhs * mul_rhs into %eax.
+        // Strategy: load one operand to %eax, imul the other (prefer memory-source).
+        if use_32bit { self.operand_to_eax(mul_lhs); } else { self.operand_to_rax(mul_lhs); }
+
+        // Try memory-source multiply for rhs
+        if let Operand::Value(rhs_val) = mul_rhs {
+            if self.dest_reg(rhs_val).is_none() {
+                if let Some(slot) = self.state.get_slot(rhs_val.0) {
+                    let sref = self.slot_ref(slot.0);
+                    if use_32bit {
+                        self.state.emit_fmt(format_args!("    imull {}, %eax", sref));
+                    } else {
+                        self.state.emit_fmt(format_args!("    imulq {}, %rax", sref));
+                    }
+                    // Fall through to add
+                    self.emit_fused_add_acc(acc, add_dest, use_32bit);
+                    return;
+                }
+            }
+        }
+
+        // Register-source multiply
+        self.operand_to_rcx(mul_rhs);
+        if use_32bit {
+            self.state.emit("    imull %ecx, %eax");
+        } else {
+            self.state.emit("    imulq %rcx, %rax");
+        }
+
+        self.emit_fused_add_acc(acc, add_dest, use_32bit);
+    }
+
+    /// Helper for fused mul-add: add %eax to the accumulator operand and store to dest.
+    fn emit_fused_add_acc(&mut self, acc: &Operand, add_dest: &Value, use_32bit: bool) {
+        // If add_dest is register-allocated, add %eax to it directly.
+        if let Some(dest_phys) = self.dest_reg(add_dest) {
+            // Ensure acc is in the dest register first
+            self.operand_to_callee_reg(acc, dest_phys);
+            if use_32bit {
+                self.state.emit_fmt(format_args!("    addl %eax, %{}", super::emit::phys_reg_name_32(dest_phys)));
+            } else {
+                self.state.emit_fmt(format_args!("    addq %rax, %{}", super::emit::phys_reg_name(dest_phys)));
+            }
+            self.state.reg_cache.invalidate_acc();
+            return;
+        }
+
+        // Memory-dest add: if acc and dest share the same stack slot, use addl %eax, mem.
+        if let Operand::Value(acc_val) = acc {
+            if self.dest_reg(acc_val).is_none() {
+                if let (Some(dest_slot), Some(acc_slot)) =
+                    (self.state.get_slot(add_dest.0), self.state.get_slot(acc_val.0))
+                {
+                    if dest_slot.0 == acc_slot.0 {
+                        let sref = self.slot_ref(dest_slot.0);
+                        if use_32bit {
+                            self.state.emit_fmt(format_args!("    addl %eax, {}", sref));
+                        } else {
+                            self.state.emit_fmt(format_args!("    addq %rax, {}", sref));
+                        }
+                        self.state.reg_cache.invalidate_acc();
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Fallback: load acc to %ecx, add to %eax, store result.
+        self.operand_to_rcx(acc);
+        if use_32bit {
+            self.state.emit("    addl %ecx, %eax");
+            self.store_eax_to(add_dest);
+        } else {
+            self.state.emit("    addq %rcx, %rax");
+            self.store_rax_to(add_dest);
+        }
+    }
+
     pub(super) fn emit_copy_i128_impl(&mut self, dest: &Value, src: &Operand) {
         self.operand_to_rax_rdx(src);
         self.store_rax_rdx_to(dest);

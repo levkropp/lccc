@@ -263,6 +263,24 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // resolve_slot_addr() directly (not register-aware).
     remove_ineligible_operands(func, &mut eligible, config);
 
+    // --- Phi register coalescing ---
+    //
+    // For loop-carried phi variables, the backedge source value (the new value
+    // computed in the loop body) should share the same register as the phi dest
+    // (the value at the loop header). This eliminates the register-to-register
+    // or register-to-stack copy at the backedge.
+    //
+    // We detect backedge Copy instructions where the dest is a multi-def value
+    // (phi dest after phi elimination) and the source is a loop-local value.
+    // The backedge source is removed from the eligible set so it doesn't get
+    // allocated independently. After allocation, it inherits the phi dest's
+    // register assignment.
+    let phi_coalesce = detect_phi_coalesce_groups(func, &liveness);
+    for &(_phi_dest, backedge_src) in &phi_coalesce {
+        // Remove backedge source from eligibility — it will inherit the phi dest's register.
+        eligible.remove(&backedge_src);
+    }
+
     // --- Linear scan allocation (replaces three-phase greedy allocator) ---
     //
     // Phase 1: callee-saved registers for ALL eligible values.
@@ -315,6 +333,16 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 assignments.insert(vid, reg);
                 used_regs_set.insert(reg.0);
             }
+        }
+    }
+
+    // Propagate phi coalesce assignments: backedge source values inherit
+    // the register of their phi dest. This makes the backedge Copy a no-op
+    // when both values share the same register.
+    for &(phi_dest, backedge_src) in &phi_coalesce {
+        if let Some(&reg) = assignments.get(&phi_dest) {
+            assignments.insert(backedge_src, reg);
+            // No need to add to used_regs_set — the phi dest already did.
         }
     }
 
@@ -670,4 +698,148 @@ fn find_best_callee_reg(
     }
 
     best_already_used.or(best_new)
+}
+
+/// Exclude multiply temp values that are consumed by multiply-add fusion.
+///
+/// A value is a fused multiply temp if:
+/// 1. It is produced by BinOp::Mul (integer, not float/i128)
+/// 2. It has exactly one use across the entire function
+/// 3. That one use is as an operand of a BinOp::Add in the immediately following instruction
+fn exclude_fused_mul_temps(func: &IrFunction, eligible: &mut FxHashSet<u32>) {
+    // Count uses per value
+    let mut use_count: FxHashMap<u32, u32> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    *use_count.entry(v.0).or_insert(0) += 1;
+                }
+            });
+        }
+        for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                *use_count.entry(v.0).or_insert(0) += 1;
+            }
+        });
+    }
+
+    for block in &func.blocks {
+        for (idx, inst) in block.instructions.iter().enumerate() {
+            // Look for BinOp::Mul with integer type
+            let (mul_dest, mul_ty) = match inst {
+                Instruction::BinOp { dest, op: crate::ir::reexports::IrBinOp::Mul, ty, .. } => (dest, ty),
+                _ => continue,
+            };
+            if mul_ty.is_float() || matches!(mul_ty, IrType::I128 | IrType::U128) {
+                continue;
+            }
+            // Must have exactly 1 use
+            if use_count.get(&mul_dest.0).copied().unwrap_or(0) != 1 {
+                continue;
+            }
+            // Next instruction must be BinOp::Add that uses this multiply result
+            if let Some(Instruction::BinOp { op: crate::ir::reexports::IrBinOp::Add, lhs, rhs, ty: add_ty, .. }) = block.instructions.get(idx + 1) {
+                let mul_is_operand = matches!(lhs, Operand::Value(v) if v.0 == mul_dest.0)
+                    || matches!(rhs, Operand::Value(v) if v.0 == mul_dest.0);
+                if mul_is_operand && mul_ty == add_ty {
+                    eligible.remove(&mul_dest.0);
+                }
+            }
+        }
+    }
+}
+
+/// Count weighted uses per value in loop blocks.
+/// Returns a map: value_id -> weighted_use_count (uses * 10^loop_depth).
+fn count_value_uses_in_loop(
+    func: &IrFunction,
+    block_loop_depth: &[u32],
+) -> FxHashMap<u32, u64> {
+    let mut uses: FxHashMap<u32, u64> = FxHashMap::default();
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        let depth = block_loop_depth.get(block_idx).copied().unwrap_or(0);
+        if depth == 0 { continue; }
+        let weight = match depth {
+            1 => 10u64,
+            2 => 100,
+            3 => 1000,
+            _ => 10_000,
+        };
+        for inst in &block.instructions {
+            for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    *uses.entry(v.0).or_insert(0) += weight;
+                }
+            });
+        }
+    }
+    uses
+}
+
+/// Detect phi coalesce groups for loop-carried variables.
+///
+/// After phi elimination, loop-header phi nodes become Copy instructions in
+/// predecessor blocks. For the backedge predecessor, this creates a Copy:
+///   `%phi_dest = copy %backedge_src`
+/// where `%phi_dest` is the multi-def phi variable and `%backedge_src` is the
+/// new value computed in the loop body.
+///
+/// By coalescing these two values (giving them the same register), the Copy
+/// becomes a no-op, eliminating a register-to-register move or stack round-trip.
+///
+/// Returns a list of (phi_dest, backedge_src) pairs that should share a register.
+fn detect_phi_coalesce_groups(
+    func: &IrFunction,
+    liveness: &LivenessResult,
+) -> Vec<(u32, u32)> {
+    // Step 1: Find multi-def values (phi dests after phi elimination).
+    // A value is multi-def if it has Copy definitions in multiple blocks.
+    let mut def_block: FxHashMap<u32, usize> = FxHashMap::default();
+    let mut multi_def: FxHashSet<u32> = FxHashSet::default();
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            if let Instruction::Copy { dest, .. } = inst {
+                if let Some(&prev) = def_block.get(&dest.0) {
+                    if prev != block_idx {
+                        multi_def.insert(dest.0);
+                    }
+                }
+                def_block.insert(dest.0, block_idx);
+            }
+        }
+    }
+
+    if multi_def.is_empty() {
+        return Vec::new();
+    }
+
+    // Step 2: Find backedge copies in loop blocks.
+    // A backedge copy is a Copy where:
+    //   - The dest is a multi-def value (phi dest)
+    //   - The source is a Value (not a constant)
+    //   - The copy is in a block with loop_depth > 0
+    let mut groups: Vec<(u32, u32)> = Vec::new();
+    let mut seen_phi_dests: FxHashSet<u32> = FxHashSet::default();
+
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        let depth = liveness.block_loop_depth.get(block_idx).copied().unwrap_or(0);
+        if depth == 0 {
+            continue;
+        }
+
+        for inst in &block.instructions {
+            if let Instruction::Copy { dest, src: Operand::Value(src_val) } = inst {
+                if multi_def.contains(&dest.0) && !seen_phi_dests.contains(&dest.0) {
+                    // Don't coalesce if src is itself a multi-def (swap cycle temporaries)
+                    if !multi_def.contains(&src_val.0) {
+                        groups.push((dest.0, src_val.0));
+                        seen_phi_dests.insert(dest.0);
+                    }
+                }
+            }
+        }
+    }
+
+    groups
 }
