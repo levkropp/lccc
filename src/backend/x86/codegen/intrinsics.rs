@@ -604,6 +604,26 @@ impl X86Codegen {
                     self.state.emit("    vmovupd %ymm0, (%rax)");            // Write 4 results back
                 }
             }
+            IntrinsicOp::FmaF64x4Hoisted => {
+                // Like FmaF64x4, but A[i][k] broadcast already in ymm1.
+                // args[0] = B pointer (4×F64)
+                // dest_ptr = C pointer (read+write, 4×F64)
+                if let Some(c_ptr) = dest_ptr {
+                    self.operand_to_reg(&args[0], "rdx");      // B ptr → %rdx
+                    self.value_to_reg(c_ptr, "rax");           // C ptr → %rax
+
+                    self.state.emit("    vmovupd (%rax), %ymm0");            // Load C[j..j+3]
+                    self.state.emit("    vfmadd231pd (%rdx), %ymm1, %ymm0"); // ymm0 = ymm1*B + ymm0
+                    self.state.emit("    vmovupd %ymm0, (%rax)");            // Store C[j..j+3]
+                }
+            }
+            IntrinsicOp::BroadcastLoadF64 => {
+                // Load scalar F64 from pointer and broadcast to ymm1.
+                // Placed before the vectorized j-loop.
+                self.operand_to_reg(&args[0], "rcx");
+                self.state.emit("    movsd (%rcx), %xmm1");
+                self.state.emit("    vbroadcastsd %xmm1, %ymm1");
+            }
 
             // --- Vector loads for reduction patterns ---
             IntrinsicOp::LoadF64x4 => {

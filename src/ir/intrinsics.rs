@@ -83,6 +83,16 @@ pub enum IntrinsicOp {
     /// args[1]: pointer to 4×F64 source vector
     /// NOT pure: modifies memory at dest_ptr.
     FmaF64x4,
+    /// Like FmaF64x4, but the A[i][k] broadcast has been hoisted out of the
+    /// inner loop. The codegen assumes ymm1 already holds the broadcast value
+    /// (set by a preceding BroadcastLoadF64 instruction).
+    /// dest_ptr = C pointer (read+write, 4×F64)
+    /// args[0] = B pointer (4×F64)  (no A pointer needed)
+    FmaF64x4Hoisted,
+    /// Load a scalar F64 from a pointer and broadcast to all 4 lanes of ymm1.
+    /// Placed before the vectorized j-loop to hoist the A[i][k] broadcast.
+    /// args[0] = pointer to scalar F64
+    BroadcastLoadF64,
 
     // --- Vector loads for reduction patterns ---
     /// Load 4 packed doubles (256-bit unaligned): vmovupd
