@@ -19,7 +19,7 @@ Six micro-benchmarks targeting different bottlenecks. All measured with best-of-
 | Item | Value |
 |------|-------|
 | **Host** | Linux x86-64 |
-| **LCCC** | Phase 15 complete — linear scan + TCE + phi-copy coalescing + FP opts + AVX2 vectorization + reduction vectorization + rec-to-iter + SIB fold + accumulator fold + regalloc loop-depth fix + sign-ext fusion + phi-copy chain coalescing + loop rotation + phi register coalescing + 3-channel multiply ILP |
+| **LCCC** | Phase 16 complete — linear scan + TCE + phi-copy coalescing + FP opts + AVX2 vectorization + reduction vectorization + rec-to-iter + SIB fold + accumulator fold + regalloc loop-depth fix + sign-ext fusion + phi-copy chain coalescing + loop rotation + phi register coalescing + 3-channel multiply ILP + matmul byte-offset IV + IVSR fix |
 | **CCC** | upstream, three-phase greedy allocator |
 | **GCC** | 15.2.1 (Arch Linux) |
 | **Flags** | `-O2` for all compilers (GCC `-O3 -march=native` for reduction comparison) |
@@ -34,7 +34,7 @@ Six micro-benchmarks targeting different bottlenecks. All measured with best-of-
 | `sieve` | 0.048s | 0.044s | **1.09× slower** |
 | `qsort` | 0.122s | 0.101s | 1.20× slower |
 | `fib(40)` | **0.001s** | 0.136s | **478× faster** |
-| `matmul` | 0.008s | 0.005s | 1.60× slower |
+| `matmul` | 0.006s | 0.005s | **1.20× slower** |
 | `reduction` | **AVX2** | scalar (GCC -O3) | **~2.7× faster** |
 | `tce_sum` | 0.007s | 0.001s | 7× slower (GCC const-folds) |
 
@@ -81,7 +81,7 @@ long fib(int n) {
 
 **Note:** This is a synthetic benchmark. No production code uses naive recursive Fibonacci. The optimization demonstrates LCCC's pattern-matching capabilities but should not be interpreted as "LCCC is faster than GCC" in general — GCC wins on all other benchmarks.
 
-### `03_matmul` — Floating Point + Cache
+### `03_matmul` — Floating Point + Cache + AVX2 Vectorization
 
 ```c
 void matmul(void) {
@@ -92,11 +92,14 @@ void matmul(void) {
 }
 ```
 
-**Why it matters:** FP throughput and cache behavior. The inner loop is a scalar FP multiply-add.
+**Why it matters:** FP throughput and cache behavior. The inner loop is a fused multiply-add pattern that benefits from SIMD vectorization.
 
-**LCCC vs CCC:** ≈ equal (0.027s vs 0.029s). Both emit scalar `mulsd`/`addsd`. The register allocator's integer improvements don't apply to XMM registers.
+**LCCC vs CCC:** 0.006s vs 0.029s (**+4.8× faster**). LCCC auto-vectorizes with AVX2 FMA3 (`vfmadd231pd`, 4 doubles per instruction), while CCC emits scalar `mulsd`/`addsd`.
 
-**LCCC vs GCC:** 7.84× slower. GCC auto-vectorizes the inner loop with AVX2 `vfmadd231pd`, processing 4 doubles per instruction. This is a Phase 5 improvement target.
+**LCCC vs GCC: 1.2× slower.** Both vectorize: LCCC uses AVX2 4-wide FMA, GCC uses SSE2 2-wide (`mulpd`/`addpd`). Despite processing 2× more elements per iteration, LCCC's inner loop has 17 instructions vs GCC's 7, due to:
+1. Address computation (7 instructions): GEP lowering goes through the accumulator instead of SIB addressing
+2. Loop-invariant A[i][k] broadcast (2 instructions): not yet hoisted to preheader
+3. Phase 16 fixed a correctness bug in IVSR (pointer IV compounding with indexed offsets in nested loops) and converted the j-loop IV from element index to byte offset, eliminating the `shl $5` from the critical path
 
 ### `04_qsort` — Library Calls
 
