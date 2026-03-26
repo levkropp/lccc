@@ -72,7 +72,7 @@ All outputs are byte-identical to GCC.
 | Benchmark | LCCC | GCC -O2 | LCCC / GCC | Key optimization |
 |-----------|-----:|--------:|:----------:|:-----------------|
 | `arith_loop` — 32-var arithmetic, 10 M iters | **0.08 s** | 0.08 s | **1.0×** | Phi register coalescing, 3-channel multiply ILP |
-| `sieve` — primes to 10 M | 0.048 s | 0.044 s | 1.1× | Phi-copy coalescing, sign-ext fusion, loop rotation |
+| `sieve` — primes to 10 M | 0.05 s | 0.04 s | 1.25× | Phi-copy coalescing, sign-ext fusion, loop rotation, late stack-load hoist |
 | `qsort` — sort 1 M integers | 0.122 s | 0.101 s | 1.2× | Push/pop callee saves, memory-operand codegen |
 | `fib(40)` — recursive Fibonacci | **0.001 s** | 0.136 s | **478× faster** | Binary recursion → iterative accumulator |
 | `matmul` — 256×256 double | **0.004 s** | 0.004 s | **1.0×** | AVX2 FMA3, byte-offset IV, leaq GEP, broadcast hoist, peephole XMM fix |

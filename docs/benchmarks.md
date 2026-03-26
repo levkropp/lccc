@@ -31,7 +31,7 @@ Six micro-benchmarks targeting different bottlenecks. All measured with best-of-
 | Benchmark | LCCC | GCC -O2 | LCCC/GCC |
 |-----------|-----:|--------:|:--------:|
 | `arith_loop` | **0.08s** | 0.08s | **1.0× (parity)** |
-| `sieve` | 0.048s | 0.044s | **1.09× slower** |
+| `sieve` | 0.05s | 0.04s | **1.25× slower** |
 | `qsort` | 0.122s | 0.101s | 1.20× slower |
 | `fib(40)` | **0.001s** | 0.136s | **478× faster** |
 | `matmul` | **0.004s** | 0.004s | **1.0× (parity)** |
