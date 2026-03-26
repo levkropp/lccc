@@ -1880,7 +1880,13 @@ pub(super) fn fuse_signext_and_move(
         let mut n = j + 1;
         while n < len && n < j + 12 {
             if infos[n].is_nop() { n += 1; continue; }
-            if infos[n].is_barrier() { break; }
+            if infos[n].is_barrier() {
+                // ret implicitly reads rax as the return value
+                if infos[n].kind == LineKind::Ret {
+                    rax_dead = false;
+                }
+                break;
+            }
             // Check if this instruction references rax
             if infos[n].reg_refs & 1 != 0 {
                 // rax is referenced. Check if it's a write (rax overwritten → dead)
@@ -2142,13 +2148,11 @@ pub(super) fn hoist_loop_invariant_gpr_load(
     let len = store.len();
     let mut changed = false;
 
-    let debug_hoist = std::env::var("CCC_DEBUG_HOIST").is_ok();
     let mut i = 0;
     while i < len {
         if infos[i].is_nop() { i += 1; continue; }
         // Match both unconditional (jmp) and conditional (jle, jl, jne, etc.) back-edges
         let jmp_text = infos[i].trimmed(store.get(i));
-        let _ = debug_hoist;
         let target = if jmp_text.starts_with("jmp ") { &jmp_text[4..] }
             else if jmp_text.starts_with("jl ") { &jmp_text[3..] }
             else if jmp_text.starts_with("jle ") { &jmp_text[4..] }
@@ -2175,8 +2179,6 @@ pub(super) fn hoist_loop_invariant_gpr_load(
             Some(h) => h,
             None => { i += 1; continue; }
         };
-
-        let debug_hoist = std::env::var("CCC_DEBUG_HOIST").is_ok();
 
         // Validate this is a real loop: the range [header..=i] must not contain
         // a ret instruction (which would indicate the range spans the epilogue
@@ -2509,6 +2511,12 @@ pub(super) fn fuse_add_sign_extend(
     // Simple adjacent-pair scan: find addl %X, %TMP immediately followed by
     // movslq %TMP, %DST. Check that %TMP is not used elsewhere in the
     // surrounding block.
+    //
+    // SAFETY: addl %X, %TMP is a read-modify-write: it reads TMP, adds X,
+    // writes back to TMP. We can only redirect the destination to DST when
+    // TMP == X (self-add, e.g. addl %ebx, %ebx → doubling), because then
+    // changing to addl %DSTd, %DSTd is correct if DST was initialized with
+    // the same value. For X != TMP, the redirect loses the TMP read.
     while i + 1 < len {
         let t1 = store.get(i).trim().to_string();
         if !t1.starts_with("addl %") { i += 1; continue; }
@@ -2516,6 +2524,15 @@ pub(super) fn fuse_add_sign_extend(
         if parts1.len() != 2 { i += 1; continue; }
         let src_reg = parts1[0][6..].to_string(); // after "addl %"
         let tmp_reg = parts1[1].to_string();
+
+        // addl %X, %TMP is read-modify-write on TMP. Redirecting the
+        // destination to DST is only safe when X == TMP (self-add / doubling).
+        // For X != TMP, the old TMP value is part of the computation and
+        // DST wouldn't have it.
+        let src_base = src_reg.trim_end_matches('d').to_string();
+        if src_base != tmp_reg && src_reg != tmp_reg {
+            i += 1; continue;
+        }
 
         // Next line must be movslq %TMP, %DST (check all lines in case of multi-line)
         let t2_raw = store.get(i + 1);
@@ -2949,7 +2966,7 @@ pub(super) fn rotate_loops(
 
         // Get the conditional jump and invert it
         let cjmp_text = infos[cjmp].trimmed(store.get(cjmp));
-        let (cond, _exit_label) = match cjmp_text.find(' ') {
+        let (cond, exit_label) = match cjmp_text.find(' ') {
             Some(space) => (&cjmp_text[..space], &cjmp_text[space + 1..]),
             None => { i += 1; continue; }
         };
@@ -3085,10 +3102,16 @@ pub(super) fn rotate_loops(
             }
         }
         replacement_lines.push(format!("    {} {}", inv_cond, body_label));
+        // When the loop exits (inverted condition not taken), fall-through goes
+        // to the next instruction. But the original loop exit target might be a
+        // trampoline block elsewhere (created by phi elimination for critical
+        // edges). We must emit a jmp to the original exit target so the fall-
+        // through reaches the correct destination with phi initialization copies.
+        replacement_lines.push(format!("    jmp {}", exit_label));
 
         let replacement = replacement_lines.join("\n");
 
-        // Replace the jmp with the duplicated latch
+        // Replace the jmp with the duplicated latch + exit jump
         store.replace(i, replacement);
         infos[i] = classify_line(store.get(i));
 

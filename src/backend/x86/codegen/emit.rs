@@ -471,8 +471,11 @@ impl X86Codegen {
                 } else if self.state.reg_cache.acc_has(v.0, false) || self.state.reg_cache.acc_has(v.0, true) {
                     self.state.out.emit_instr_reg_reg("    movq", "rax", target_name);
                 } else {
-                    let target_32 = phys_reg_name_32(target);
-                    self.state.out.emit_instr_reg_reg("    xorl", target_32, target_32);
+                    // Value not in any register, stack slot, or accumulator cache.
+                    // Fall back to loading via the accumulator path instead of
+                    // silently zeroing the register.
+                    self.operand_to_rax(op);
+                    self.state.out.emit_instr_reg_reg("    movq", "rax", target_name);
                 }
             }
         }
