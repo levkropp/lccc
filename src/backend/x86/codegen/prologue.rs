@@ -352,7 +352,10 @@ impl X86Codegen {
             }
         }
 
-        let stack_base: i64 = 16;
+        // In RBP mode: stack args start at 16(%rbp) = return_addr(8) + saved_rbp(8).
+        // In FPO mode: no saved rbp, so stack args start at 8 from the virtual rbp
+        // (which is entry_rsp = return_addr).
+        let stack_base: i64 = if self.state.omit_frame_pointer { 8 } else { 16 };
 
         // Build a map from physical register -> list of param indices that use it,
         // so we can detect when two params share the same callee-saved register.
@@ -521,7 +524,7 @@ impl X86Codegen {
 
         let xmm_regs = ["xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"];
         let class = self.state.param_classes[param_idx];
-        let stack_base: i64 = 16;
+        let stack_base: i64 = if self.state.omit_frame_pointer { 8 } else { 16 };
 
         match class {
             ParamClass::IntReg { reg_idx } => {
