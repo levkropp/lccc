@@ -1357,13 +1357,20 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction, gep_fold_m
 
 /// Generate a Copy instruction, handling coalesced slots, i128, and wide values.
 fn generate_copy(cg: &mut dyn ArchCodegen, dest: &Value, src: &Operand) {
-    // Propagate alloca flag through Copy chains: if src is an alloca, dest
-    // should also be treated as an alloca (its "value" is an address, not data).
-    // Without this, `char *zOut = buf;` (where buf is an alloca) would load
-    // from buf's slot (getting 0) instead of computing buf's address with leaq.
+    // When the source is an alloca, the Copy must materialize the alloca's
+    // ADDRESS (via leaq), not load a value from the alloca's slot or register.
+    // We must bypass emit_load_operand/operand_to_rax because they check the
+    // accumulator cache and register assignments, which would return the wrong
+    // value (a loaded byte from the array instead of the array's address).
     if let Operand::Value(src_val) = src {
         if cg.state_ref().is_alloca(src_val.0) {
-            cg.state().alloca_values.insert(dest.0);
+            if let Some(slot) = cg.state_ref().get_slot(src_val.0) {
+                // Directly emit leaq to compute the alloca's stack address
+                cg.state().out.emit_instr_rbp_reg("    leaq", slot.0, "rax");
+                cg.state().reg_cache.set_acc(src_val.0, true);
+                cg.emit_store_result(dest);
+                return;
+            }
         }
     }
 
