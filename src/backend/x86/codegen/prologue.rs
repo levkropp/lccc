@@ -205,7 +205,9 @@ impl X86Codegen {
             self.state.emit("    endbr64");
         }
 
-        let omit_fp = self.state.omit_frame_pointer;
+        // Variadic functions need the frame pointer for va_start/va_arg to
+        // compute register save area addresses relative to %rbp. Override FPO.
+        let omit_fp = self.state.omit_frame_pointer && !func.is_variadic;
         let used_regs = self.used_callee_saved.clone();
 
         if omit_fp {
@@ -298,7 +300,7 @@ impl X86Codegen {
     pub(super) fn emit_epilogue_impl(&mut self, frame_size: i64) {
         let used_regs = self.used_callee_saved.clone();
         let num_saved = used_regs.len() as i64;
-        let omit_fp = self.state.omit_frame_pointer;
+        let omit_fp = self.state.omit_frame_pointer && !self.state.func_is_variadic;
 
         if omit_fp {
             // Frame-pointer-less epilogue: restore callee-saved regs from stack, then addq
