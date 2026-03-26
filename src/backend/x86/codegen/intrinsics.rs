@@ -625,16 +625,33 @@ impl X86Codegen {
                         self.state.emit("    vfmadd231pd (%rdx,%rsi), %ymm1, %ymm0");
                         self.state.emit("    vmovupd %ymm0, (%rax,%rsi)");
                     } else {
-                        // Fallback: compute full pointers
-                        self.operand_to_reg(&args[0], "rcx");
-                        self.operand_to_reg(&args[1], "rdx");
-                        self.value_to_reg(c_ptr, "rax");
+                        // Use register-allocated pointers directly when available.
+                        // This avoids unnecessary movq copies (e.g., movq %rbx, %rcx)
+                        // when the pointer is already in a callee-saved register.
+                        let a_name = if let Some(r) = self.operand_reg(&args[0]) {
+                            super::emit::phys_reg_name(r)
+                        } else {
+                            self.operand_to_reg(&args[0], "rcx");
+                            "rcx"
+                        };
+                        let b_name = if let Some(r) = self.operand_reg(&args[1]) {
+                            super::emit::phys_reg_name(r)
+                        } else {
+                            self.operand_to_reg(&args[1], "rdx");
+                            "rdx"
+                        };
+                        let c_name = if let Some(r) = self.dest_reg(c_ptr) {
+                            super::emit::phys_reg_name(r)
+                        } else {
+                            self.value_to_reg(c_ptr, "rax");
+                            "rax"
+                        };
 
-                        self.state.emit("    movsd (%rcx), %xmm1");
+                        self.state.emit_fmt(format_args!("    movsd (%{}), %xmm1", a_name));
                         self.state.emit("    vbroadcastsd %xmm1, %ymm1");
-                        self.state.emit("    vmovupd (%rax), %ymm0");
-                        self.state.emit("    vfmadd231pd (%rdx), %ymm1, %ymm0");
-                        self.state.emit("    vmovupd %ymm0, (%rax)");
+                        self.state.emit_fmt(format_args!("    vmovupd (%{}), %ymm0", c_name));
+                        self.state.emit_fmt(format_args!("    vfmadd231pd (%{}), %ymm1, %ymm0", b_name));
+                        self.state.emit_fmt(format_args!("    vmovupd %ymm0, (%{})", c_name));
                     }
 
                     self.state.reg_cache.invalidate_all();
