@@ -50,6 +50,9 @@ pub(super) struct GepFoldInfo {
 /// When all conditions are met, the GEP instruction is skipped during codegen,
 /// and each Load/Store that uses it receives the (base, offset) directly.
 fn build_gep_fold_map(func: &IrFunction, use_counts: &[u32]) -> FxHashMap<u32, GepFoldInfo> {
+    if std::env::var("CCC_NO_GEP_FOLD").is_ok() {
+        return FxHashMap::default();
+    }
     let mut gep_map: FxHashMap<u32, GepFoldInfo> = FxHashMap::default();
 
     // Phase 1: Collect all GEPs with constant offsets.
