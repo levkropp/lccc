@@ -32,6 +32,12 @@ pub(super) fn line_references_reg_fast(info: &LineInfo, reg: RegId) -> bool {
 /// For example, replacing family 0 (rax) with family 1 (rcx) will convert:
 ///   %rax -> %rcx, %eax -> %ecx, %ax -> %cx, %al -> %cl
 pub(super) fn replace_reg_family(line: &str, old_id: RegId, new_id: RegId) -> String {
+    // REG_NAMES only covers GP register families 0-15.
+    // XMM/YMM registers (families 24-39) are not in REG_NAMES and must be
+    // skipped to avoid out-of-bounds access that corrupts instruction text.
+    if old_id as usize >= REG_NAMES[0].len() || new_id as usize >= REG_NAMES[0].len() {
+        return line.to_string();
+    }
     let mut result = line.to_string();
     // Replace in order from longest to shortest to avoid partial matches.
     // 64-bit names are longest (e.g., %r10, %rax), then 32-bit, 16-bit, 8-bit.

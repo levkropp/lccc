@@ -1793,6 +1793,7 @@ impl ArchCodegen for X86Codegen {
         fn emit_gep_direct_const(&mut self, slot: StackSlot, offset: i64) => emit_gep_direct_const_impl;
         fn emit_gep_indirect_const(&mut self, slot: StackSlot, offset: i64, val_id: u32) => emit_gep_indirect_const_impl;
         fn emit_gep_add_const_to_acc(&mut self, offset: i64) => emit_gep_add_const_to_acc_impl;
+        fn emit_leaq_base_index(&mut self, base_reg: PhysReg, index_reg: PhysReg, dest: &Value, dest_phys: Option<PhysReg>) => emit_leaq_base_index_impl;
         fn emit_add_imm_to_acc(&mut self, imm: i64) => emit_add_imm_to_acc_impl;
         fn emit_round_up_acc_to_16(&mut self) => emit_round_up_acc_to_16_impl;
         fn emit_sub_sp_by_acc(&mut self) => emit_sub_sp_by_acc_impl;

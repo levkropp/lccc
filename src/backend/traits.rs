@@ -714,6 +714,19 @@ pub trait ArchCodegen {
                 }
             }
         }
+        // Optimized path: if both base and offset are register-allocated,
+        // use leaq (%base_reg, %offset_reg), %dest_reg to compute the
+        // address in a single instruction.
+        if let Operand::Value(off_val) = offset {
+            let base_reg = self.get_phys_reg_for_value(base.0);
+            let off_reg = self.get_phys_reg_for_value(off_val.0);
+            let dest_reg = self.get_phys_reg_for_value(dest.0);
+            if let (Some(br), Some(or)) = (base_reg, off_reg) {
+                self.emit_leaq_base_index(br, or, dest, dest_reg);
+                return;
+            }
+        }
+
         // General path for non-constant offsets.
         if let Some(addr) = self.state_ref().resolve_slot_addr(base.0) {
             match addr {
@@ -744,6 +757,23 @@ pub trait ArchCodegen {
         // Default fallback: load ptr to secondary, load offset to acc, add.
         self.emit_slot_addr_to_secondary(slot, false, val_id);
         self.emit_gep_add_const_to_acc_from_secondary(offset);
+    }
+
+    /// Emit leaq (%base_reg, %index_reg), %dest for GEP with both operands
+    /// in registers. Default: falls back to accumulator path.
+    fn emit_leaq_base_index(&mut self, base_reg: PhysReg, index_reg: PhysReg,
+                             dest: &Value, dest_reg: Option<PhysReg>) {
+        // Default: load base to secondary, load index to acc, add, store
+        self.emit_reg_to_acc(base_reg);
+        self.emit_acc_to_secondary();
+        self.emit_reg_to_acc(index_reg);
+        self.emit_add_secondary_to_acc();
+        self.emit_store_result(dest);
+    }
+
+    /// Move a physical register's value to the accumulator.
+    fn emit_reg_to_acc(&mut self, _reg: PhysReg) {
+        // Default: no-op (backends override)
     }
 
     /// Add a constant offset to accumulator (used after computing base in acc).

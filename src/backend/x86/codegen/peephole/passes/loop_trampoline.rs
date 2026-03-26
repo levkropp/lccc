@@ -273,6 +273,11 @@ pub(super) fn eliminate_loop_trampolines(store: &mut LineStore, infos: &mut [Lin
         let mut coalesce_actions: Vec<(usize, RegId, RegId)> = Vec::new();
         let mut copy_nop_lines: Vec<usize> = Vec::new();
         for &(src_fam, dst_fam) in &tramp_moves {
+            // Skip XMM/YMM registers — REG_NAMES only covers GP families 0-15
+            if src_fam as usize >= REG_NAMES[0].len() || dst_fam as usize >= REG_NAMES[0].len() {
+                move_coalesced.push(false);
+                continue;
+            }
             let src_64 = REG_NAMES[0][src_fam as usize];
             let dst_64 = REG_NAMES[0][dst_fam as usize];
 
@@ -482,6 +487,8 @@ pub(super) fn eliminate_loop_trampolines(store: &mut LineStore, infos: &mut [Lin
         } else {
             for (idx, &(src_fam, dst_fam)) in tramp_moves.iter().enumerate() {
                 if !move_coalesced[idx] { continue; }
+                // Skip XMM/YMM registers — REG_NAMES only covers GP families 0-15
+                if src_fam as usize >= REG_NAMES[0].len() || dst_fam as usize >= REG_NAMES[0].len() { continue; }
                 let src_64 = REG_NAMES[0][src_fam as usize];
                 let dst_64 = REG_NAMES[0][dst_fam as usize];
                 for &line_idx in &tramp_all_lines {
