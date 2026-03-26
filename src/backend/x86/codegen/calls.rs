@@ -29,8 +29,10 @@ impl X86Codegen {
     pub(super) fn emit_call_stack_args_impl(&mut self, args: &[Operand], arg_classes: &[CallArgClass],
                             _arg_types: &[IrType], stack_arg_space: usize, _fptr_spill: usize, _f128_temp_space: usize) -> i64 {
         let need_align_pad = !stack_arg_space.is_multiple_of(16);
+        let mut sp_adjust: i64 = 0;
         if need_align_pad {
             self.state.emit("    subq $8, %rsp");
+            sp_adjust += 8;
         }
         let arg_padding = crate::backend::call_abi::compute_stack_arg_padding(arg_classes);
         let stack_indices: Vec<usize> = (0..args.len())
@@ -143,14 +145,23 @@ impl X86Codegen {
             let pad = arg_padding[si];
             if pad > 0 {
                 self.state.out.emit_instr_imm_reg("    subq", pad as i64, "rsp");
+                sp_adjust += pad as i64;
             }
         }
-        0
+        // Return the total RSP adjustment so emit_call_reg_args can
+        // compensate stack slot offsets when loading register arguments.
+        sp_adjust + compute_stack_push_bytes(arg_classes) as i64
     }
 
     pub(super) fn emit_call_reg_args_impl(&mut self, args: &[Operand], arg_classes: &[CallArgClass],
-                          _arg_types: &[IrType], _total_sp_adjust: i64, _f128_temp_space: usize, _stack_arg_space: usize,
+                          _arg_types: &[IrType], total_sp_adjust: i64, _f128_temp_space: usize, _stack_arg_space: usize,
                           _struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>]) {
+        // Stack args (Phase 2) may have adjusted rsp. Temporarily increase
+        // the RSP frame size so rbp-to-rsp offset conversion is correct
+        // when loading register arguments from stack slots.
+        if total_sp_adjust != 0 && self.state.out.use_rsp_addressing {
+            self.state.out.rsp_frame_size += total_sp_adjust;
+        }
         let xmm_regs = ["xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"];
         let mut float_count = 0usize;
         for (i, arg) in args.iter().enumerate() {
@@ -243,6 +254,10 @@ impl X86Codegen {
             self.state.emit("    xorl %eax, %eax");
         }
         self.state.reg_cache.invalidate_all();
+        // Restore the original RSP frame size.
+        if total_sp_adjust != 0 && self.state.out.use_rsp_addressing {
+            self.state.out.rsp_frame_size -= total_sp_adjust;
+        }
     }
 
     pub(super) fn emit_call_instruction_impl(&mut self, direct_name: Option<&str>, func_ptr: Option<&Operand>, _indirect: bool, _stack_arg_space: usize) {
