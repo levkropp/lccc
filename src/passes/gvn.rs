@@ -606,6 +606,16 @@ fn process_block(
 
                 if let Some(existing_value) = existing {
                     // This expression was already computed
+                    if std::env::var("CCC_DEBUG_GVN").is_ok() {
+                        eprintln!("[GVN] CSE: Value({}) = Copy(Value({})) [block {}] key={:?}",
+                            dest.0, existing_value.0, block_idx, expr_key);
+                    }
+                } else {
+                    if std::env::var("CCC_DEBUG_GVN").is_ok() && matches!(expr_key, ExprKey::Gep { .. } | ExprKey::Load { .. }) {
+                        eprintln!("[GVN] NEW: Value({}) [block {}] key={:?}", dest.0, block_idx, expr_key);
+                    }
+                }
+                if let Some(existing_value) = existing {
                     let idx = existing_value.0 as usize;
                     let existing_vn = if idx < state.value_numbers.len() && state.value_numbers[idx] != u32::MAX {
                         state.value_numbers[idx]
