@@ -547,7 +547,12 @@ fn apply_thread_redirections(
         count += 1;
 
         // Update phi nodes in new target blocks.
+        let debug_thread = std::env::var("CCC_DEBUG_THREAD").is_ok();
         for (_old, new_target, phi_lookup_block) in edge_changes {
+            if debug_thread {
+                eprintln!("[THREAD] block {} edge: old={} new={} phi_lookup={}",
+                    block_label, _old, new_target, phi_lookup_block);
+            }
             if let Some(&target_idx) = label_to_idx.get(new_target) {
                 let block = &mut func.blocks[target_idx];
                 for inst in &mut block.instructions {

@@ -105,22 +105,28 @@ pub(super) fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]
                                         let refs = infos[m].reg_refs & dst_mask != 0;
                                         if writes {
                                             // Check if pure write (not read-modify-write).
-                                            // reg_refs includes dest, so refs can be true
-                                            // even for pure writes like "movq %r8, %rcx".
+                                            // Use the same logic as the main scan:
+                                            // is_read_modify_write + REG_NAMES fallback.
                                             let also_reads = if !refs {
                                                 false
                                             } else {
                                                 match infos[m].kind {
                                                     LineKind::LoadRbp { .. } | LineKind::Pop { .. } => false,
-                                                    _ => {
+                                                    LineKind::SetCC { .. } => false,
+                                                    LineKind::Other { .. } => {
                                                         let t = infos[m].trimmed(store.get(m));
-                                                        if let Some(cp) = t.rfind(", %") {
-                                                            let src = &t[..cp];
+                                                        if is_read_modify_write(t) {
+                                                            true
+                                                        } else if let Some(comma_pos) = t.rfind(',') {
+                                                            let src_part = &t[..comma_pos];
                                                             REG_NAMES.iter().any(|row|
-                                                                src.contains(row[dst_reg as usize])
+                                                                src_part.contains(row[dst_reg as usize])
                                                             )
-                                                        } else { true }
+                                                        } else {
+                                                            true
+                                                        }
                                                     }
+                                                    _ => refs,
                                                 }
                                             };
                                             if !also_reads { found_dead = true; }
