@@ -33,6 +33,11 @@ impl X86Codegen {
         if need_align_pad {
             self.state.emit("    subq $8, %rsp");
             sp_adjust += 8;
+            // Adjust RSP frame size so operand_to_rax slot conversions
+            // are correct after the alignment subq.
+            if self.state.out.use_rsp_addressing {
+                self.state.out.rsp_frame_size += 8;
+            }
         }
         let arg_padding = crate::backend::call_abi::compute_stack_arg_padding(arg_classes);
         let stack_indices: Vec<usize> = (0..args.len())
@@ -139,6 +144,10 @@ impl X86Codegen {
                 CallArgClass::Stack => {
                     self.operand_to_rax(&args[si]);
                     self.state.emit("    pushq %rax");
+                    if self.state.out.use_rsp_addressing {
+                        self.state.out.rsp_frame_size += 8;
+                    }
+                    sp_adjust += 8;
                 }
                 _ => {}
             }
@@ -146,11 +155,19 @@ impl X86Codegen {
             if pad > 0 {
                 self.state.out.emit_instr_imm_reg("    subq", pad as i64, "rsp");
                 sp_adjust += pad as i64;
+                if self.state.out.use_rsp_addressing {
+                    self.state.out.rsp_frame_size += pad as i64;
+                }
             }
+        }
+        // Restore the original RSP frame size. The total adjustment is
+        // tracked in sp_adjust and returned to emit_call_reg_args.
+        if self.state.out.use_rsp_addressing {
+            self.state.out.rsp_frame_size -= sp_adjust;
         }
         // Return the total RSP adjustment so emit_call_reg_args can
         // compensate stack slot offsets when loading register arguments.
-        sp_adjust + compute_stack_push_bytes(arg_classes) as i64
+        sp_adjust
     }
 
     pub(super) fn emit_call_reg_args_impl(&mut self, args: &[Operand], arg_classes: &[CallArgClass],
