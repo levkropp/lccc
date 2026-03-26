@@ -2337,6 +2337,136 @@ pub(super) fn hoist_loop_invariant_gpr_load(
     changed
 }
 
+// ── Loop-invariant broadcast hoisting ────────────────────────────────────────
+//
+// Hoists loop-invariant movsd+vbroadcastsd pairs out of the inner loop:
+//
+//   .loop:
+//     movsd (%REG), %xmm1          →  (NOPed, hoisted before loop)
+//     vbroadcastsd %xmm1, %ymm1    →  (NOPed, hoisted before loop)
+//     vmovupd ...                      vmovupd ...
+//     vfmadd231pd ...                  vfmadd231pd ...
+//
+// The hoist is safe when %REG is not modified within the loop body.
+
+pub(super) fn hoist_loop_invariant_fp_broadcast(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+
+    while i < len {
+        if infos[i].is_nop() { i += 1; continue; }
+        // Find back-edge: jl/jle/jne/jb/ja/jmp to a label before this instruction
+        let jmp_text = infos[i].trimmed(store.get(i));
+        let target = if jmp_text.starts_with("jl ") { &jmp_text[3..] }
+            else if jmp_text.starts_with("jle ") { &jmp_text[4..] }
+            else if jmp_text.starts_with("jne ") { &jmp_text[4..] }
+            else if jmp_text.starts_with("jmp ") { &jmp_text[4..] }
+            else { i += 1; continue; };
+        if !target.starts_with(".L") { i += 1; continue; }
+
+        let target_label = format!("{}:", target);
+        let mut header_pos = None;
+        for lbl in 0..i {
+            if infos[lbl].kind == LineKind::Label &&
+               infos[lbl].trimmed(store.get(lbl)) == target_label {
+                header_pos = Some(lbl);
+                break;
+            }
+        }
+        let header = match header_pos {
+            Some(h) => h,
+            None => { i += 1; continue; }
+        };
+
+        // Validate: no ret or call in loop
+        let mut has_ret = false;
+        let mut has_call = false;
+        for chk in header..=i {
+            if infos[chk].is_nop() { continue; }
+            match infos[chk].kind {
+                LineKind::Ret => { has_ret = true; break; }
+                LineKind::Call => { has_call = true; }
+                _ => {}
+            }
+        }
+        if has_ret || has_call { i += 1; continue; }
+
+        // Scan loop body for: movsd (%REG), %xmm1 followed by vbroadcastsd %xmm1, %ymm1
+        let mut hoisted_one = false;
+        for pos in header + 1..i {
+            if hoisted_one { break; }
+            if infos[pos].is_nop() { continue; }
+            let t1 = infos[pos].trimmed(store.get(pos));
+            if !t1.starts_with("movsd (%") || !t1.ends_with("), %xmm1") { continue; }
+
+            // Extract the source register
+            let reg_start = 7; // after "movsd (%"
+            let reg_end = t1.find("), %xmm1").unwrap_or(0);
+            if reg_end <= reg_start { continue; }
+            let src_reg = &t1[reg_start..reg_end];
+
+            // Next non-NOP must be vbroadcastsd
+            let mut pos2 = pos + 1;
+            while pos2 < i && infos[pos2].is_nop() { pos2 += 1; }
+            if pos2 >= i { continue; }
+            let t2 = infos[pos2].trimmed(store.get(pos2));
+            if t2 != "vbroadcastsd %xmm1, %ymm1" { continue; }
+
+            // Check that src_reg is NOT modified within the loop
+            let write_pattern = format!(", %{}", src_reg);
+            let mut reg_modified = false;
+            for chk in header..=i {
+                if chk == pos || chk == pos2 { continue; }
+                if infos[chk].is_nop() { continue; }
+                let ct = infos[chk].trimmed(store.get(chk));
+                if ct.contains(&write_pattern) || ct.ends_with(&format!("%{}", src_reg)) {
+                    // Check if it's a destination (after last comma)
+                    if let Some(last_comma) = ct.rfind(", ") {
+                        let dest_part = &ct[last_comma + 2..];
+                        if dest_part.contains(src_reg) {
+                            reg_modified = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if reg_modified { continue; }
+
+            // Find a NOP slot JUST before the header (within 10 lines) to place
+            // both hoisted instructions as a combined two-line string.
+            let mut slot = None;
+            for p in (0..header).rev() {
+                if infos[p].is_nop() {
+                    slot = Some(p);
+                    break;
+                }
+                // Only search in the immediate preheader
+                if p < header.saturating_sub(10) { break; }
+                if infos[p].kind == LineKind::Label { break; }
+            }
+
+            if let Some(s) = slot {
+                let movsd_text = store.get(pos).trim_end().to_string();
+                let bcast_text = store.get(pos2).trim_end().to_string();
+                // Combine both instructions into one slot
+                let combined = format!("{}\n{}", movsd_text, bcast_text);
+                replace_line(store, &mut infos[s], s, combined);
+                mark_nop(&mut infos[pos]);
+                mark_nop(&mut infos[pos2]);
+                changed = true;
+                hoisted_one = true;
+            }
+        }
+
+        i += 1;
+    }
+    changed
+}
+
 // ── Increment chain collapse ─────────────────────────────────────────────────
 //
 // Collapses a common SSA phi-resolution pattern for loop counter increments:
