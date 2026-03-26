@@ -173,7 +173,13 @@ impl LineInfo {
     /// This avoids re-scanning leading whitespace on every access.
     #[inline]
     pub(super) fn trimmed<'a>(&self, line: &'a str) -> &'a str {
-        &line[self.trim_start as usize..]
+        let start = self.trim_start as usize;
+        if start >= line.len() {
+            // Line was replaced with shorter/empty text after classification
+            line.trim()
+        } else {
+            &line[start..]
+        }
     }
 }
 

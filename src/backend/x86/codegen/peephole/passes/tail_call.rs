@@ -50,7 +50,7 @@ pub(super) fn optimize_tail_calls(store: &mut LineStore, infos: &mut [LineInfo])
         match infos[i].kind {
             LineKind::Label => {
                 let line = store.get(i);
-                let trimmed = &line[infos[i].trim_start as usize..];
+                let trimmed = infos[i].trimmed(line);
                 // A global label (not starting with .L) indicates a new function
                 if !trimmed.starts_with(".L") {
                     func_suppress_tailcall = false;
@@ -61,7 +61,7 @@ pub(super) fn optimize_tail_calls(store: &mut LineStore, infos: &mut [LineInfo])
             }
             LineKind::Directive => {
                 let line = store.get(i);
-                let trimmed = &line[infos[i].trim_start as usize..];
+                let trimmed = infos[i].trimmed(line);
                 if trimmed == ".cfi_startproc" {
                     func_suppress_tailcall = false;
                     in_function = true;
@@ -80,7 +80,7 @@ pub(super) fn optimize_tail_calls(store: &mut LineStore, infos: &mut [LineInfo])
         if in_function && !func_suppress_tailcall {
             if let LineKind::Other { .. } = infos[i].kind {
                 let line = store.get(i);
-                let trimmed = &line[infos[i].trim_start as usize..];
+                let trimmed = infos[i].trimmed(line);
                 if (trimmed.starts_with("leaq ") || trimmed.starts_with("leal ") || trimmed.starts_with("lea "))
                     && (trimmed.contains("(%rbp)") || trimmed.contains("(%rsp)"))
                 {
@@ -110,7 +110,7 @@ pub(super) fn optimize_tail_calls(store: &mut LineStore, infos: &mut [LineInfo])
         if let Some(ret_idx) = is_tail_call_candidate(store, infos, i, len) {
             // Extract the call target
             let call_line = store.get(i);
-            let trimmed = &call_line[infos[i].trim_start as usize..];
+            let trimmed = infos[i].trimmed(call_line);
 
             if let Some(jmp_text) = convert_call_to_jmp(trimmed) {
                 // NOP the call
@@ -177,7 +177,7 @@ fn is_tail_call_candidate(
                 continue;
             }
             LineKind::Other { dest_reg } => {
-                let trimmed = &store.get(j)[infos[j].trim_start as usize..];
+                let trimmed = infos[j].trimmed(store.get(j));
                 if trimmed == "movq %rbp, %rsp" {
                     found_frame_teardown = true;
                     j += 1;
