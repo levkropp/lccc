@@ -1677,11 +1677,11 @@ pub(super) fn eliminate_rcx_address_copy(
 
                         // Sub-pattern G2: movsd (%rcx), %xmmN → movsd (%<src>), %xmmN
                         if line_j.starts_with("movsd (%rcx), %xmm") {
-                            let xmm = &line_j[18..]; // after "movsd (%rcx), "
+                            let xmm_dest = &line_j[14..]; // after "movsd (%rcx), " → "%xmmN"
                             let mut k = j + 1;
                             while k < len && infos[k].is_nop() { k += 1; }
                             if !rcx_is_live_at(store, infos, k, len) {
-                                let new = format!("    movsd (%{}), {}", src_reg, xmm);
+                                let new = format!("    movsd (%{}), {}", src_reg, xmm_dest);
                                 mark_nop(&mut infos[i]);
                                 replace_line(store, &mut infos[j], j, new);
                                 changed = true;

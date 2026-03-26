@@ -2436,11 +2436,13 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
     }
 
     // Step 3: Replace the body with FmaF64x4.
-    // The FMA codegen handles SIB addressing automatically when it detects
-    // that its pointer arguments come from GEP instructions.
+    // TODO: Hoist A[i][k] broadcast using BroadcastLoadF64 + FmaF64x4Hoisted
+    // (infrastructure ready, but the FMA body accesses wrong register for B_ptr
+    // when hoisted — the header BroadcastLoadF64 instruction shifts register
+    // allocation and the B_gep value ends up sharing a register with the byte
+    // offset IV).
     {
         let body = &mut func.blocks[pattern.body_idx];
-
         let intrinsic = Instruction::Intrinsic {
             dest: None,
             op: IntrinsicOp::FmaF64x4,
