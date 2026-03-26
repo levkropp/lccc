@@ -132,7 +132,7 @@ pub fn calculate_stack_space_common(
     // Even small functions benefit: a 3-block function with 20 intermediates can
     // save 100+ bytes. Critical for recursive functions (PostgreSQL plpgsql) and
     // kernel functions with macro-expanded short-lived intermediates.
-    let coalesce = num_blocks >= 2;
+    let coalesce = num_blocks >= 2 && std::env::var("CCC_NO_SLOT_COALESCE").is_err();
 
     // Phase 0: Pre-scan for vector intrinsics and mark their destinations.
     // This must happen BEFORE stack layout because the slot allocator needs to
