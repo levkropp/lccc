@@ -1357,6 +1357,16 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction, gep_fold_m
 
 /// Generate a Copy instruction, handling coalesced slots, i128, and wide values.
 fn generate_copy(cg: &mut dyn ArchCodegen, dest: &Value, src: &Operand) {
+    // Propagate alloca flag through Copy chains: if src is an alloca, dest
+    // should also be treated as an alloca (its "value" is an address, not data).
+    // Without this, `char *zOut = buf;` (where buf is an alloca) would load
+    // from buf's slot (getting 0) instead of computing buf's address with leaq.
+    if let Operand::Value(src_val) = src {
+        if cg.state_ref().is_alloca(src_val.0) {
+            cg.state().alloca_values.insert(dest.0);
+        }
+    }
+
     // Skip Copy when dest and src share the same stack slot (from copy coalescing).
     if let Operand::Value(src_val) = src {
         let dest_slot = cg.state_ref().get_slot(dest.0);
