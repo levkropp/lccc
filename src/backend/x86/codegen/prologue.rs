@@ -155,16 +155,13 @@ impl X86Codegen {
             false,
         );
 
-        // When omitting the frame pointer, local slots must start AFTER the callee-save area
-        // to avoid overlapping. In RSP mode, callee saves are movq'd into the frame at
-        // offsets -8..-N*8, so locals must start at -N*8-8.
-        //
-        // With frame pointer (push mode): callee-saved pushes occupy -8(%rbp) through
-        // -(N*8)(%rbp). Local alloca slots must also start BELOW these pushes to avoid
-        // overlapping. The callee_save_reserve shifts all local slot offsets past the
-        // push area. The total frame size (space + callee_save_space at the end) already
-        // accounts for both local slots and push area separately, since pushes are
-        // separate from the subq allocation.
+        // FPO (RSP mode): callee saves are movq'd into the frame at offsets -8..-N*8
+        // from the virtual rbp. callee_save_reserve shifts local slots below them.
+        // RBP (push mode): pushes go BEFORE subq and are at -8(%rbp)..-N*8(%rbp).
+        // Local slots are within the subq frame starting at -(N*8+first_slot)(%rbp).
+        // For non-variadic RBP functions, no reserve is needed because the subq frame
+        // starts below the push area. For variadic functions, the register save area
+        // is added to `space` separately.
         let callee_save_reserve = (self.used_callee_saved.len() as i64) * 8;
         let mut space = calculate_stack_space_common(&mut self.state, func, callee_save_reserve, |space, alloc_size, align| {
             let effective_align = if align > 0 { align.max(8) } else { 8 };
@@ -182,14 +179,7 @@ impl X86Codegen {
             self.reg_save_area_offset = -space;
         }
 
-        // FPO mode: callee saves are movq'd into the frame, consuming frame space.
-        //   `space` already includes callee_save_reserve for the save area — return as-is.
-        // RBP mode: callee saves are pushed separately (not part of subq).
-        //   `space` includes callee_save_reserve to offset local slot assignments,
-        //   but the subq only needs space for locals + variadic save. However, since
-        //   callee_save_reserve is also the push area size, the subq $space works
-        //   correctly: the extra space at the top of the frame (between the pushes
-        //   and the first local slot) is just padding.
+        // `space` includes callee_save_reserve for the save area — return as-is.
         space
     }
 
