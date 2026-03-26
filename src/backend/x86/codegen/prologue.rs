@@ -238,7 +238,10 @@ impl X86Codegen {
             self.state.out.use_rsp_addressing = true;
             self.state.out.rsp_frame_size = frame_size;
         } else {
-            // Traditional frame-pointer prologue
+            // Traditional frame-pointer prologue.
+            // Reset RSP-relative addressing flag: a previous FPO function may have
+            // set it, and the AsmOutput is shared across all functions in the module.
+            self.state.out.use_rsp_addressing = false;
             self.state.emit("    pushq %rbp");
             if self.state.emit_cfi {
                 self.state.emit("    .cfi_def_cfa_offset 16");
