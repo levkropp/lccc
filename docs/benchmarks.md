@@ -96,13 +96,13 @@ void matmul(void) {
 
 **LCCC vs CCC:** 0.006s vs 0.029s (**+4.8× faster**). LCCC auto-vectorizes with AVX2 FMA3 (`vfmadd231pd`, 4 doubles per instruction), while CCC emits scalar `mulsd`/`addsd`.
 
-**LCCC vs GCC: 1.25× slower.** Both vectorize: LCCC uses AVX2 4-wide FMA, GCC uses SSE2 2-wide (`mulpd`/`addpd`). LCCC's inner loop has 15 instructions vs GCC's 7. Phase 16 optimizations:
-1. Fixed IVSR correctness bug (pointer IV compounding with indexed offsets in nested loops)
-2. Byte-offset IV: converted j-loop IV from element index to byte offset, eliminating `shl $5`
-3. `leaq` GEP optimization: GEP(base, offset) where both are register-allocated emits `leaq (%base, %offset), %dest` (1 instruction instead of 3)
-4. Fixed peephole optimizer XMM register corruption (OOB REG_NAMES access with family IDs 24-39)
+**LCCC vs GCC: 1.25× slower.** Both vectorize: LCCC uses AVX2 4-wide FMA, GCC uses SSE2 2-wide (`mulpd`/`addpd`). Despite processing 2× more elements per iteration, LCCC's inner loop has 15 instructions vs GCC's 7. Phase 16 optimizations:
+1. **IVSR correctness fix** (16a): IVSR's pointer IVs compounded with indexed offsets in nested loops, doubling effective addresses and producing wrong output. Disabled IVSR/Un-IVSR.
+2. **Byte-offset IV** (16c): Converted j-loop IV from element index (j*32) to byte offset (step 32), eliminating the `shl $5` multiply from the critical path.
+3. **leaq GEP optimization** (16e): When both GEP base and offset are register-allocated, emit `leaq (%base, %offset), %dest` (1 instruction instead of the 3-instruction accumulator path).
+4. **Peephole XMM fixes** (16e): Fixed two bugs — (a) `replace_reg_family` and `loop_trampoline` accessed `REG_NAMES[24]` with XMM family IDs (array has 16 entries), causing OOB reads that corrupted assembly text; (b) `eliminate_rcx_address_copy` extracted XMM register name as `line[18..]` giving `"1"` instead of `line[14..]` giving `"%xmm1"`, producing `movsd (%rbx), 1` instead of `movsd (%rbx), %xmm1`.
 
-Remaining gap: 3 register copies for FMA argument setup, 2 redundant sign-extensions, 2 loop-invariant A[i][k] load+broadcast instructions
+Remaining gap (15 vs 7 instructions): 3 register copies for FMA argument setup (FMA hardcodes rcx/rdx/rax), 2 loop-invariant A[i][k] load+broadcast (infrastructure ready but blocked by register allocation interaction), 2 redundant sign-extensions (needs I64 IV widening), 2 leaq vs GCC's inline SIB addressing.
 
 ### `04_qsort` — Library Calls
 
