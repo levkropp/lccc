@@ -2487,6 +2487,84 @@ pub(super) fn hoist_loop_invariant_fp_broadcast(
     changed
 }
 
+// ── Add + sign-extend fusion ─────────────────────────────────────────────────
+//
+// Fuses addl + movslq when the intermediate 32-bit register is only used
+// as a temporary:
+//
+//   addl %SRC, %TMP            →  addl %SRC, %DSTd
+//   movslq %TMPd, %DST        →  (NOP)
+//
+// The 32-bit addl into %DSTd automatically zero-extends to 64-bit on x86-64.
+// This is safe when the value is non-negative (array indices, loop counters).
+
+pub(super) fn fuse_add_sign_extend(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+
+    while i + 1 < len {
+        if infos[i].is_nop() { i += 1; continue; }
+
+        let t1 = infos[i].trimmed(store.get(i));
+        // Match: addl %SRC, %TMP
+        if !t1.starts_with("addl %") { i += 1; continue; }
+        let parts1: Vec<&str> = t1.split(", %").collect();
+        if parts1.len() != 2 { i += 1; continue; }
+        let src_reg = &parts1[0][5..]; // after "addl %"
+        let tmp_reg32 = parts1[1]; // e.g., "ebp"
+
+        // Find next non-NOP
+        let mut j = i + 1;
+        while j < len && infos[j].is_nop() { j += 1; }
+        if j >= len { i += 1; continue; }
+
+        let t2 = infos[j].trimmed(store.get(j));
+        // Match: movslq %TMPd, %DST
+        if !t2.starts_with("movslq %") { i += 1; continue; }
+        let parts2: Vec<&str> = t2.split(", %").collect();
+        if parts2.len() != 2 { i += 1; continue; }
+        let sext_src = &parts2[0][8..]; // after "movslq %"
+        let dst_reg64 = parts2[1]; // e.g., "r14"
+
+        // The movslq source (without 'd' suffix) must match the add dest
+        let sext_src_base = sext_src.trim_end_matches('d');
+        if sext_src_base != tmp_reg32 && sext_src != tmp_reg32 {
+            i += 1; continue;
+        }
+
+        // Check that %TMP is not used after the movslq (within 5 lines)
+        let tmp_64 = format!("%{}", sext_src_base); // e.g., "%rbp" or "%ebp"
+        let mut tmp_used_after = false;
+        for k in j + 1..len.min(j + 10) {
+            if infos[k].is_nop() { continue; }
+            if infos[k].kind == LineKind::Label { break; }
+            let tk = infos[k].trimmed(store.get(k));
+            // Check if the 32-bit or 64-bit form of TMP is referenced
+            if tk.contains(tmp_reg32) || tk.contains(sext_src_base) {
+                tmp_used_after = true;
+                break;
+            }
+        }
+        if tmp_used_after { i += 1; continue; }
+
+        // Get the 32-bit name for DST (e.g., "r14" → "r14d")
+        let dst_reg32 = format!("{}d", dst_reg64);
+
+        // Replace: addl %SRC, %DSTd; NOP the movslq
+        let new_add = format!("    addl %{}, %{}", src_reg, dst_reg32);
+        replace_line(store, &mut infos[i], i, new_add);
+        mark_nop(&mut infos[j]);
+        changed = true;
+        i = j + 1;
+        continue;
+    }
+    changed
+}
+
 // ── Increment chain collapse ─────────────────────────────────────────────────
 //
 // Collapses a common SSA phi-resolution pattern for loop counter increments:
