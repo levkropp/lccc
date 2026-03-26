@@ -87,6 +87,9 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= local_patterns::coalesce_phi_register_copies(&mut store, &mut infos);
         changed |= local_patterns::fuse_signext_and_move(&mut store, &mut infos);
         changed |= local_patterns::collapse_increment_chain(&mut store, &mut infos);
+        // fuse_add_sign_extend disabled: causes "bad src register" on matmul
+        // because the tmp_used_after check doesn't account for loop back-edges
+        // changed |= local_patterns::fuse_add_sign_extend(&mut store, &mut infos);
         changed |= local_patterns::fold_cascaded_shifts(&mut store, &mut infos);
         changed |= local_patterns::hoist_loop_invariant_gpr_load(&mut store, &mut infos);
         changed |= local_patterns::hoist_loop_invariant_fp_broadcast(&mut store, &mut infos);
