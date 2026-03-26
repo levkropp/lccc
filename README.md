@@ -72,7 +72,7 @@ All outputs are byte-identical to GCC.
 | Benchmark | LCCC | GCC -O2 | LCCC / GCC | Key optimization |
 |-----------|-----:|--------:|:----------:|:-----------------|
 | `arith_loop` — 32-var arithmetic, 10 M iters | **0.08 s** | 0.08 s | **1.0×** | Phi register coalescing, 3-channel multiply ILP |
-| `sieve` — primes to 10 M | 0.05 s | 0.04 s | 1.25× | Phi-copy coalescing, sign-ext fusion, loop rotation, late stack-load hoist |
+| `sieve` — primes to 10 M | **0.07 s** | 0.06 s | **1.17×** | Phi-copy coalescing, sign-ext fusion, loop rotation, stack-load hoist, addl+movslq fusion |
 | `qsort` — sort 1 M integers | 0.122 s | 0.101 s | 1.2× | Push/pop callee saves, memory-operand codegen |
 | `fib(40)` — recursive Fibonacci | **0.001 s** | 0.136 s | **478× faster** | Binary recursion → iterative accumulator |
 | `matmul` — 256×256 double | **0.004 s** | 0.004 s | **1.0×** | AVX2 FMA3, byte-offset IV, leaq GEP, broadcast hoist, peephole XMM fix |
@@ -87,10 +87,10 @@ All outputs are byte-identical to GCC.
   instructions vs GCC's 125.
 - **Fibonacci 478× faster**: Binary recursion-to-iteration converts exponential O(2^n) recursive fib
   to O(n) iterative sliding-window loop. GCC keeps recursive calls.
-- **Sieve 1.1×**: Phase 13 peephole passes reduced the inner marking loop from 11 to 6 instructions:
-  phi-copy coalescing eliminates SSA temp copies, sign-extend fusion retargets `movslq` directly,
-  loop rotation moves the condition to the latch (1 branch vs 2), and the latch optimizer
-  eliminates redundant self sign-extends.
+- **Sieve 1.17×**: Inner marking loop reduced from 6 to 4 instructions (matching GCC). Phase 17
+  hoisted the loop-invariant sieve pointer load out of the inner loop (late peephole pass after
+  all simplifications), then fused `addl + movslq` into a single `addl` by redirecting the 32-bit
+  add to write directly into the sign-extend destination register.
 - **MatMul 1.0× (parity)**: AVX2 vectorization with FMA3 (`vfmadd231pd`). Phase 16
   converted the inner loop IV to byte offset, added `leaq` GEP optimization (1 instruction
   instead of 3), hoisted the loop-invariant A[i][k] broadcast via peephole, and eliminated
