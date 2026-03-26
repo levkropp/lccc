@@ -162,7 +162,14 @@ impl X86Codegen {
         // For non-variadic RBP functions, no reserve is needed because the subq frame
         // starts below the push area. For variadic functions, the register save area
         // is added to `space` separately.
-        let callee_save_reserve = (self.used_callee_saved.len() as i64) * 8;
+        // Reserve space for callee-saved register saves PLUS 8 bytes of padding.
+        // The saves occupy offsets -8, -16, ..., -(N*8) from the virtual rbp.
+        // Without the +8 padding, block-local slot reuse (Tier 3) can assign
+        // a variable to offset -(N*8) which COLLIDES with the last callee-save
+        // (typically %rbp). Adding 8 bytes ensures the reuse pool starts at
+        // -(N*8 + 8), safely below the callee-save area.
+        let n_callee = self.used_callee_saved.len() as i64;
+        let callee_save_reserve = if n_callee > 0 { n_callee * 8 + 8 } else { 0 };
         let mut space = calculate_stack_space_common(&mut self.state, func, callee_save_reserve, |space, alloc_size, align| {
             let effective_align = if align > 0 { align.max(8) } else { 8 };
             let alloc = (alloc_size + 7) & !7;
