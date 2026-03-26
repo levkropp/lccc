@@ -87,9 +87,7 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= local_patterns::coalesce_phi_register_copies(&mut store, &mut infos);
         changed |= local_patterns::fuse_signext_and_move(&mut store, &mut infos);
         changed |= local_patterns::collapse_increment_chain(&mut store, &mut infos);
-        // fuse_add_sign_extend disabled: causes "bad src register" on matmul
-        // because the tmp_used_after check doesn't account for loop back-edges
-        // changed |= local_patterns::fuse_add_sign_extend(&mut store, &mut infos);
+        changed |= local_patterns::fuse_add_sign_extend(&mut store, &mut infos);
         changed |= local_patterns::fold_cascaded_shifts(&mut store, &mut infos);
         changed |= local_patterns::hoist_loop_invariant_gpr_load(&mut store, &mut infos);
         changed |= local_patterns::hoist_loop_invariant_fp_broadcast(&mut store, &mut infos);
@@ -136,6 +134,10 @@ pub fn peephole_optimize(asm: String) -> String {
         }
     }
 
+    // Phase 3b: Fuse addl+movslq in loops (must run BEFORE trampoline elimination,
+    // which may remove the conditional back-edge that this pass uses to detect loops).
+    local_patterns::fuse_add_sign_extend(&mut store, &mut infos);
+
     // Phase 4: Eliminate loop backedge trampoline blocks.
     let trampoline_changed = loop_trampoline::eliminate_loop_trampolines(&mut store, &mut infos);
 
@@ -174,6 +176,11 @@ pub fn peephole_optimize(asm: String) -> String {
     // tail call optimization. Uses multi-line replacement, so no further
     // line-level passes should depend on infos accuracy after this.
     local_patterns::rotate_loops(&mut store, &mut infos);
+
+    // Phase 4e: Fuse addl+movslq after loop rotation.
+    // Rotation moves the movslq from the header to the latch (right after addl).
+    // Use text-only fusion (no infos dependency) since rotate uses multi-line replacement.
+    local_patterns::fuse_add_sign_extend(&mut store, &mut infos);
 
     // Phase 5: Tail call optimization: convert `call X; epilogue; ret` to
     // `epilogue; jmp X`. This must run before callee-save elimination because

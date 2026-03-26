@@ -2506,60 +2506,78 @@ pub(super) fn fuse_add_sign_extend(
     let mut changed = false;
     let mut i = 0;
 
+    // Simple adjacent-pair scan: find addl %X, %TMP immediately followed by
+    // movslq %TMP, %DST. Check that %TMP is not used elsewhere in the
+    // surrounding block.
     while i + 1 < len {
-        if infos[i].is_nop() { i += 1; continue; }
-
-        let t1 = infos[i].trimmed(store.get(i));
-        // Match: addl %SRC, %TMP
+        let t1 = store.get(i).trim().to_string();
         if !t1.starts_with("addl %") { i += 1; continue; }
         let parts1: Vec<&str> = t1.split(", %").collect();
         if parts1.len() != 2 { i += 1; continue; }
-        let src_reg = &parts1[0][5..]; // after "addl %"
-        let tmp_reg32 = parts1[1]; // e.g., "ebp"
+        let src_reg = parts1[0][6..].to_string(); // after "addl %"
+        let tmp_reg = parts1[1].to_string();
 
-        // Find next non-NOP
-        let mut j = i + 1;
-        while j < len && infos[j].is_nop() { j += 1; }
-        if j >= len { i += 1; continue; }
-
-        let t2 = infos[j].trimmed(store.get(j));
-        // Match: movslq %TMPd, %DST
-        if !t2.starts_with("movslq %") { i += 1; continue; }
-        let parts2: Vec<&str> = t2.split(", %").collect();
+        // Next line must be movslq %TMP, %DST (check all lines in case of multi-line)
+        let t2_raw = store.get(i + 1);
+        let t2 = t2_raw.trim().to_string();
+        // Handle multi-line entries: check first line
+        let t2_first = t2.split('\n').next().unwrap_or(&t2).trim().to_string();
+        if !t2_first.starts_with("movslq %") { i += 1; continue; }
+        let parts2: Vec<&str> = t2_first.split(", %").collect();
         if parts2.len() != 2 { i += 1; continue; }
-        let sext_src = &parts2[0][8..]; // after "movslq %"
-        let dst_reg64 = parts2[1]; // e.g., "r14"
+        let sext_src = parts2[0][8..].to_string();
+        let dst_reg = parts2[1].to_string();
 
-        // The movslq source (without 'd' suffix) must match the add dest
-        let sext_src_base = sext_src.trim_end_matches('d');
-        if sext_src_base != tmp_reg32 && sext_src != tmp_reg32 {
+        let sext_base = sext_src.trim_end_matches('d').to_string();
+        if sext_base != tmp_reg && sext_src != tmp_reg {
             i += 1; continue;
         }
 
-        // Check that %TMP is not used after the movslq (within 5 lines)
-        let tmp_64 = format!("%{}", sext_src_base); // e.g., "%rbp" or "%ebp"
-        let mut tmp_used_after = false;
-        for k in j + 1..len.min(j + 10) {
-            if infos[k].is_nop() { continue; }
-            if infos[k].kind == LineKind::Label { break; }
-            let tk = infos[k].trimmed(store.get(k));
-            // Check if the 32-bit or 64-bit form of TMP is referenced
-            if tk.contains(tmp_reg32) || tk.contains(sext_src_base) {
-                tmp_used_after = true;
+        // Find enclosing block bounds for safety check
+        let mut block_start = 0;
+        for k in (0..i).rev() {
+            let tk = store.get(k);
+            if tk.trim().ends_with(':') || tk.contains(":\n") {
+                block_start = k;
                 break;
             }
         }
-        if tmp_used_after { i += 1; continue; }
+        let mut block_end = len - 1;
+        for k in (i + 2)..len.min(i + 30) {
+            let tk = store.get(k).trim().to_string();
+            if tk.starts_with("j") || tk.ends_with(':') {
+                block_end = k;
+                break;
+            }
+        }
 
-        // Get the 32-bit name for DST (e.g., "r14" → "r14d")
-        let dst_reg32 = format!("{}d", dst_reg64);
+        // Safety: %TMP must not appear elsewhere in the block
+        let tmp_pattern = format!("%{}", tmp_reg);
+        let mut tmp_used_elsewhere = false;
+        for k in block_start..=block_end {
+            if k == i || k == i + 1 { continue; }
+            let tk = store.get(k).to_string();
+            if tk.contains(&tmp_pattern) {
+                tmp_used_elsewhere = true;
+                break;
+            }
+        }
+        if tmp_used_elsewhere { i += 1; continue; }
 
-        // Replace: addl %SRC, %DSTd; NOP the movslq
+        // Transform!
+        let dst_reg32 = format!("{}d", dst_reg);
         let new_add = format!("    addl %{}, %{}", src_reg, dst_reg32);
-        replace_line(store, &mut infos[i], i, new_add);
-        mark_nop(&mut infos[j]);
+        let t2_raw_owned = store.get(i + 1).to_string();
+        store.replace(i, new_add);
+        // If movslq was part of a multi-line entry, keep the rest
+        if t2_raw_owned.contains('\n') {
+            let rest = t2_raw_owned.split_once('\n').map(|(_, r)| r).unwrap_or("");
+            store.replace(i + 1, rest.to_string());
+        } else {
+            store.replace(i + 1, String::new());
+        }
         changed = true;
-        i = j + 1;
+        i += 2;
         continue;
     }
     changed
