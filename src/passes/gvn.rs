@@ -111,11 +111,15 @@ struct GvnState {
     /// parameter values from the alloca slot, which may be modified by
     /// stores through aliased pointers.
     escaped_param_allocas: FxHashSet<u32>,
+    /// Volatile allocas must not participate in store-to-load forwarding.
+    /// These are used for post-increment/decrement temporaries that must
+    /// survive through the stack slot to prevent register coalescing issues.
+    volatile_allocas: FxHashSet<u32>,
 }
 
 impl GvnState {
     /// Create a new GVN state sized for `max_value_id` values.
-    fn new(max_value_id: usize, escaped_param_allocas: FxHashSet<u32>) -> Self {
+    fn new(max_value_id: usize, escaped_param_allocas: FxHashSet<u32>, volatile_allocas: FxHashSet<u32>) -> Self {
         Self {
             value_numbers: vec![u32::MAX; max_value_id + 1],
             next_vn: 0,
@@ -129,6 +133,7 @@ impl GvnState {
             vn_log: Vec::new(),
             total_eliminated: 0,
             escaped_param_allocas,
+            volatile_allocas,
         }
     }
 
@@ -372,6 +377,22 @@ fn find_escaped_param_allocas(func: &IrFunction) -> FxHashSet<u32> {
     escaped
 }
 
+/// Find volatile allocas in the function. These must not participate in
+/// store-to-load forwarding because they are used to preserve values that
+/// would otherwise be lost to register coalescing (e.g., post-decrement
+/// return values in `while(n--)` patterns).
+fn find_volatile_allocas(func: &IrFunction) -> FxHashSet<u32> {
+    let mut volatile = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Alloca { dest, volatile: true, .. } = inst {
+                volatile.insert(dest.0);
+            }
+        }
+    }
+    volatile
+}
+
 /// Run dominator-based GVN on a single function.
 pub(crate) fn run_gvn_function(func: &mut IrFunction) -> usize {
     let num_blocks = func.blocks.len();
@@ -380,10 +401,11 @@ pub(crate) fn run_gvn_function(func: &mut IrFunction) -> usize {
     }
 
     let escaped = find_escaped_param_allocas(func);
+    let volatile = find_volatile_allocas(func);
 
     // Fast path for single-block functions: skip CFG/dominator computation.
     if num_blocks == 1 {
-        let mut state = GvnState::new(func.max_value_id() as usize, escaped);
+        let mut state = GvnState::new(func.max_value_id() as usize, escaped, volatile);
         return process_block(0, func, &mut state);
     }
 
@@ -401,14 +423,15 @@ pub(crate) fn run_gvn_with_analysis(func: &mut IrFunction, cfg: &analysis::CfgAn
     }
 
     let escaped = find_escaped_param_allocas(func);
+    let volatile = find_volatile_allocas(func);
 
     // Fast path for single-block functions.
     if num_blocks == 1 {
-        let mut state = GvnState::new(func.max_value_id() as usize, escaped);
+        let mut state = GvnState::new(func.max_value_id() as usize, escaped, volatile);
         return process_block(0, func, &mut state);
     }
 
-    let mut state = GvnState::new(func.max_value_id() as usize, escaped);
+    let mut state = GvnState::new(func.max_value_id() as usize, escaped, volatile);
 
     // DFS over the dominator tree
     gvn_dfs(0, func, &cfg.dom_children, &cfg.preds, &mut state);
@@ -532,7 +555,8 @@ fn process_block(
         // aliased pointer may write to the same slot.
         if is_forwardable_store(&inst) {
             if let Instruction::Store { val, ptr, ty, .. } = &inst {
-                if !state.escaped_param_allocas.contains(&ptr.0) {
+                if !state.escaped_param_allocas.contains(&ptr.0)
+                    && !state.volatile_allocas.contains(&ptr.0) {
                     let ptr_vn = state.operand_to_vn(&Operand::Value(*ptr));
                     let fwd_key = StoreFwdKey { ptr_vn, ty: *ty };
                     let fwd_key_for_log = fwd_key.clone();

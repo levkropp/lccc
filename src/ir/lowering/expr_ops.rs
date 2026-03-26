@@ -783,22 +783,47 @@ impl Lowerer {
         if let Some(lv) = self.lower_lvalue(inner) {
             let loaded = self.load_lvalue_typed(&lv, ty);
             let loaded_val = self.operand_to_value(loaded);
+
+            // For post-increment/decrement (return_new == false), save the old
+            // value to a volatile alloca BEFORE computing the new value. This
+            // prevents register coalescing from clobbering the old value: after
+            // mem2reg, the old value gets coalesced with the phi dest (same
+            // register), but the inc/dec computation writes the new value to
+            // that register before the old value is consumed (e.g., the
+            // CondBranch in `while(n--)`).
+            let mut postdec_alloca = None;
+            if !return_new {
+                let alloca_ty = if ty == IrType::Ptr { IrType::I64 } else { ty };
+                let tmp = self.emit_entry_alloca(alloca_ty, alloca_ty.size(), 0, true);
+                self.emit(Instruction::Store {
+                    val: Operand::Value(loaded_val), ptr: tmp,
+                    ty: alloca_ty, seg_override: AddressSpace::Default,
+                });
+                postdec_alloca = Some((tmp, alloca_ty));
+            }
+
             let (step, binop_ty) = self.inc_dec_step_and_type(ty, inner);
             let ir_op = if is_inc { IrBinOp::Add } else { IrBinOp::Sub };
             let result = self.emit_binop_val(ir_op, Operand::Value(loaded_val), step, binop_ty);
             let store_op = if self.is_bool_lvalue(inner) {
                 self.emit_bool_normalize_typed(Operand::Value(result), binop_ty)
             } else if ty != binop_ty && ty.is_integer() && binop_ty.is_integer() {
-                // When the add/sub was done in a wider type than the variable's type
-                // (e.g. U32 variable incremented via I64 add), truncate back to the
-                // variable's type so wrapping semantics are correct. Without this,
-                // 0xFFFFFFFF + 1 would be 0x100000000 instead of wrapping to 0.
                 self.emit_implicit_cast(Operand::Value(result), binop_ty, ty)
             } else {
                 Operand::Value(result)
             };
             self.store_lvalue_typed(&lv, store_op, ty);
-            return if return_new { store_op } else { loaded };
+            if return_new {
+                return store_op;
+            }
+            // Reload the old value from the alloca we saved earlier
+            let (tmp, alloca_ty) = postdec_alloca.unwrap();
+            let reload_dest = self.fresh_value();
+            self.emit(Instruction::Load {
+                dest: reload_dest, ptr: tmp,
+                ty: alloca_ty, seg_override: AddressSpace::Default,
+            });
+            return Operand::Value(reload_dest);
         }
         self.lower_expr(inner)
     }
