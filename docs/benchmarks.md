@@ -34,7 +34,7 @@ Six micro-benchmarks targeting different bottlenecks. All measured with best-of-
 | `sieve` | 0.048s | 0.044s | **1.09× slower** |
 | `qsort` | 0.122s | 0.101s | 1.20× slower |
 | `fib(40)` | **0.001s** | 0.136s | **478× faster** |
-| `matmul` | 0.006s | 0.005s | **1.20× slower** |
+| `matmul` | 0.005s | 0.004s | **1.25× slower** |
 | `reduction` | **AVX2** | scalar (GCC -O3) | **~2.7× faster** |
 | `tce_sum` | 0.007s | 0.001s | 7× slower (GCC const-folds) |
 
@@ -96,10 +96,13 @@ void matmul(void) {
 
 **LCCC vs CCC:** 0.006s vs 0.029s (**+4.8× faster**). LCCC auto-vectorizes with AVX2 FMA3 (`vfmadd231pd`, 4 doubles per instruction), while CCC emits scalar `mulsd`/`addsd`.
 
-**LCCC vs GCC: 1.2× slower.** Both vectorize: LCCC uses AVX2 4-wide FMA, GCC uses SSE2 2-wide (`mulpd`/`addpd`). Despite processing 2× more elements per iteration, LCCC's inner loop has 17 instructions vs GCC's 7, due to:
-1. Address computation (7 instructions): GEP lowering goes through the accumulator instead of SIB addressing
-2. Loop-invariant A[i][k] broadcast (2 instructions): not yet hoisted to preheader
-3. Phase 16 fixed a correctness bug in IVSR (pointer IV compounding with indexed offsets in nested loops) and converted the j-loop IV from element index to byte offset, eliminating the `shl $5` from the critical path
+**LCCC vs GCC: 1.25× slower.** Both vectorize: LCCC uses AVX2 4-wide FMA, GCC uses SSE2 2-wide (`mulpd`/`addpd`). LCCC's inner loop has 15 instructions vs GCC's 7. Phase 16 optimizations:
+1. Fixed IVSR correctness bug (pointer IV compounding with indexed offsets in nested loops)
+2. Byte-offset IV: converted j-loop IV from element index to byte offset, eliminating `shl $5`
+3. `leaq` GEP optimization: GEP(base, offset) where both are register-allocated emits `leaq (%base, %offset), %dest` (1 instruction instead of 3)
+4. Fixed peephole optimizer XMM register corruption (OOB REG_NAMES access with family IDs 24-39)
+
+Remaining gap: 3 register copies for FMA argument setup, 2 redundant sign-extensions, 2 loop-invariant A[i][k] load+broadcast instructions
 
 ### `04_qsort` — Library Calls
 
