@@ -954,8 +954,13 @@ impl AsmOutput {
     pub fn emit_instr_rbp(&mut self, mnemonic: &str, offset: i64) {
         self.buf.push_str(mnemonic);
         self.buf.push(' ');
-        write_i64_fast(&mut self.buf, offset);
-        self.buf.push_str("(%rbp)");
+        if self.use_rsp_addressing {
+            write_i64_fast(&mut self.buf, self.rsp_frame_size + offset);
+            self.buf.push_str("(%rsp)");
+        } else {
+            write_i64_fast(&mut self.buf, offset);
+            self.buf.push_str("(%rbp)");
+        }
         self.buf.push('\n');
     }
 

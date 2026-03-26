@@ -182,14 +182,14 @@ impl X86Codegen {
             self.reg_save_area_offset = -space;
         }
 
-        // With FPO (RSP mode): callee-saved registers are movq'd into the frame
-        // alongside locals, so their space is already in `space` via callee_save_reserve.
-        // Without FPO (RBP mode): callee-saved registers are pushed separately (before
-        // subq), so `space` includes the callee_save_reserve offset but the pushes don't
-        // consume subq space. However, the subq must be large enough for all locals +
-        // variadic save area, which are already accounted for in `space`.
-        // The callee_save_reserve in `space` just shifts slot offsets to avoid the push
-        // area; the actual stack allocation (subq) is `space` in both modes.
+        // FPO mode: callee saves are movq'd into the frame, consuming frame space.
+        //   `space` already includes callee_save_reserve for the save area — return as-is.
+        // RBP mode: callee saves are pushed separately (not part of subq).
+        //   `space` includes callee_save_reserve to offset local slot assignments,
+        //   but the subq only needs space for locals + variadic save. However, since
+        //   callee_save_reserve is also the push area size, the subq $space works
+        //   correctly: the extra space at the top of the frame (between the pushes
+        //   and the first local slot) is just padding.
         space
     }
 
