@@ -158,7 +158,15 @@ pub fn peephole_optimize(asm: String) -> String {
         }
     }
 
-    // Phase 4c: Loop rotation — move condition from header to latch.
+    // Phase 4c: Late loop-invariant hoisting.
+    // Must run after all simplification passes have cleaned up the loop body
+    // (e.g., eliminate_rcx_address_copy, fold_base_index_addressing). Earlier
+    // in Phase 1, intermediate register copies prevent hoisting because the
+    // destination register appears to be written elsewhere.
+    local_patterns::hoist_loop_invariant_gpr_load(&mut store, &mut infos);
+    local_patterns::hoist_loop_invariant_fp_broadcast(&mut store, &mut infos);
+
+    // Phase 4d: Loop rotation — move condition from header to latch.
     // Must run after trampolines (which simplify loop structure) and before
     // tail call optimization. Uses multi-line replacement, so no further
     // line-level passes should depend on infos accuracy after this.
