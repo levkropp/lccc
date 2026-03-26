@@ -861,8 +861,42 @@ fn detect_phi_coalesce_groups(
                 if multi_def.contains(&dest.0) && !seen_phi_dests.contains(&dest.0) {
                     // Don't coalesce if src is itself a multi-def (swap cycle temporaries)
                     if !multi_def.contains(&src_val.0) {
-                        groups.push((dest.0, src_val.0));
-                        seen_phi_dests.insert(dest.0);
+                        // Safety: don't coalesce if the phi dest is used AFTER
+                        // the backedge source's definition in the same block.
+                        // This detects the "lost copy" pattern where e.g.:
+                        //   v_n = Call(malloc)       ← src defined here
+                        //   Store(v_head, v_n+8)     ← phi dest USED here
+                        //   Copy v_head = v_n        ← coalesce candidate
+                        // Coalescing v_head and v_n to the same register would
+                        // clobber v_head when storing the Call result.
+                        let mut src_defined = false;
+                        let mut phi_dest_used_after_src = false;
+                        for inst2 in &block.instructions {
+                            if !src_defined {
+                                // Check if this instruction defines src_val
+                                if let Some(d) = inst2.dest() {
+                                    if d.0 == src_val.0 {
+                                        src_defined = true;
+                                    }
+                                }
+                            } else {
+                                // After src is defined, check if phi dest is used
+                                if let Instruction::Copy { dest: d, .. } = inst2 {
+                                    if d.0 == dest.0 {
+                                        break; // reached the coalesce Copy, stop
+                                    }
+                                }
+                                // Check if the phi dest value appears as an operand
+                                let uses_dest = uses_value(inst2, dest.0);
+                                if uses_dest {
+                                    phi_dest_used_after_src = true;
+                                }
+                            }
+                        }
+                        if !phi_dest_used_after_src {
+                            groups.push((dest.0, src_val.0));
+                            seen_phi_dests.insert(dest.0);
+                        }
                     }
                 }
             }
@@ -870,4 +904,31 @@ fn detect_phi_coalesce_groups(
     }
 
     groups
+}
+
+/// Check if an instruction uses a given value ID as an operand (not as dest).
+fn uses_value(inst: &Instruction, val_id: u32) -> bool {
+    let check_op = |op: &Operand| -> bool {
+        matches!(op, Operand::Value(v) if v.0 == val_id)
+    };
+    match inst {
+        Instruction::Store { val, ptr, .. } => check_op(val) || ptr.0 == val_id,
+        Instruction::Load { ptr, .. } => ptr.0 == val_id,
+        Instruction::BinOp { lhs, rhs, .. } => check_op(lhs) || check_op(rhs),
+        Instruction::UnaryOp { src, .. } => check_op(src),
+        Instruction::Cmp { lhs, rhs, .. } => check_op(lhs) || check_op(rhs),
+        Instruction::Cast { src, .. } => check_op(src),
+        Instruction::Copy { src, .. } => check_op(src),
+        Instruction::GetElementPtr { base, offset, .. } => base.0 == val_id || check_op(offset),
+        Instruction::Select { cond, true_val, false_val, .. } =>
+            check_op(cond) || check_op(true_val) || check_op(false_val),
+        Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } =>
+            info.args.iter().any(|a| check_op(a)),
+        Instruction::AtomicStore { val, ptr, .. } => check_op(val) || check_op(ptr),
+        Instruction::AtomicLoad { ptr, .. } => check_op(ptr),
+        Instruction::AtomicRmw { ptr, val, .. } => check_op(ptr) || check_op(val),
+        Instruction::AtomicCmpxchg { ptr, expected, desired, .. } =>
+            check_op(ptr) || check_op(expected) || check_op(desired),
+        _ => false,
+    }
 }
