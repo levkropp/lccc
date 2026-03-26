@@ -743,7 +743,7 @@ fn simplify_trivial_phis(func: &mut IrFunction) -> usize {
 /// Without fusion, SSA values crossing these artificial block boundaries are
 /// classified as multi-block and each gets a permanent stack slot (8 bytes).
 fn merge_single_pred_blocks(func: &mut IrFunction) -> usize {
-    if func.blocks.len() <= 1 {
+    if func.blocks.len() <= 1 || std::env::var("CCC_NO_MERGE_BLOCKS").is_ok() {
         return 0;
     }
 
