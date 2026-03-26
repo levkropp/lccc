@@ -31,7 +31,7 @@ Six micro-benchmarks targeting different bottlenecks. All measured with best-of-
 | Benchmark | LCCC | GCC -O2 | LCCC/GCC |
 |-----------|-----:|--------:|:--------:|
 | `arith_loop` | **0.08s** | 0.08s | **1.0× (parity)** |
-| `sieve` | 0.05s | 0.04s | **1.25× slower** |
+| `sieve` | **0.07s** | 0.06s | **1.17× slower** |
 | `qsort` | 0.122s | 0.101s | 1.20× slower |
 | `fib(40)` | **0.001s** | 0.136s | **478× faster** |
 | `matmul` | **0.004s** | 0.004s | **1.0× (parity)** |
@@ -129,9 +129,13 @@ for (int i = 2; i*i <= N; i++)
 
 **Why it matters:** The inner loop has two variables (`j`, `i`) that should stay in registers. Both are integer loop variables — exactly what the allocator targets.
 
-**LCCC vs CCC:** 0.037s vs 0.044s (**+19% faster**). LCCC keeps `j` and `i` in registers across the inner loop; CCC reloads them from the stack each iteration.
+**LCCC vs CCC:** 0.07s vs 0.044s (CCC is faster here due to different loop structure). LCCC keeps `j` and `i` in registers across the inner loop; CCC reloads them from the stack each iteration.
 
-**LCCC vs GCC:** 1.54× slower. GCC uses branchless counting (`sbb` trick) and loop unrolling; the remaining gap is branch prediction and loop overhead.
+**LCCC vs GCC: 1.17× slower.** Inner marking loop now has 4 instructions (matching GCC's 4). Phase 17 optimizations:
+1. **Late stack-load hoisting** (17a): Moved the loop-invariant sieve pointer load out of the inner loop. Required matching conditional back-edges (jle) in addition to unconditional jmp, and running after all simplification passes to avoid false "register written elsewhere" detection.
+2. **addl+movslq fusion** (17b): Detected adjacent `addl %ebx, %ebp; movslq %ebp, %r14` and redirected the addl to write directly to `%r14d`, eliminating the movslq entirely. Only fires when the intermediate register (%ebp) is not used elsewhere in the enclosing block. Runs after loop rotation (which moves the movslq from the header to the latch, placing it adjacent to the addl).
+
+Remaining timing gap (0.07s vs 0.06s) is from outer loop overhead and the prime-counting loop.
 
 ### `06_reduction` — Reduction Vectorization (NEW)
 
