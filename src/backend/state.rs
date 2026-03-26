@@ -80,6 +80,9 @@ pub struct CodegenState {
     pub out: AsmOutput,
     pub stack_offset: i64,
     pub value_locations: FxHashMap<u32, StackSlot>,
+    /// Emergency spill slot offset, allocated downward from the bottom of the frame.
+    /// Used when store_rax_to encounters a value with no register or stack slot.
+    pub emergency_spill_offset: i64,
     /// Values that are allocas (their stack slot IS the data, not a pointer to data).
     pub alloca_values: FxHashSet<u32>,
     /// Type associated with each alloca (for type-aware loads/stores).
@@ -234,6 +237,7 @@ impl CodegenState {
             out: AsmOutput::new(),
             stack_offset: 0,
             value_locations: FxHashMap::default(),
+            emergency_spill_offset: 0,
             alloca_values: FxHashSet::default(),
             alloca_types: FxHashMap::default(),
             alloca_alignments: FxHashMap::default(),
@@ -363,6 +367,17 @@ impl CodegenState {
 
     pub fn get_slot(&self, v: u32) -> Option<StackSlot> {
         self.value_locations.get(&v).copied()
+    }
+
+    /// Allocate an emergency spill slot for a value that has no register or
+    /// stack slot. Uses the red zone below the frame (extending the stack
+    /// offset downward). The slot is registered in value_locations so
+    /// subsequent reads can find it.
+    pub fn allocate_emergency_slot(&mut self, val_id: u32) -> StackSlot {
+        self.emergency_spill_offset -= 8;
+        let slot = StackSlot(self.stack_offset + self.emergency_spill_offset);
+        self.value_locations.insert(val_id, slot);
+        slot
     }
 
     pub fn is_i128_value(&self, v: u32) -> bool {

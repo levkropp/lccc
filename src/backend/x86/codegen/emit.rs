@@ -636,6 +636,13 @@ impl X86Codegen {
         } else if let Some(slot) = self.state.get_slot(dest.0) {
             // No register: store to stack slot.
             self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
+        } else {
+            // Value has neither register nor slot. This can happen when copy
+            // coalescing or immediately-consumed analysis eliminated the slot,
+            // but the accumulator cache gets invalidated before the value is
+            // read. Allocate an emergency spill slot to preserve the value.
+            let slot = self.state.allocate_emergency_slot(dest.0);
+            self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
         }
         // After storing to dest, %rax still holds dest's value
         self.state.reg_cache.set_acc(dest.0, false);
