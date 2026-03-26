@@ -600,12 +600,10 @@ impl X86Codegen {
                     let b_gep = b_val.and_then(|bv| self.find_gep_base_offset(bv));
                     let c_gep = self.find_gep_base_offset(c_val);
 
-                    // Use SIB if both have GEP info and share the same offset value
-                    // Temporarily disabled for debugging
-                    let use_sib = false &&  match (&b_gep, &c_gep) {
-                        (Some((_, b_off)), Some((_, c_off))) => b_off == c_off,
-                        _ => false,
-                    };
+                    // SIB disabled: GEP leaq optimization handles the address
+                    // computation more reliably (no value ID matching needed).
+                    let use_sib = false;
+                    let _ = (&b_gep, &c_gep);
 
                     if use_sib {
                         let (c_base, offset) = c_gep.unwrap();

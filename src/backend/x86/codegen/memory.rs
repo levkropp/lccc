@@ -763,6 +763,30 @@ impl X86Codegen {
         self.state.reg_cache.invalidate_acc();
     }
 
+    /// Emit leaq (%base, %index), %dest for GEP with both operands in registers.
+    /// If dest is also register-allocated, emits directly to the dest register.
+    /// Otherwise, emits to %rax and stores via store_rax_to.
+    pub(super) fn emit_leaq_base_index_impl(
+        &mut self,
+        base_reg: super::super::super::regalloc::PhysReg,
+        index_reg: super::super::super::regalloc::PhysReg,
+        dest: &Value,
+        dest_phys: Option<super::super::super::regalloc::PhysReg>,
+    ) {
+        use super::emit::{phys_reg_name};
+        let base_name = phys_reg_name(base_reg);
+        let index_name = phys_reg_name(index_reg);
+
+        if let Some(dp) = dest_phys {
+            let dest_name = phys_reg_name(dp);
+            self.state.emit_fmt(format_args!("    leaq (%{}, %{}), %{}", base_name, index_name, dest_name));
+        } else {
+            self.state.emit_fmt(format_args!("    leaq (%{}, %{}), %rax", base_name, index_name));
+            self.store_rax_to(dest);
+        }
+        self.state.reg_cache.invalidate_acc();
+    }
+
     pub(super) fn emit_gep_add_const_to_acc_impl(&mut self, offset: i64) {
         if offset != 0 {
             self.state.out.emit_instr_imm_reg("    addq", offset, "rax");

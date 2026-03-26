@@ -57,6 +57,9 @@ const MAX_POST_GLOBAL_ITERATIONS: usize = 4;
 /// 3. Run local passes one more time to clean up opportunities exposed by the
 ///    global passes (max `MAX_POST_GLOBAL_ITERATIONS` iterations).
 pub fn peephole_optimize(asm: String) -> String {
+    if std::env::var("CCC_NO_PEEPHOLE").is_ok() {
+        return asm;
+    }
     let mut store = LineStore::new(asm);
     let line_count = store.len();
     let mut infos: Vec<LineInfo> = (0..line_count).map(|i| classify_line(store.get(i))).collect();
