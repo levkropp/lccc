@@ -156,14 +156,16 @@ impl X86Codegen {
         );
 
         // When omitting the frame pointer, local slots must start AFTER the callee-save area
-        // to avoid overlapping. In push mode, pushes are separate from the subq frame,
-        // so locals can start at offset 0. In RSP mode, callee saves are movq'd into the
-        // frame at offsets -8..-N*8, so locals must start at -N*8-8.
-        let callee_save_reserve = if self.state.omit_frame_pointer {
-            (self.used_callee_saved.len() as i64) * 8
-        } else {
-            0
-        };
+        // to avoid overlapping. In RSP mode, callee saves are movq'd into the frame at
+        // offsets -8..-N*8, so locals must start at -N*8-8.
+        //
+        // With frame pointer (push mode): callee-saved pushes occupy -8(%rbp) through
+        // -(N*8)(%rbp). Local alloca slots must also start BELOW these pushes to avoid
+        // overlapping. The callee_save_reserve shifts all local slot offsets past the
+        // push area. The total frame size (space + callee_save_space at the end) already
+        // accounts for both local slots and push area separately, since pushes are
+        // separate from the subq allocation.
+        let callee_save_reserve = (self.used_callee_saved.len() as i64) * 8;
         let mut space = calculate_stack_space_common(&mut self.state, func, callee_save_reserve, |space, alloc_size, align| {
             let effective_align = if align > 0 { align.max(8) } else { 8 };
             let alloc = (alloc_size + 7) & !7;
@@ -180,12 +182,15 @@ impl X86Codegen {
             self.reg_save_area_offset = -space;
         }
 
-        // Callee-saved registers are now saved with pushq, so they don't consume
-        // stack frame space. But we still need to account for their rbp offsets:
-        // the pushes happen after `movq %rsp, %rbp`, so they occupy -8(%rbp),
-        // -16(%rbp), etc. The local frame starts after them.
-        let callee_save_space = (self.used_callee_saved.len() as i64) * 8;
-        space + callee_save_space
+        // With FPO (RSP mode): callee-saved registers are movq'd into the frame
+        // alongside locals, so their space is already in `space` via callee_save_reserve.
+        // Without FPO (RBP mode): callee-saved registers are pushed separately (before
+        // subq), so `space` includes the callee_save_reserve offset but the pushes don't
+        // consume subq space. However, the subq must be large enough for all locals +
+        // variadic save area, which are already accounted for in `space`.
+        // The callee_save_reserve in `space` just shifts slot offsets to avoid the push
+        // area; the actual stack allocation (subq) is `space` in both modes.
+        space
     }
 
     pub(super) fn aligned_frame_size_impl(&self, raw_space: i64) -> i64 {
