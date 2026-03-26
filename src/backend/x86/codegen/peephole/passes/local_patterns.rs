@@ -2142,16 +2142,26 @@ pub(super) fn hoist_loop_invariant_gpr_load(
     let len = store.len();
     let mut changed = false;
 
+    let debug_hoist = std::env::var("CCC_DEBUG_HOIST").is_ok();
     let mut i = 0;
     while i < len {
         if infos[i].is_nop() { i += 1; continue; }
-        if infos[i].kind != LineKind::Jmp { i += 1; continue; }
+        // Match both unconditional (jmp) and conditional (jle, jl, jne, etc.) back-edges
         let jmp_text = infos[i].trimmed(store.get(i));
-        if !jmp_text.starts_with("jmp ") { i += 1; continue; }
-        let target = &jmp_text[4..];
+        let _ = debug_hoist;
+        let target = if jmp_text.starts_with("jmp ") { &jmp_text[4..] }
+            else if jmp_text.starts_with("jl ") { &jmp_text[3..] }
+            else if jmp_text.starts_with("jle ") { &jmp_text[4..] }
+            else if jmp_text.starts_with("jne ") { &jmp_text[4..] }
+            else if jmp_text.starts_with("jge ") { &jmp_text[4..] }
+            else if jmp_text.starts_with("jg ") { &jmp_text[3..] }
+            else if jmp_text.starts_with("jb ") { &jmp_text[3..] }
+            else if jmp_text.starts_with("ja ") { &jmp_text[3..] }
+            else { i += 1; continue; };
+        if !target.starts_with(".L") { i += 1; continue; }
         let target_label = format!("{}:", target);
 
-        // Find the target label (must be before the jmp = back-edge)
+        // Find the target label (must be before the branch = back-edge)
         let mut header_pos = None;
         for lbl in 0..i {
             if infos[lbl].kind == LineKind::Label {
@@ -2165,6 +2175,8 @@ pub(super) fn hoist_loop_invariant_gpr_load(
             Some(h) => h,
             None => { i += 1; continue; }
         };
+
+        let debug_hoist = std::env::var("CCC_DEBUG_HOIST").is_ok();
 
         // Validate this is a real loop: the range [header..=i] must not contain
         // a ret instruction (which would indicate the range spans the epilogue
@@ -2328,8 +2340,16 @@ pub(super) fn hoist_loop_invariant_gpr_load(
                 mark_nop(&mut infos[pos]); // remove original load
                 changed = true;
                 hoisted_one = true;
+            } else {
+                // No NOP slot found: prepend the load to the header label line.
+                // This places the load just before the loop entry.
+                let header_text = store.get(header).to_string();
+                let combined = format!("{}\n{}", load_text.trim_end(), header_text.trim_end());
+                store.replace(header, combined);
+                mark_nop(&mut infos[pos]);
+                changed = true;
+                hoisted_one = true;
             }
-            // If no NOP slot found, skip this optimization
         }
 
         i += 1;
