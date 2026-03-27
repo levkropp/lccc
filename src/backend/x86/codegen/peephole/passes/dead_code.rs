@@ -67,81 +67,10 @@ pub(super) fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]
             }
 
             if infos[j].is_barrier() {
-                // For unconditional Jmp: follow the target and continue scanning.
-                // If the register is overwritten before being read at the target,
-                // it's dead in the current block. This handles loop back-edges.
-                if infos[j].kind == LineKind::Jmp {
-                    let jmp_text = infos[j].trimmed(store.get(j));
-                    if jmp_text.starts_with("jmp ") {
-                        let target = &jmp_text[4..]; // e.g., ".LBB9"
-                        let target_label = format!("{}:", target);
-                        // Find the label in the infos array.
-                        for lbl in 0..len {
-                            if infos[lbl].kind == LineKind::Label {
-                                let lbl_text = infos[lbl].trimmed(store.get(lbl));
-                                if lbl_text == target_label {
-                                    // Continue scanning from just after the label.
-                                    // Follow through CondJmp fall-throughs (the
-                                    // register must be dead on ALL successor paths).
-                                    let mut m = lbl + 1;
-                                    let scan_end2 = (m + DEAD_MOVE_WINDOW).min(len);
-                                    let mut found_dead = false;
-                                    while m < scan_end2 {
-                                        if infos[m].is_nop() { m += 1; continue; }
-                                        if infos[m].is_barrier() {
-                                            // CondJmp: continue scanning the fall-through.
-                                            if infos[m].kind == LineKind::CondJmp {
-                                                m += 1;
-                                                continue;
-                                            }
-                                            // Label: skip it and keep scanning.
-                                            if infos[m].kind == LineKind::Label {
-                                                m += 1;
-                                                continue;
-                                            }
-                                            break;
-                                        }
-                                        let writes = get_dest_reg(&infos[m]) == dst_reg;
-                                        let refs = infos[m].reg_refs & dst_mask != 0;
-                                        if writes {
-                                            // Check if pure write (not read-modify-write).
-                                            // Use the same logic as the main scan:
-                                            // is_read_modify_write + REG_NAMES fallback.
-                                            let also_reads = if !refs {
-                                                false
-                                            } else {
-                                                match infos[m].kind {
-                                                    LineKind::LoadRbp { .. } | LineKind::Pop { .. } => false,
-                                                    LineKind::SetCC { .. } => false,
-                                                    LineKind::Other { .. } => {
-                                                        let t = infos[m].trimmed(store.get(m));
-                                                        if is_read_modify_write(t) {
-                                                            true
-                                                        } else if let Some(comma_pos) = t.rfind(',') {
-                                                            let src_part = &t[..comma_pos];
-                                                            REG_NAMES.iter().any(|row|
-                                                                src_part.contains(row[dst_reg as usize])
-                                                            )
-                                                        } else {
-                                                            true
-                                                        }
-                                                    }
-                                                    _ => refs,
-                                                }
-                                            };
-                                            if !also_reads { found_dead = true; }
-                                            break;
-                                        }
-                                        if refs { break; } // read before write → not dead
-                                        m += 1;
-                                    }
-                                    dead = found_dead;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
+                // At a basic block boundary, we can't prove the register is dead
+                // without analyzing all successor paths. Conservatively stop.
+                // (Previously this followed jmp targets, but that was unsound for
+                // complex control flow with conditional branches at the target.)
                 break;
             }
 
