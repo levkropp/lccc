@@ -51,6 +51,11 @@ impl X86Codegen {
             return false;
         }
 
+        // Base and index must be different registers.
+        if base_reg == index_reg {
+            return false;
+        }
+
         // Check if loading the store value would clobber base or index register
         if let Operand::Value(v) = val {
             if let Some(&val_reg) = self.reg_assignments.get(&v.0) {
@@ -107,6 +112,15 @@ impl X86Codegen {
     ///
     /// Emits: `mov %src, (%base_reg,%index_reg,scale)`
     fn try_emit_phase9_indexed_store(&mut self, val: &Operand, ptr: &Value, ty: IrType) -> bool {
+        // Phase 9 decomposes a variable-offset GEP into SIB addressing:
+        //   Store val, (GEP base, Mul(idx, scale))  →  movl %eax, (%base, %idx, scale)
+        // However, variable-offset GEPs are always emitted as `leaq` instructions
+        // (they are NOT in gep_fold_map, which only handles constant offsets).
+        // By the time the Store is emitted, the GEP's source registers (base, idx)
+        // may have been clobbered by the leaq destination or intervening instructions.
+        // The GEP result is already computed in a register/slot, so use it directly.
+        return false;
+
         // Check if ptr is defined by a GEP instruction
         let gep_inst = match self.get_defining_instruction(ptr.0) {
             Some(inst) => inst,
@@ -159,6 +173,15 @@ impl X86Codegen {
             Some(&reg) => phys_reg_name(reg),
             None => return false,
         };
+
+        // Base and index must be different registers for SIB addressing.
+        // If the register allocator assigned both the same register (e.g.,
+        // because one value's live range ended and the register was reused),
+        // the SIB computation would be wrong (base + base*scale instead of
+        // base + index*scale).
+        if base_reg == index_reg {
+            return false;
+        }
 
         // Check if loading the store value would clobber the base or index
         // register. This happens when the store value's register overlaps with
@@ -305,6 +328,10 @@ impl X86Codegen {
     ///
     /// Emits: `mov (%base_reg,%index_reg,scale), %dest`
     fn try_emit_phase9_indexed_load(&mut self, dest: &Value, ptr: &Value, ty: IrType) -> bool {
+        // Disabled: same issue as try_emit_phase9_indexed_store — variable-offset
+        // GEPs are already emitted, so base/index registers may be stale.
+        return false;
+
         // Check if ptr is defined by a GEP instruction
         let gep_inst = match self.get_defining_instruction(ptr.0) {
             Some(inst) => inst,
