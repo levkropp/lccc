@@ -896,6 +896,13 @@ pub(super) fn resolve_copy_aliases(
     copy_alias: &FxHashMap<u32, u32>,
 ) {
     for (&dest_id, &root_id) in copy_alias {
+        // If the alias already has its own slot (allocated because the
+        // classify_value check detected cross-block uses, multi-def, or
+        // other safety concerns), keep the separate slot instead of
+        // overwriting it with the root's potentially block-local slot.
+        if state.value_locations.contains_key(&dest_id) {
+            continue;
+        }
         if let Some(&slot) = state.value_locations.get(&root_id) {
             state.value_locations.insert(dest_id, slot);
         }
