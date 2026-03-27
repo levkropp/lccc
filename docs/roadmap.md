@@ -12,7 +12,7 @@ next_page:
 
 # Roadmap
 {:.doc-subtitle}
-LCCC improves CCC in twelve phases. Phases 1–12 are complete.
+LCCC improves CCC in sixteen phases. Phases 1–14f are complete.
 
 ## Status Overview
 
@@ -32,6 +32,11 @@ LCCC improves CCC in twelve phases. Phases 1–12 are complete.
 | 10 | Binary rec-to-iter, XMM regalloc, FPO | ✅ Complete | **478× faster on fib, F64 in XMM regs** |
 | 11 | Peephole: const stores, SIB fold, ALU fold | ✅ Complete | **Sieve 1.78× → 1.55×, 75 sign-ext removed** |
 | 12 | Register allocator loop-depth fix | ✅ Complete | **Inner-loop values correctly prioritized** |
+| 13 | Peephole: sign-ext, phi-copy coalesce, loop rotation | ✅ Complete | **Sieve 6 instructions, 1.1× GCC** |
+| 14 | Correctness hardening (31 bugs) | ✅ Complete | **Full SQLite works** |
+| 14f | Phase 9 SIB disable + phi coalesce multi-block | ✅ Complete | **CREATE TABLE, JOIN, subqueries** |
+| — | Re-enable peephole optimizer for SQLite | 🔲 Planned | Stack corruption in large functions |
+| — | Re-enable GVN pass for SQLite | 🔲 Planned | Separate crash |
 | — | Better function inlining | 🔲 Planned | ~1.5× on call-heavy code |
 | — | Profile-guided optimization (PGO) | 🔲 Planned | ~1.2–1.5× general |
 
@@ -224,6 +229,45 @@ See the [Phase 4 write-up](/lccc/updates/phase4-loop-unrolling) for full details
 **Results:**
 - Sieve: outer loop variable `i` promoted from stack to `%ebx`, eliminating 1 stack load per inner-loop iteration
 - All benchmarks: more correct allocation decisions across the board
+
+---
+
+## Phase 13 — Peephole: Sign-Extension, Phi-Copy Coalesce, Loop Rotation (Complete)
+
+**Goal:** Reduce instruction count in inner loops through assembly-level pattern matching.
+
+**What changed** (`src/backend/x86/codegen/peephole/`):
+- Sign-extension fusion: fold `movslq + addq` into `addl` when high bits are dead
+- Phi-copy coalescing: eliminate `movq` between phi dest and backedge source
+- Loop rotation: move condition check to end of loop, eliminating one unconditional jump
+
+**Results:**
+- Sieve inner loop: 8 → 6 instructions
+- ~1.1× GCC -O2 on sieve (parity on most other benchmarks)
+
+---
+
+## Phase 14 — Correctness Hardening: SQLite (Complete)
+
+**Goal:** Fix correctness bugs that prevented real-world projects from compiling and running.
+
+**Test target:** SQLite 3.45 amalgamation (260K lines, single-file C).
+
+**31 bugs fixed** across:
+1. **Peephole optimizer** (6): dead reg elimination, loop rotation, fuse_add_sign_extend, fuse_signext_and_move, indirect call
+2. **Register allocator** (4): phi coalesce linked list, phi coalesce cross-block uses, phi coalesce multi-block loop body, callee-save boundary
+3. **Stack layout** (5): callee-save padding, slot alias preservation, cross-block alias, multi-def alias, phi incoming protection
+4. **Call codegen** (3): indirect call stack corruption, stack arg RSP tracking, FPO stack_base
+5. **Frame/addressing** (3): RSP/RBP mode leak, variadic FPO override, emit_instr_rbp FPO
+6. **Value handling** (4): alloca Copy materialization, post-decrement volatile, GVN volatile bypass, emergency spills
+7. **SIB/indexed addressing** (2): register conflict check, Phase 9 stale register disable
+8. **Jump table** (1): i128 overflow protection
+9. **Other** (3): operand_to_callee_reg fallback, liveness phi extension, debug infrastructure
+
+**Results:**
+- SQLite fully works: CREATE TABLE, INSERT, UPDATE, DELETE, SELECT with WHERE/ORDER BY/LIMIT, JOIN, subqueries, GROUP BY, UNION ALL, transactions, prepared statements, aggregates, typeof/coalesce/CASE
+- 18/18 compatibility tests pass
+- Build flags: `CCC_NO_PEEPHOLE=1 CCC_DISABLE_PASSES=vectorize,gvn`
 
 ---
 

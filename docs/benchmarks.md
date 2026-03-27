@@ -40,6 +40,10 @@ Six micro-benchmarks targeting different bottlenecks. All measured with best-of-
 
 All outputs are byte-identical to GCC's.
 
+## Real-World: SQLite 3.45
+
+LCCC compiles and fully runs the SQLite amalgamation (260K lines). All core SQL operations work correctly: CREATE TABLE, INSERT, UPDATE, DELETE, SELECT with JOINs, subqueries, GROUP BY, transactions, prepared statements, and aggregate functions. 31 correctness bugs were fixed to reach this milestone. Build flags: `CCC_NO_PEEPHOLE=1 CCC_DISABLE_PASSES=vectorize,gvn`.
+
 ## Benchmark Descriptions
 
 ### `01_arith_loop` — Register Pressure + Phi Register Coalescing + Multiply ILP
