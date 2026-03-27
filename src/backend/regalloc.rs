@@ -30,7 +30,7 @@ use super::liveness::{
 };
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
-use crate::ir::reexports::{Instruction, IrConst, IrFunction, Operand};
+use crate::ir::reexports::{Instruction, IrConst, IrFunction, Operand, Terminator};
 
 /// A physical register assignment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -842,6 +842,74 @@ fn detect_phi_coalesce_groups(
         return Vec::new();
     }
 
+    // Step 1b: Build use-block map for backedge source safety check.
+    // If a backedge source is used in blocks OTHER than the Copy's block,
+    // coalescing is unsafe: the source's register would be reused by the
+    // allocator for other values in those blocks, clobbering the source
+    // before its cross-block uses.
+    let mut src_use_blocks: FxHashMap<u32, FxHashSet<usize>> = FxHashMap::default();
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            // Skip Copy dests — we care about OPERAND uses, not definitions
+            let check_operands = |inst: &Instruction| {
+                let mut uses = Vec::new();
+                match inst {
+                    Instruction::BinOp { lhs, rhs, .. } => {
+                        if let Operand::Value(v) = lhs { uses.push(v.0); }
+                        if let Operand::Value(v) = rhs { uses.push(v.0); }
+                    }
+                    Instruction::UnaryOp { src, .. } | Instruction::Cast { src, .. } => {
+                        if let Operand::Value(v) = src { uses.push(v.0); }
+                    }
+                    Instruction::Store { val, .. } => {
+                        if let Operand::Value(v) = val { uses.push(v.0); }
+                    }
+                    Instruction::Copy { src, .. } => {
+                        if let Operand::Value(v) = src { uses.push(v.0); }
+                    }
+                    Instruction::Cmp { lhs, rhs, .. } => {
+                        if let Operand::Value(v) = lhs { uses.push(v.0); }
+                        if let Operand::Value(v) = rhs { uses.push(v.0); }
+                    }
+                    Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+                        for a in &info.args {
+                            if let Operand::Value(v) = a { uses.push(v.0); }
+                        }
+                    }
+                    Instruction::Select { cond, true_val, false_val, .. } => {
+                        if let Operand::Value(v) = cond { uses.push(v.0); }
+                        if let Operand::Value(v) = true_val { uses.push(v.0); }
+                        if let Operand::Value(v) = false_val { uses.push(v.0); }
+                    }
+                    _ => {}
+                }
+                uses
+            };
+            for vid in check_operands(inst) {
+                src_use_blocks.entry(vid).or_default().insert(block_idx);
+            }
+        }
+        // Also check terminator operands
+        match &block.terminator {
+            Terminator::CondBranch { cond, .. } => {
+                if let Operand::Value(v) = cond {
+                    src_use_blocks.entry(v.0).or_default().insert(block_idx);
+                }
+            }
+            Terminator::Return(Some(op)) => {
+                if let Operand::Value(v) = op {
+                    src_use_blocks.entry(v.0).or_default().insert(block_idx);
+                }
+            }
+            Terminator::Switch { val, .. } => {
+                if let Operand::Value(v) = val {
+                    src_use_blocks.entry(v.0).or_default().insert(block_idx);
+                }
+            }
+            _ => {}
+        }
+    }
+
     // Step 2: Find backedge copies in loop blocks.
     // A backedge copy is a Copy where:
     //   - The dest is a multi-def value (phi dest)
@@ -893,7 +961,17 @@ fn detect_phi_coalesce_groups(
                                 }
                             }
                         }
-                        if !phi_dest_used_after_src {
+                        // Also check: the backedge source must not have uses
+                        // in OTHER blocks. If it does, coalescing gives it the
+                        // phi dest's register, but the allocator may reassign
+                        // that register to other values in those blocks,
+                        // clobbering the source before its cross-block uses.
+                        let src_has_cross_block_use = src_use_blocks
+                            .get(&src_val.0)
+                            .map(|blocks| blocks.iter().any(|&b| b != block_idx))
+                            .unwrap_or(false);
+
+                        if !phi_dest_used_after_src && !src_has_cross_block_use {
                             groups.push((dest.0, src_val.0));
                             seen_phi_dests.insert(dest.0);
                         }
