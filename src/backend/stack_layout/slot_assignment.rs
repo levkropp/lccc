@@ -46,6 +46,14 @@ pub(super) fn coalescable_group(
         return None;
     }
     if let Some(&def_blk) = ctx.def_block.get(&val_id) {
+        // Values used as phi incoming must NOT be block-local because phi
+        // elimination places Copies at predecessor block ends. If the source
+        // value's slot was already reused (Tier 3 block-local), the phi Copy
+        // reads garbage. Check all blocks for phi references.
+        if ctx.phi_incoming_values.contains(&val_id) {
+            return None;
+        }
+
         if let Some(blocks) = ctx.use_blocks_map.get(&val_id) {
             let mut unique: Vec<usize> = blocks.clone();
             unique.sort_unstable();
