@@ -156,6 +156,8 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
         return LivenessResult { intervals: Vec::new(), call_points: Vec::new(), block_loop_depth: Vec::new() };
     }
 
+    // Debug: trace phi references for GetToken return value
+
     let alloca_set = collect_alloca_set(func);
     let (value_ids, id_to_dense) = build_dense_value_map(func, &alloca_set);
 
@@ -405,6 +407,38 @@ fn assign_program_points(
 
         block_gen.push(gen);
         block_kill.push(kill);
+    }
+
+    // Phase 1d: Extend liveness for phi incoming values.
+    // After phi elimination, each Phi { incoming: [(V, block_X), ...] } becomes
+    // a Copy instruction at the END of block_X. The value V must be live at that
+    // point. Without this extension, V's interval might end earlier (at its last
+    // direct use), allowing its register to be reused before the phi-elimination
+    // Copy executes. This is the root cause of the sqlite3RunParser n-value
+    // corruption: n's register (r13) was reused before the phi Copy.
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Phi { incoming, .. } = inst {
+                for (op, pred_label) in incoming {
+                    if let Operand::Value(v) = op {
+                        if alloca_set.contains(&v.0) { continue; }
+                        if let Some(&dense) = id_to_dense.get(&v.0) {
+                            if let Some(&pred_idx) = block_id_to_idx.get(&pred_label.0) {
+                                let pred_end = block_end_points[pred_idx];
+                                // Extend the value's last use to the predecessor's end
+                                let entry = &mut last_use_points[dense];
+                                if *entry == u32::MAX || pred_end > *entry {
+                                    *entry = pred_end;
+                                }
+                                // Also add to predecessor's gen set so backward
+                                // dataflow propagates liveness correctly
+                                block_gen[pred_idx].insert(dense);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     ProgramPointState {

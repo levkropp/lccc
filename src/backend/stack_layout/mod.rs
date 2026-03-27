@@ -106,6 +106,11 @@ struct StackLayoutContext {
     /// as the first operand loaded into the accumulator. These values don't need
     /// stack slots — the accumulator register cache keeps them alive.
     immediately_consumed: FxHashSet<u32>,
+    /// Values that appear as incoming operands in Phi instructions.
+    /// These must NOT be classified as block-local (Tier 3) because phi
+    /// elimination places Copies at predecessor block ends. If the source
+    /// value's Tier 3 slot was reused by another block, the Copy reads garbage.
+    phi_incoming_values: FxHashSet<u32>,
 }
 
 // ── Main stack space calculation ──────────────────────────────────────────
@@ -402,6 +407,20 @@ fn build_layout_context(
         }
     }
 
+    // Collect phi incoming values: values used as operands in Phi instructions.
+    let mut phi_incoming_values = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let crate::ir::reexports::Instruction::Phi { incoming, .. } = inst {
+                for (op, _) in incoming {
+                    if let crate::ir::reexports::Operand::Value(v) = op {
+                        phi_incoming_values.insert(v.0);
+                    }
+                }
+            }
+        }
+    }
+
     StackLayoutContext {
         coalesce,
         use_blocks_map,
@@ -412,5 +431,6 @@ fn build_layout_context(
         dead_param_allocas,
         coalescable_allocas,
         immediately_consumed,
+        phi_incoming_values,
     }
 }
