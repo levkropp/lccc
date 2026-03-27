@@ -287,7 +287,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // The backedge source is removed from the eligible set so it doesn't get
     // allocated independently. After allocation, it inherits the phi dest's
     // register assignment.
-    let phi_coalesce = detect_phi_coalesce_groups(func, &liveness);
+    let phi_coalesce = if std::env::var("CCC_NO_PHI_COALESCE").is_ok() {
+        Vec::new()
+    } else {
+        detect_phi_coalesce_groups(func, &liveness)
+    };
     for &(_phi_dest, backedge_src) in &phi_coalesce {
         // Remove backedge source from eligibility — it will inherit the phi dest's register.
         eligible.remove(&backedge_src);
@@ -930,34 +934,73 @@ fn detect_phi_coalesce_groups(
                     // Don't coalesce if src is itself a multi-def (swap cycle temporaries)
                     if !multi_def.contains(&src_val.0) {
                         // Safety: don't coalesce if the phi dest is used AFTER
-                        // the backedge source's definition in the same block.
-                        // This detects the "lost copy" pattern where e.g.:
+                        // the backedge source's definition. This detects the
+                        // "lost copy" pattern where e.g.:
                         //   v_n = Call(malloc)       ← src defined here
                         //   Store(v_head, v_n+8)     ← phi dest USED here
                         //   Copy v_head = v_n        ← coalesce candidate
                         // Coalescing v_head and v_n to the same register would
                         // clobber v_head when storing the Call result.
-                        let mut src_defined = false;
+                        //
+                        // Important: the src may be defined in a DIFFERENT block
+                        // than the Copy (multi-block loop bodies). We must check
+                        // the src's defining block for phi dest uses, not just
+                        // the Copy's block.
                         let mut phi_dest_used_after_src = false;
-                        for inst2 in &block.instructions {
-                            if !src_defined {
-                                // Check if this instruction defines src_val
-                                if let Some(d) = inst2.dest() {
+
+                        // Find the block that defines the backedge source
+                        let mut src_def_block = None;
+                        for (bi, b) in func.blocks.iter().enumerate() {
+                            for i in &b.instructions {
+                                if let Some(d) = i.dest() {
                                     if d.0 == src_val.0 {
-                                        src_defined = true;
+                                        src_def_block = Some(bi);
                                     }
                                 }
-                            } else {
-                                // After src is defined, check if phi dest is used
-                                if let Instruction::Copy { dest: d, .. } = inst2 {
-                                    if d.0 == dest.0 {
-                                        break; // reached the coalesce Copy, stop
+                            }
+                        }
+
+                        // Check the block containing the Copy
+                        {
+                            let mut src_defined = false;
+                            for inst2 in &block.instructions {
+                                if !src_defined {
+                                    if let Some(d) = inst2.dest() {
+                                        if d.0 == src_val.0 {
+                                            src_defined = true;
+                                        }
+                                    }
+                                } else {
+                                    if let Instruction::Copy { dest: d, .. } = inst2 {
+                                        if d.0 == dest.0 {
+                                            break;
+                                        }
+                                    }
+                                    if uses_value(inst2, dest.0) {
+                                        phi_dest_used_after_src = true;
                                     }
                                 }
-                                // Check if the phi dest value appears as an operand
-                                let uses_dest = uses_value(inst2, dest.0);
-                                if uses_dest {
-                                    phi_dest_used_after_src = true;
+                            }
+                        }
+
+                        // If the src is defined in a DIFFERENT block, also check
+                        // that block (and any other block the src's value flows
+                        // through) for phi dest uses after the src definition.
+                        if let Some(sdb) = src_def_block {
+                            if sdb != block_idx {
+                                let mut src_defined = false;
+                                for inst2 in &func.blocks[sdb].instructions {
+                                    if !src_defined {
+                                        if let Some(d) = inst2.dest() {
+                                            if d.0 == src_val.0 {
+                                                src_defined = true;
+                                            }
+                                        }
+                                    } else {
+                                        if uses_value(inst2, dest.0) {
+                                            phi_dest_used_after_src = true;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -972,8 +1015,15 @@ fn detect_phi_coalesce_groups(
                             .unwrap_or(false);
 
                         if !phi_dest_used_after_src && !src_has_cross_block_use {
+                            if std::env::var("CCC_DEBUG_PHI_COALESCE").is_ok() {
+                                eprintln!("[PHI_COALESCE] Coalescing phi_dest=Value({}) with backedge_src=Value({}) in block {}",
+                                    dest.0, src_val.0, block_idx);
+                            }
                             groups.push((dest.0, src_val.0));
                             seen_phi_dests.insert(dest.0);
+                        } else if std::env::var("CCC_DEBUG_PHI_COALESCE").is_ok() {
+                            eprintln!("[PHI_COALESCE] BLOCKED phi_dest=Value({}) with backedge_src=Value({}) in block {} (used_after={}, cross_block={})",
+                                dest.0, src_val.0, block_idx, phi_dest_used_after_src, src_has_cross_block_use);
                         }
                     }
                 }

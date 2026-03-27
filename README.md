@@ -116,21 +116,26 @@ python3 lccc-improvements/benchmarks/bench.py --reps 5 --md results.md
 
 ### SQLite 3.45 Status
 
-LCCC compiles and **runs** the full SQLite amalgamation (260K lines, single-file):
+LCCC compiles and **fully runs** the SQLite amalgamation (260K lines, single-file).
+All core SQL operations work correctly:
 
 ```
-$ sqlite3_open(":memory:")          ✅ works
-$ sqlite3_mprintf("%d", 42)        ✅ returns "42"
-$ SELECT 42                        ✅ returns 42
-$ SELECT 1+1                       ✅ returns 2
-$ SELECT 'hello'                   ✅ returns "hello"
-$ CREATE TABLE ...                  🔧 in progress (crashes in deeper SQL compilation)
-$ SELECT 42*2                       🔧 in progress (memory allocator issue)
+$ CREATE TABLE / INSERT / UPDATE / DELETE  ✅
+$ SELECT with WHERE, ORDER BY, LIMIT      ✅
+$ JOIN (INNER, LEFT)                       ✅
+$ Subqueries (correlated + uncorrelated)   ✅
+$ GROUP BY + HAVING                        ✅
+$ Aggregate functions (count/sum/avg/min/max) ✅
+$ UNION ALL                                ✅
+$ Transactions (BEGIN/COMMIT/ROLLBACK)     ✅
+$ Prepared statements with parameter binding ✅
+$ typeof(), coalesce(), CASE/WHEN          ✅
 ```
 
-**29 correctness bugs fixed** to reach this point, across peephole optimizer, register
+**31 correctness bugs fixed** to reach this point, across peephole optimizer, register
 allocator, stack layout, call codegen, phi elimination, and liveness analysis. Key fixes:
-- Phi coalescing safety for cross-block value uses
+- Phi coalescing safety for multi-block loop bodies (cross-block src definition)
+- Phase 9 SIB indexed store/load disabled (stale register after emitted GEP)
 - SIB indexed store register conflict detection
 - Alloca address materialization in Copy instructions
 - RSP/RBP addressing mode leak between functions
@@ -457,8 +462,8 @@ docs/           Jekyll documentation site source
 | 11 | Peephole: const stores, SIB fold, ALU fold | ✅ Complete | **Sieve 1.78× → 1.55×, 75 sign-ext removed** |
 | 12 | Register allocator loop-depth fix | ✅ Complete | **Inner-loop values correctly prioritized** |
 | 13 | Peephole: sign-ext, phi-copy coalesce, loop rotation | ✅ Complete | **Sieve 6 instructions, 1.1× GCC** |
-| 14 | Correctness hardening (29 bugs) | ✅ Complete | **SQLite SELECT queries work** |
-| — | Full SQLite (CREATE TABLE, INSERT, etc.) | In progress | Real-world SQL database |
+| 14 | Correctness hardening (31 bugs) | ✅ Complete | **Full SQLite works** |
+| 14f | Phase 9 SIB disable + phi coalesce multi-block | ✅ Complete | **CREATE TABLE, JOIN, subqueries** |
 | — | Better function inlining | Planned | ~1.5× on call-heavy code |
 | — | Profile-guided optimization (PGO) | Planned | ~1.2–1.5× general |
 

@@ -641,21 +641,34 @@ fn extend_gep_base_liveness(
 
     for block in &func.blocks {
         for inst in &block.instructions {
-            if let Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), .. } = inst {
-                // Skip alloca bases (already handled by existing fold logic)
-                if alloca_set.contains(&base.0) {
-                    continue;
+            match inst {
+                Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), .. } => {
+                    // Constant-offset GEP: foldable into Load/Store addressing mode
+                    if alloca_set.contains(&base.0) {
+                        continue;
+                    }
+                    let offset_val = match c {
+                        IrConst::I64(n) => *n,
+                        IrConst::I32(n) => *n as i64,
+                        IrConst::I16(n) => *n as i64,
+                        IrConst::I8(n) => *n as i64,
+                        _ => continue,
+                    };
+                    if offset_val >= i32::MIN as i64 && offset_val <= i32::MAX as i64 {
+                        gep_info.insert(dest.0, (base.0, offset_val));
+                    }
                 }
-                let offset_val = match c {
-                    IrConst::I64(n) => *n,
-                    IrConst::I32(n) => *n as i64,
-                    IrConst::I16(n) => *n as i64,
-                    IrConst::I8(n) => *n as i64,
-                    _ => continue,
-                };
-                if offset_val >= i32::MIN as i64 && offset_val <= i32::MAX as i64 {
-                    gep_info.insert(dest.0, (base.0, offset_val));
-                if std::env::var("CCC_DEBUG_LIVENESS").is_ok() { eprintln!("[LIVENESS] gep_info: dest={}, base={}, offset={}", dest.0, base.0, offset_val); } }
+                Instruction::GetElementPtr { dest, base, offset: Operand::Value(_), .. } => {
+                    // Variable-offset GEP: may be used for SIB indexed addressing.
+                    // The base pointer must stay live until the Load/Store that uses
+                    // this GEP result, otherwise the register allocator may reuse the
+                    // base register before the SIB store/load executes.
+                    if alloca_set.contains(&base.0) {
+                        continue;
+                    }
+                    gep_info.insert(dest.0, (base.0, 0));
+                }
+                _ => {}
             }
         }
     }
