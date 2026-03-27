@@ -463,9 +463,20 @@ fn classify_value(
     // Skip copy-aliased values (they'll share root's slot). Not for i128/f128.
     // Also don't skip protected values (vectors, DynAlloca results) - they need
     // unique slots even if copy-aliased, to prevent corruption from slot reuse.
+    // Also don't skip multi-defined values (from phi elimination): they have
+    // complex liveness across blocks that makes slot sharing unsafe. The alias
+    // root might be block-local (Tier 3, reusable), but the multi-def value
+    // needs persistence across blocks.
     let is_copy_aliased = ctx.copy_alias.contains_key(&dest.0);
     let is_protected = state.protected_slot_values.contains(&dest.0);
-    if !is_i128 && !is_f128 && !is_protected && is_copy_aliased {
+    let is_multi_def = ctx.multi_def_values.contains(&dest.0);
+    // Don't skip copy-aliased values that have cross-block uses: the alias
+    // root might be block-local (Tier 3, reusable), but this value needs
+    // its data to persist across blocks.
+    let has_cross_block_use = ctx.use_blocks_map.get(&dest.0)
+        .map(|blks| blks.iter().any(|&b| ctx.def_block.get(&dest.0).map_or(true, |&db| b != db)))
+        .unwrap_or(false);
+    if !is_i128 && !is_f128 && !is_protected && !is_multi_def && !has_cross_block_use && is_copy_aliased {
         return;
     }
     if debug_protect && is_protected && is_copy_aliased {

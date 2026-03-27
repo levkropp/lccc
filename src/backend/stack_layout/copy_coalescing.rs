@@ -235,7 +235,9 @@ pub(super) fn compute_immediately_consumed(func: &IrFunction, lhs_first_binop: b
             // Skip if value is a copy-alias root (other values share its slot).
             if copy_alias_roots.contains(&dest.0) { continue; }
             // Must have exactly one Operand use.
-            if operand_use_count.get(&dest.0).copied().unwrap_or(0) != 1 { continue; }
+            let use_cnt = operand_use_count.get(&dest.0).copied().unwrap_or(0);
+            if use_cnt != 1 { continue; }
+            if use_cnt != 1 { continue; }
 
             // Check if the single use is in the immediately next instruction
             // or in the block terminator (if this is the last instruction).
