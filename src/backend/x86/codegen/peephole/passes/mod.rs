@@ -60,56 +60,71 @@ pub fn peephole_optimize(asm: String) -> String {
     if std::env::var("CCC_NO_PEEPHOLE").is_ok() {
         return asm;
     }
+    let skip_phase1 = std::env::var("CCC_NO_PEEPHOLE_PHASE1").is_ok();
+    let skip_phase2 = std::env::var("CCC_NO_PEEPHOLE_PHASE2").is_ok();
+    let skip_phase3 = std::env::var("CCC_NO_PEEPHOLE_PHASE3").is_ok();
+    let skip_phase4 = std::env::var("CCC_NO_PEEPHOLE_PHASE4").is_ok();
+    let skip_phase5 = std::env::var("CCC_NO_PEEPHOLE_PHASE5").is_ok();
+    let skip_phase6 = std::env::var("CCC_NO_PEEPHOLE_PHASE6").is_ok();
+    let skip_phase7 = std::env::var("CCC_NO_PEEPHOLE_PHASE7").is_ok();
+
     let mut store = LineStore::new(asm);
     let line_count = store.len();
     let mut infos: Vec<LineInfo> = (0..line_count).map(|i| classify_line(store.get(i))).collect();
 
+    // CCC_PEEPHOLE_SKIP=pass1,pass2,... to disable specific sub-passes
+    let skip_set: std::collections::HashSet<String> = std::env::var("CCC_PEEPHOLE_SKIP")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .collect();
+    let sk = |name: &str| -> bool { skip_set.contains(name) };
+
     // Phase 1: Iterative cheap local passes.
     let mut changed = true;
     let mut pass_count = 0;
-    while changed && pass_count < MAX_LOCAL_PASS_ITERATIONS {
+    while changed && pass_count < MAX_LOCAL_PASS_ITERATIONS && !skip_phase1 {
         changed = false;
-        let local_changed = local_patterns::combined_local_pass(&mut store, &mut infos);
+        let local_changed = if sk("combined") { false } else { local_patterns::combined_local_pass(&mut store, &mut infos) };
         changed |= local_changed;
-        changed |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos);
-        changed |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
-        changed |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos);
-        changed |= local_patterns::eliminate_rcx_address_copy(&mut store, &mut infos);
-        changed |= local_patterns::fold_ptr_deref_through_stack(&mut store, &mut infos);
-        changed |= local_patterns::eliminate_fp_spill_around_load(&mut store, &mut infos);
-        changed |= local_patterns::fuse_copy_and_operation(&mut store, &mut infos);
-        changed |= local_patterns::promote_loop_invariant_fp_load(&mut store, &mut infos);
-        changed |= local_patterns::eliminate_dead_sign_extensions(&mut store, &mut infos);
-        changed |= local_patterns::fold_base_index_addressing(&mut store, &mut infos);
-        changed |= local_patterns::fold_accumulator_alu_store(&mut store, &mut infos);
-        changed |= local_patterns::coalesce_phi_register_copies(&mut store, &mut infos);
-        changed |= local_patterns::fuse_signext_and_move(&mut store, &mut infos);
-        changed |= local_patterns::collapse_increment_chain(&mut store, &mut infos);
-        changed |= local_patterns::fuse_add_sign_extend(&mut store, &mut infos);
-        changed |= local_patterns::fold_cascaded_shifts(&mut store, &mut infos);
-        changed |= local_patterns::hoist_loop_invariant_gpr_load(&mut store, &mut infos);
-        changed |= local_patterns::hoist_loop_invariant_fp_broadcast(&mut store, &mut infos);
+        if !sk("fuse_movq_ext") { changed |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos); }
+        if !sk("fp_roundtrips") { changed |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos); }
+        if !sk("fp_mem_fold") { changed |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos); }
+        if !sk("rcx_copy") { changed |= local_patterns::eliminate_rcx_address_copy(&mut store, &mut infos); }
+        if !sk("ptr_deref") { changed |= local_patterns::fold_ptr_deref_through_stack(&mut store, &mut infos); }
+        if !sk("fp_spill") { changed |= local_patterns::eliminate_fp_spill_around_load(&mut store, &mut infos); }
+        if !sk("fuse_copy_op") { changed |= local_patterns::fuse_copy_and_operation(&mut store, &mut infos); }
+        if !sk("fp_hoist") { changed |= local_patterns::promote_loop_invariant_fp_load(&mut store, &mut infos); }
+        if !sk("dead_signext") { changed |= local_patterns::eliminate_dead_sign_extensions(&mut store, &mut infos); }
+        if !sk("base_index") { changed |= local_patterns::fold_base_index_addressing(&mut store, &mut infos); }
+        if !sk("acc_alu") { changed |= local_patterns::fold_accumulator_alu_store(&mut store, &mut infos); }
+        if !sk("phi_coalesce") { changed |= local_patterns::coalesce_phi_register_copies(&mut store, &mut infos); }
+        if !sk("signext_move") { changed |= local_patterns::fuse_signext_and_move(&mut store, &mut infos); }
+        if !sk("inc_chain") { changed |= local_patterns::collapse_increment_chain(&mut store, &mut infos); }
+        if !sk("add_signext") { changed |= local_patterns::fuse_add_sign_extend(&mut store, &mut infos); }
+        if !sk("cascaded_shifts") { changed |= local_patterns::fold_cascaded_shifts(&mut store, &mut infos); }
+        if !sk("gpr_hoist") { changed |= local_patterns::hoist_loop_invariant_gpr_load(&mut store, &mut infos); }
+        if !sk("fp_broadcast") { changed |= local_patterns::hoist_loop_invariant_fp_broadcast(&mut store, &mut infos); }
         if local_changed || pass_count == 0 {
-            changed |= push_pop::eliminate_push_pop_pairs(&store, &mut infos);
-            changed |= push_pop::eliminate_binop_push_pop_pattern(&mut store, &mut infos);
+            if !sk("push_pop") { changed |= push_pop::eliminate_push_pop_pairs(&store, &mut infos); }
+            if !sk("binop_push_pop") { changed |= push_pop::eliminate_binop_push_pop_pattern(&mut store, &mut infos); }
         }
         pass_count += 1;
     }
 
     // Phase 2: Expensive global passes (run once)
-    let global_changed = store_forwarding::global_store_forwarding(&mut store, &mut infos);
-    let global_changed = global_changed | copy_propagation::propagate_register_copies(&mut store, &mut infos);
-    let global_changed = global_changed | dead_code::eliminate_dead_reg_moves(&store, &mut infos);
-    let global_changed = global_changed | dead_code::eliminate_dead_stores(&store, &mut infos);
-    let global_changed = global_changed | compare_branch::fuse_compare_and_branch(&mut store, &mut infos);
-    // Memory operand folding: fold remaining stack loads into subsequent ALU
-    // instructions as memory source operands. This runs after store forwarding
-    // has already converted loads that can be forwarded from registers; the
-    // remaining loads benefit from being folded into ALU instructions.
-    let global_changed = global_changed | memory_fold::fold_memory_operands(&mut store, &mut infos);
+    let global_changed = if skip_phase2 { false } else {
+    let mut global_changed = false;
+    if !sk("store_fwd") { global_changed |= store_forwarding::global_store_forwarding(&mut store, &mut infos); }
+    if !sk("copy_prop") { global_changed |= copy_propagation::propagate_register_copies(&mut store, &mut infos); }
+    if !sk("dead_regs") { global_changed |= dead_code::eliminate_dead_reg_moves(&store, &mut infos); }
+    if !sk("dead_stores") { global_changed |= dead_code::eliminate_dead_stores(&store, &mut infos); }
+    if !sk("cmp_branch") { global_changed |= compare_branch::fuse_compare_and_branch(&mut store, &mut infos); }
+    if !sk("mem_fold") { global_changed |= memory_fold::fold_memory_operands(&mut store, &mut infos); }
+    global_changed };
 
     // Phase 3: One more local cleanup if global passes made changes.
-    if global_changed {
+    if global_changed && !skip_phase3 {
         let mut changed2 = true;
         let mut pass_count2 = 0;
         while changed2 && pass_count2 < MAX_POST_GLOBAL_ITERATIONS {
@@ -121,12 +136,12 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= local_patterns::eliminate_rcx_address_copy(&mut store, &mut infos);
             changed2 |= local_patterns::fold_ptr_deref_through_stack(&mut store, &mut infos);
             changed2 |= local_patterns::eliminate_fp_spill_around_load(&mut store, &mut infos);
-            changed2 |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);
-            changed2 |= dead_code::eliminate_dead_stores(&store, &mut infos);
-            changed2 |= memory_fold::fold_memory_operands(&mut store, &mut infos);
+            if !sk("dead_regs") { changed2 |= dead_code::eliminate_dead_reg_moves(&store, &mut infos); }
+            if !sk("dead_stores") { changed2 |= dead_code::eliminate_dead_stores(&store, &mut infos); }
+            if !sk("mem_fold") { changed2 |= memory_fold::fold_memory_operands(&mut store, &mut infos); }
             changed2 |= local_patterns::fold_base_index_addressing(&mut store, &mut infos);
             changed2 |= local_patterns::coalesce_phi_register_copies(&mut store, &mut infos);
-            changed2 |= local_patterns::fuse_signext_and_move(&mut store, &mut infos);
+            if !sk("signext_move") { changed2 |= local_patterns::fuse_signext_and_move(&mut store, &mut infos); }
             changed2 |= local_patterns::collapse_increment_chain(&mut store, &mut infos);
             pass_count2 += 1;
         }
@@ -134,13 +149,15 @@ pub fn peephole_optimize(asm: String) -> String {
 
     // Phase 3b: Fuse addl+movslq in loops (must run BEFORE trampoline elimination,
     // which may remove the conditional back-edge that this pass uses to detect loops).
-    local_patterns::fuse_add_sign_extend(&mut store, &mut infos);
+    if !skip_phase4 { local_patterns::fuse_add_sign_extend(&mut store, &mut infos); }
 
     // Phase 4: Eliminate loop backedge trampoline blocks.
-    let trampoline_changed = loop_trampoline::eliminate_loop_trampolines(&mut store, &mut infos);
+    let trampoline_changed = if skip_phase4 { false } else {
+        loop_trampoline::eliminate_loop_trampolines(&mut store, &mut infos)
+    };
 
     // Phase 4b: If trampoline elimination made changes, do another round of local cleanup.
-    if trampoline_changed {
+    if trampoline_changed && !skip_phase4 {
         let mut changed3 = true;
         let mut pass_count3 = 0;
         while changed3 && pass_count3 < MAX_POST_GLOBAL_ITERATIONS {
@@ -151,50 +168,51 @@ pub fn peephole_optimize(asm: String) -> String {
             changed3 |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos);
             changed3 |= local_patterns::eliminate_rcx_address_copy(&mut store, &mut infos);
             changed3 |= local_patterns::fold_ptr_deref_through_stack(&mut store, &mut infos);
-            changed3 |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);
-            changed3 |= dead_code::eliminate_dead_stores(&store, &mut infos);
-            changed3 |= memory_fold::fold_memory_operands(&mut store, &mut infos);
+            if !sk("dead_regs") { changed3 |= dead_code::eliminate_dead_reg_moves(&store, &mut infos); }
+            if !sk("dead_stores") { changed3 |= dead_code::eliminate_dead_stores(&store, &mut infos); }
+            if !sk("mem_fold") { changed3 |= memory_fold::fold_memory_operands(&mut store, &mut infos); }
             changed3 |= local_patterns::coalesce_phi_register_copies(&mut store, &mut infos);
-            changed3 |= local_patterns::fuse_signext_and_move(&mut store, &mut infos);
+            if !sk("signext_move") { changed3 |= local_patterns::fuse_signext_and_move(&mut store, &mut infos); }
             changed3 |= local_patterns::collapse_increment_chain(&mut store, &mut infos);
             pass_count3 += 1;
         }
     }
 
     // Phase 4c: Late loop-invariant hoisting.
-    // Must run after all simplification passes have cleaned up the loop body
-    // (e.g., eliminate_rcx_address_copy, fold_base_index_addressing). Earlier
-    // in Phase 1, intermediate register copies prevent hoisting because the
-    // destination register appears to be written elsewhere.
-    local_patterns::hoist_loop_invariant_gpr_load(&mut store, &mut infos);
-    local_patterns::hoist_loop_invariant_fp_broadcast(&mut store, &mut infos);
+    if !skip_phase4 {
+        local_patterns::hoist_loop_invariant_gpr_load(&mut store, &mut infos);
+        local_patterns::hoist_loop_invariant_fp_broadcast(&mut store, &mut infos);
+    }
 
     // Phase 4d: Loop rotation — move condition from header to latch.
-    // Must run after trampolines (which simplify loop structure) and before
-    // tail call optimization. Uses multi-line replacement, so no further
-    // line-level passes should depend on infos accuracy after this.
-    local_patterns::rotate_loops(&mut store, &mut infos);
+    if !skip_phase4 {
+        local_patterns::rotate_loops(&mut store, &mut infos);
+    }
 
     // Phase 4e: Fuse addl+movslq after loop rotation.
-    // Rotation moves the movslq from the header to the latch (right after addl).
-    // Use text-only fusion (no infos dependency) since rotate uses multi-line replacement.
-    local_patterns::fuse_add_sign_extend(&mut store, &mut infos);
+    if !skip_phase4 {
+        local_patterns::fuse_add_sign_extend(&mut store, &mut infos);
+    }
 
-    // Phase 5: Tail call optimization: convert `call X; epilogue; ret` to
-    // `epilogue; jmp X`. This must run before callee-save elimination because
-    // removing the call may make some callee-save registers unnecessary.
-    tail_call::optimize_tail_calls(&mut store, &mut infos);
+    // Phase 5: Tail call optimization.
+    if !skip_phase5 {
+        tail_call::optimize_tail_calls(&mut store, &mut infos);
+    }
 
     // Phase 5b: Global dead store elimination for never-read stack slots.
-    dead_code::eliminate_never_read_stores(&store, &mut infos);
+    if !skip_phase5 {
+        dead_code::eliminate_never_read_stores(&store, &mut infos);
+    }
 
     // Phase 6: Eliminate unused callee-saved register saves/restores.
-    callee_saves::eliminate_unused_callee_saves(&mut store, &mut infos);
+    if !skip_phase6 {
+        callee_saves::eliminate_unused_callee_saves(&mut store, &mut infos);
+    }
 
-    // Phase 7: Compact stack frames by packing callee-saved saves tightly
-    // and shrinking subq $N, %rsp when dead stores/callee-save elimination
-    // created gaps in the frame.
-    frame_compact::compact_frame(&mut store, &mut infos);
+    // Phase 7: Compact stack frames.
+    if !skip_phase7 {
+        frame_compact::compact_frame(&mut store, &mut infos);
+    }
 
     store.build_result(|i| infos[i].is_nop())
 }

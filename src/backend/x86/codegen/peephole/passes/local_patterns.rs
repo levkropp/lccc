@@ -1873,17 +1873,23 @@ pub(super) fn fuse_signext_and_move(
         }
 
         // Check if %rax is dead after j, or only used in a redirectable cmpl.
-        // Scan forward from j+1 within the basic block.
+        // Scan forward from j+1 until the next basic block boundary (barrier).
+        // No line limit — large functions like SQLite's 10K-line VDBE interpreter
+        // can have long stretches of non-barrier instructions.
         let src_32_name = REG_NAMES[1][src_family as usize];
-        let mut rax_dead = true;
+        let mut rax_dead = false; // conservative default: assume alive
         let mut cmpl_line: Option<usize> = None;
         let mut n = j + 1;
-        while n < len && n < j + 12 {
+        while n < len {
             if infos[n].is_nop() { n += 1; continue; }
             if infos[n].is_barrier() {
                 // ret implicitly reads rax as the return value
                 if infos[n].kind == LineKind::Ret {
                     rax_dead = false;
+                } else {
+                    // jmp/label/call: end of basic block, rax is dead
+                    // (call clobbers rax; jmp/label start a new context)
+                    rax_dead = true;
                 }
                 break;
             }
@@ -1891,8 +1897,8 @@ pub(super) fn fuse_signext_and_move(
             if infos[n].reg_refs & 1 != 0 {
                 // rax is referenced. Check if it's a write (rax overwritten → dead)
                 match infos[n].kind {
-                    LineKind::Other { dest_reg: 0 } => break, // rax overwritten → dead
-                    LineKind::LoadRbp { reg: 0, .. } => break, // rax loaded → dead
+                    LineKind::Other { dest_reg: 0 } => { rax_dead = true; break; }
+                    LineKind::LoadRbp { reg: 0, .. } => { rax_dead = true; break; }
                     _ => {}
                 }
                 // Check if it's a cmpl $imm, %eax
