@@ -1221,8 +1221,11 @@ pub trait ArchCodegen {
         } else if cases.len() >= MIN_JUMP_TABLE_CASES {
             let min_val = cases.iter().map(|&(v, _)| v).min().expect("switch must have cases");
             let max_val = cases.iter().map(|&(v, _)| v).max().expect("switch must have cases");
-            let range = (max_val - min_val + 1) as usize;
-            range <= MAX_JUMP_TABLE_RANGE && cases.len() * 100 / range >= MIN_JUMP_TABLE_DENSITY_PERCENT
+            // Use i128 arithmetic to prevent overflow when min_val is very negative
+            // and max_val is very positive (e.g., -2^31 to 2^31).
+            let range_i128 = max_val as i128 - min_val as i128 + 1;
+            let range_ok = range_i128 > 0 && range_i128 <= MAX_JUMP_TABLE_RANGE as i128;
+            range_ok && cases.len() * 100 / (range_i128 as usize) >= MIN_JUMP_TABLE_DENSITY_PERCENT
         } else {
             false
         };
@@ -1463,11 +1466,16 @@ pub trait ArchCodegen {
 pub fn build_jump_table(cases: &[(i64, BlockId)], default: &BlockId) -> (Vec<BlockId>, i64, usize) {
     let min_val = cases.iter().map(|&(v, _)| v).min().expect("switch must have cases");
     let max_val = cases.iter().map(|&(v, _)| v).max().expect("switch must have cases");
-    let range = (max_val - min_val + 1) as usize;
+    // Use i128 to prevent overflow when case values span a wide range.
+    let range_i128 = max_val as i128 - min_val as i128 + 1;
+    assert!(range_i128 > 0 && range_i128 <= MAX_JUMP_TABLE_RANGE as i128,
+        "jump table range overflow: min={}, max={}, range={}", min_val, max_val, range_i128);
+    let range = range_i128 as usize;
 
     let mut table = vec![*default; range];
     for &(case_val, target) in cases {
         let idx = (case_val - min_val) as usize;
+        debug_assert!(idx < range, "jump table index out of bounds: idx={}, range={}", idx, range);
         table[idx] = target;
     }
     (table, min_val, range)
