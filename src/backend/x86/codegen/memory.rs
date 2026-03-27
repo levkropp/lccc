@@ -51,6 +51,16 @@ impl X86Codegen {
             return false;
         }
 
+        // Check if loading the store value would clobber base or index register
+        if let Operand::Value(v) = val {
+            if let Some(&val_reg) = self.reg_assignments.get(&v.0) {
+                let val_name = phys_reg_name(val_reg);
+                if val_name == base_reg || val_name == index_reg {
+                    return false;
+                }
+            }
+        }
+
         // Load the value to be stored into the accumulator/xmm register
         self.operand_to_rax(val);
 
@@ -149,6 +159,19 @@ impl X86Codegen {
             Some(&reg) => phys_reg_name(reg),
             None => return false,
         };
+
+        // Check if loading the store value would clobber the base or index
+        // register. This happens when the store value's register overlaps with
+        // the base/index, or when operand_to_rax needs to use the register for
+        // intermediate computations. If so, fall back to non-indexed store.
+        if let Operand::Value(v) = val {
+            if let Some(&val_reg) = self.reg_assignments.get(&v.0) {
+                let val_name = phys_reg_name(val_reg);
+                if val_name == base_reg || val_name == index_reg {
+                    return false; // Register conflict, fall back
+                }
+            }
+        }
 
         // Load the value to be stored into the accumulator/xmm register
         self.operand_to_rax(val);
