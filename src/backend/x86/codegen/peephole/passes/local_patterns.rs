@@ -14,7 +14,7 @@
 //!   7. eliminate_redundant_xorl_zero: xorl %eax,%eax when %rax already zero
 
 use super::super::types::*;
-use super::helpers::{is_valid_gp_reg, has_implicit_reg_usage, replace_reg_family, is_callee_saved_reg};
+use super::helpers::{is_valid_gp_reg, has_implicit_reg_usage, replace_reg_family, is_callee_saved_reg, get_dest_reg};
 
 /// Format a stack offset string for text matching/generation.
 /// Checks context to decide between (%rbp) and (%rsp).
@@ -733,12 +733,31 @@ pub(super) fn fold_base_index_addressing(
 
         // Case 1: Direct use — the mem op uses (%rax)
         if let Some(folded) = try_fold_mem_op_with_sib(tk, "(%rax)", base_reg, idx_reg) {
-            mark_nop(&mut infos[i]); // remove movq %REG, %rax
-            mark_nop(&mut infos[j]); // remove addq %REG_BASE, %rax
-            replace_line(store, &mut infos[k], k, folded);
-            changed = true;
-            i = k + 1;
-            continue;
+            // Safety: verify rax is dead after k. The NOP'd instructions
+            // leave rax without the computed address. If anything reads rax
+            // after k expecting the address, the fold is unsafe.
+            let rax_mask = 1u16;
+            let mut rax_dead = true;
+            let mut n = k + 1;
+            while n < len {
+                if infos[n].is_nop() { n += 1; continue; }
+                if infos[n].is_barrier() { break; }
+                if infos[n].reg_refs & rax_mask != 0 {
+                    let dest = get_dest_reg(&infos[n]);
+                    if dest == 0 { break; } // rax overwritten → dead
+                    rax_dead = false;
+                    break;
+                }
+                n += 1;
+            }
+            if rax_dead {
+                mark_nop(&mut infos[i]); // remove movq %REG, %rax
+                mark_nop(&mut infos[j]); // remove addq %REG_BASE, %rax
+                replace_line(store, &mut infos[k], k, folded);
+                changed = true;
+                i = k + 1;
+                continue;
+            }
         }
 
         // Case 2: Intermediate copy — movq %rax, %REG_TMP, then mem op on (%REG_TMP)
@@ -757,13 +776,38 @@ pub(super) fn fold_base_index_addressing(
                     let tm = infos[m].trimmed(store.get(m));
                     let addr_pat = format!("(%{})", &tmp_reg[1..]); // e.g. "(%rcx)"
                     if let Some(folded) = try_fold_mem_op_with_sib(tm, &addr_pat, base_reg, idx_reg) {
-                        mark_nop(&mut infos[i]); // remove movq %REG, %rax
-                        mark_nop(&mut infos[j]); // remove addq
-                        mark_nop(&mut infos[k]); // remove movq %rax, %TMP
-                        replace_line(store, &mut infos[m], m, folded);
-                        changed = true;
-                        i = m + 1;
-                        continue;
+                        // Safety: verify %TMP is dead after m. If anything reads
+                        // %TMP after the folded mem op, the NOP'd movq at k means
+                        // %TMP holds a stale value. Scan forward to the next
+                        // barrier and check %TMP is either overwritten or not read.
+                        let tmp_mask = 1u16 << tmp_family;
+                        let mut tmp_dead = true;
+                        let mut n = m + 1;
+                        while n < len {
+                            if infos[n].is_nop() { n += 1; continue; }
+                            if infos[n].is_barrier() { break; }
+                            if infos[n].reg_refs & tmp_mask != 0 {
+                                // TMP is referenced. Check if it's a pure write (overwrite → dead).
+                                let dest = get_dest_reg(&infos[n]);
+                                if dest == tmp_family {
+                                    break; // overwritten before read → safe
+                                }
+                                // TMP is read before being overwritten → not safe
+                                tmp_dead = false;
+                                break;
+                            }
+                            n += 1;
+                        }
+
+                        if tmp_dead {
+                            mark_nop(&mut infos[i]); // remove movq %REG, %rax
+                            mark_nop(&mut infos[j]); // remove addq
+                            mark_nop(&mut infos[k]); // remove movq %rax, %TMP
+                            replace_line(store, &mut infos[m], m, folded);
+                            changed = true;
+                            i = m + 1;
+                            continue;
+                        }
                     }
                 }
             }
