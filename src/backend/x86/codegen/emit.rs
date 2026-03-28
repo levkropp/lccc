@@ -246,6 +246,13 @@ pub struct X86Codegen {
     pub(super) ivsr_pointers: FxHashMap<u32, IvsrPointerInfo>,
     /// Maps IVSR pointer phi to original loop counter value ID
     pub(super) pointer_to_counter: FxHashMap<u32, u32>,
+    /// Phase 2b: caller-saved registers with call-spanning values.
+    /// Maps PhysReg ID → dedicated spill slot for save/restore at call sites.
+    pub(super) caller_save_spill_slots: FxHashMap<u8, crate::backend::state::StackSlot>,
+    /// Phase 2b: live intervals for each caller-saved-spanning register.
+    /// Maps PhysReg ID → list of (start, end) program points.
+    /// At each call, only save registers with an interval containing the call point.
+    pub(super) caller_save_intervals: FxHashMap<u8, Vec<(u32, u32)>>,
 }
 
 /// Information about an IVSR-transformed pointer induction variable
@@ -281,6 +288,8 @@ impl X86Codegen {
             current_func: None,
             ivsr_pointers: FxHashMap::default(),
             pointer_to_counter: FxHashMap::default(),
+            caller_save_spill_slots: FxHashMap::default(),
+            caller_save_intervals: FxHashMap::default(),
         }
     }
 
@@ -1612,6 +1621,30 @@ impl ArchCodegen for X86Codegen {
     fn emit_acc_to_phys_reg(&mut self, dest: PhysReg) {
         let d_name = phys_reg_name(dest);
         self.state.out.emit_instr_reg_reg("    movq", "rax", d_name);
+    }
+
+    fn emit_pre_call_save_caller_regs(&mut self) {
+        let point = self.state.current_program_point;
+        for (&reg_id, &slot) in &self.caller_save_spill_slots {
+            if let Some(intervals) = self.caller_save_intervals.get(&reg_id) {
+                if intervals.iter().any(|&(start, end)| start <= point && point <= end) {
+                    let reg_name = phys_reg_name(PhysReg(reg_id));
+                    self.state.out.emit_instr_reg_rbp("    movq", reg_name, slot.0);
+                }
+            }
+        }
+    }
+
+    fn emit_post_call_restore_caller_regs(&mut self) {
+        let point = self.state.current_program_point;
+        for (&reg_id, &slot) in &self.caller_save_spill_slots {
+            if let Some(intervals) = self.caller_save_intervals.get(&reg_id) {
+                if intervals.iter().any(|&(start, end)| start <= point && point <= end) {
+                    let reg_name = phys_reg_name(PhysReg(reg_id));
+                    self.state.out.emit_instr_rbp_reg("    movq", slot.0, reg_name);
+                }
+            }
+        }
     }
 
     fn jump_mnemonic(&self) -> &'static str { "jmp" }

@@ -42,6 +42,10 @@ pub struct RegAllocResult {
     pub assignments: FxHashMap<u32, PhysReg>,
     /// Set of physical registers actually used (for prologue/epilogue save/restore).
     pub used_regs: Vec<PhysReg>,
+    /// Caller-saved registers assigned to call-spanning values (Phase 2b).
+    /// Maps PhysReg ID → list of (interval_start, interval_end) for each value
+    /// assigned to that register. Used for selective save/restore at call sites.
+    pub caller_save_spans: FxHashMap<u8, Vec<(u32, u32)>>,
     /// The liveness analysis computed during register allocation, if any.
     /// Cached here so that calculate_stack_space_common can reuse it for
     /// Tier 2 liveness-based stack slot packing, avoiding a redundant
@@ -99,6 +103,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         return RegAllocResult {
             assignments: FxHashMap::default(),
             used_regs: Vec::new(),
+            caller_save_spans: FxHashMap::default(),
             liveness: None,
         };
     }
@@ -409,6 +414,58 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
 
+    // Phase 2b: Caller-saved registers for call-spanning values with
+    // per-call selective save/restore. Unlike Phase 2 (non-call-spanning only),
+    // Phase 2b allows call-spanning values in caller-saved registers by
+    // recording their live intervals. The codegen saves/restores each register
+    // only at call sites where the value is actually live.
+    let mut caller_save_spans: FxHashMap<u8, Vec<(u32, u32)>> = FxHashMap::default();
+    if !config.caller_saved_regs.is_empty() && std::env::var("CCC_CALLER_SAVE_SPANNING").is_ok() {
+        // Use all available caller-saved registers (not just r10/r11)
+        let span_regs: Vec<PhysReg> = config.caller_saved_regs.iter()
+            .filter(|r| !used_regs_set.contains(&r.0)) // exclude any already used as callee-saved
+            .copied()
+            .collect();
+
+        if !span_regs.is_empty() {
+            let phase2b_intervals: Vec<LiveInterval> = liveness
+                .intervals
+                .iter()
+                .filter(|iv| eligible.contains(&iv.value_id))
+                .filter(|iv| iv.end > iv.start)
+                .filter(|iv| !assignments.contains_key(&iv.value_id))
+                .filter(|iv| spans_any_call(iv, call_points))
+                .take(500) // Limit to top 500 candidates to avoid O(n²) in linear scan
+                .copied()
+                .collect();
+
+            if !phase2b_intervals.is_empty() {
+                // Build interval map for live-at-call checks
+                let interval_map: FxHashMap<u32, (u32, u32)> = phase2b_intervals.iter()
+                    .map(|iv| (iv.value_id, (iv.start, iv.end)))
+                    .collect();
+
+                let phase2b_ranges = live_range::build_live_ranges(
+                    &phase2b_intervals,
+                    &liveness.block_loop_depth,
+                    func,
+                );
+                let mut span_allocator =
+                    LinearScanAllocator::new(phase2b_ranges, span_regs);
+                span_allocator.run();
+
+                for (vid, reg) in span_allocator.assignments {
+                    assignments.insert(vid, reg);
+                    // Record the interval for this register for selective save/restore
+                    if let Some(&(start, end)) = interval_map.get(&vid) {
+                        caller_save_spans.entry(reg.0).or_default().push((start, end));
+                    }
+                    // Do NOT add to used_regs_set (not prologue-saved)
+                }
+            }
+        }
+    }
+
     let mut used_regs: Vec<PhysReg> = used_regs_set.iter().map(|&r| PhysReg(r)).collect();
     used_regs.sort_by_key(|r| r.0);
 
@@ -432,6 +489,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     RegAllocResult {
         assignments,
         used_regs,
+        caller_save_spans,
         liveness: Some(liveness),
     }
 }

@@ -28,7 +28,7 @@ pub fn run_regalloc_and_merge_clobbers(
     reg_assignments: &mut FxHashMap<u32, PhysReg>,
     used_callee_saved: &mut Vec<PhysReg>,
     allow_inline_asm_regalloc: bool,
-) -> (FxHashMap<u32, PhysReg>, Option<super::super::liveness::LivenessResult>) {
+) -> (FxHashMap<u32, PhysReg>, Option<super::super::liveness::LivenessResult>, FxHashMap<u8, Vec<(u32, u32)>>) {
     // Detect x86-64 target by checking for x86 callee-saved PhysReg IDs (1-5).
     // On x86-64, provide XMM registers for F64 allocation.
     let xmm_regs = if available_regs.iter().any(|r| r.0 == 1) {
@@ -41,6 +41,7 @@ pub fn run_regalloc_and_merge_clobbers(
     let alloc_result = super::super::regalloc::allocate_registers(func, &config);
     *reg_assignments = alloc_result.assignments;
     *used_callee_saved = alloc_result.used_regs;
+    let caller_save_spans = alloc_result.caller_save_spans;
     let cached_liveness = alloc_result.liveness;
 
     // Merge inline-asm clobbered callee-saved registers into the save/restore
@@ -54,7 +55,7 @@ pub fn run_regalloc_and_merge_clobbers(
     used_callee_saved.sort_by_key(|r| r.0);
 
     let reg_assigned: FxHashMap<u32, PhysReg> = reg_assignments.clone();
-    (reg_assigned, cached_liveness)
+    (reg_assigned, cached_liveness, caller_save_spans)
 }
 
 /// Filter a callee-saved register list by removing ASM-clobbered entries.
