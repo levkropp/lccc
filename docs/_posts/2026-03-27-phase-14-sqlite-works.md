@@ -102,3 +102,13 @@ ALL STRESS TESTS PASSED
 ```
 
 18/18 compatibility tests pass. SQLite compiles in ~45 seconds.
+
+## Update: Peephole Optimizer Re-enabled (Phase 15)
+
+After Phase 14, the peephole optimizer was disabled for SQLite (`CCC_NO_PEEPHOLE=1`). Binary search using per-pass disable flags (`CCC_PEEPHOLE_SKIP`) identified three buggy passes:
+
+1. **`fuse_signext_and_move`**: rax liveness scan had a 12-line window — too small for SQLite's 10K-line functions. Fixed by scanning to the next barrier.
+2. **`eliminate_dead_reg_moves`**: jmp-following crossed basic block boundaries unsoundly. Fixed by removing cross-block following.
+3. **`fold_base_index_addressing`**: crashes on subquery compilation. Still under investigation.
+
+With these 3 passes disabled, **22 of 25 peephole sub-passes are now active** on SQLite. All 11 stress tests pass.
