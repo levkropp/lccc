@@ -1034,6 +1034,7 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
     let emit_debug = cg.state_ref().debug_info && source_mgr.is_some() && !file_table.is_empty();
     let mut last_debug_file: u32 = 0;
     let mut last_debug_line: u32 = 0;
+    cg.state().current_program_point = 0;
 
     for block in &func.blocks {
         if Some(block.label) != entry_label {
@@ -1061,19 +1062,14 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
             // This flag is set by the Mul handler below when fusion fires.
             if skip_fused_add {
                 skip_fused_add = false;
+                cg.state().current_program_point += 1;
                 continue;
             }
             // Skip GEP instructions whose offset has been folded into Load/Store.
-            // Safe to skip when:
-            // 1. Base is an alloca (Direct or OverAligned): alloca slots are stable
-            //    and never reused by liveness packing.
-            // 2. Base has a register assignment: the liveness analysis has been
-            //    extended to keep the base alive through all Load/Store uses of
-            //    this GEP result (see extend_gep_base_liveness in liveness.rs),
-            //    so the register holds the correct value at the use points.
             if let Instruction::GetElementPtr { dest, base, .. } = inst {
                 if gep_fold_map.contains_key(&dest.0) &&
                    (cg.state_ref().is_alloca(base.0) || cg.get_phys_reg_for_value(base.0).is_some()) {
+                    cg.state().current_program_point += 1;
                     continue;
                 }
             }
@@ -1099,7 +1095,8 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
                             let mul_is_lhs = matches!(add_lhs, Operand::Value(v) if v.0 == dest.0);
                             let acc_op = if mul_is_lhs { add_rhs } else { add_lhs };
                             cg.emit_fused_mul_add(dest, lhs, rhs, acc_op, add_dest, *add_ty);
-                            skip_fused_add = true; // skip the next Add instruction
+                            skip_fused_add = true;
+                            cg.state().current_program_point += 1;
                             continue;
                         }
                     }
@@ -1107,6 +1104,7 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
             }
 
             generate_instruction(cg, inst, &gep_fold_map, &global_addr_map, &global_addr_ptr_set, &dead_global_addrs);
+            cg.state().current_program_point += 1;
         }
 
         if let Some(fi) = fuse_idx {
@@ -1119,6 +1117,8 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
         } else {
             generate_terminator(cg, &block.terminator, frame_size);
         }
+        // Count terminator as a program point (matches liveness analysis)
+        cg.state().current_program_point += 1;
     }
 
     if emit_cfi {

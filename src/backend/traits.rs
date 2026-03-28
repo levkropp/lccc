@@ -447,6 +447,9 @@ pub trait ArchCodegen {
                  is_sret: bool,
                  _is_fastcall: bool,
                  ret_eightbyte_classes: &[crate::common::types::EightbyteClass]) {
+        // Phase 2b: save caller-saved registers with live values before the call.
+        self.emit_pre_call_save_caller_regs();
+
         use super::call_abi::*;
         let config = self.call_abi_config();
         let mut arg_classes = classify_call_args(args, arg_types, struct_arg_sizes, struct_arg_aligns, struct_arg_classes, struct_arg_riscv_float_classes, is_variadic, &config);
@@ -548,7 +551,18 @@ pub trait ArchCodegen {
             self.set_call_ret_eightbyte_classes(ret_eightbyte_classes);
             self.emit_call_store_result(&dest, return_type);
         }
+
+        // Phase 2b: restore caller-saved registers after the call.
+        self.emit_post_call_restore_caller_regs();
     }
+
+    // ---- Caller-save spill/reload hooks for Phase 2b ----
+
+    /// Save caller-saved registers with live values before a call.
+    /// Default: no-op. X86 overrides to selectively save based on liveness.
+    fn emit_pre_call_save_caller_regs(&mut self) {}
+    /// Restore caller-saved registers after a call returns.
+    fn emit_post_call_restore_caller_regs(&mut self) {}
 
     // ---- Call hook methods (overridden by each backend) ----
 

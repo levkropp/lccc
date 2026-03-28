@@ -156,7 +156,7 @@ impl X86Codegen {
         self.skip_i32_sext = !has_gep && needs_sext_set.is_empty();
         self.needs_sext_values = needs_sext_set;
 
-        let (reg_assigned, cached_liveness) = crate::backend::generation::run_regalloc_and_merge_clobbers(
+        let (reg_assigned, cached_liveness, caller_save_spans) = crate::backend::generation::run_regalloc_and_merge_clobbers(
             func, available_regs, caller_saved_regs, &asm_clobbered_regs,
             &mut self.reg_assignments, &mut self.used_callee_saved,
             false,
@@ -183,6 +183,18 @@ impl X86Codegen {
             let new_space = ((space + alloc + effective_align - 1) / effective_align) * effective_align;
             (-new_space, new_space)
         }, &reg_assigned, &X86_CALLEE_SAVED, cached_liveness, false);
+
+        // Allocate spill slots for Phase 2b caller-saved-spanning registers.
+        self.caller_save_spill_slots.clear();
+        self.caller_save_intervals.clear();
+        for (&reg_id, spans) in &caller_save_spans {
+            if !spans.is_empty() {
+                space += 8;
+                let slot = crate::backend::state::StackSlot(-space);
+                self.caller_save_spill_slots.insert(reg_id, slot);
+                self.caller_save_intervals.insert(reg_id, spans.clone());
+            }
+        }
 
         if func.is_variadic {
             if self.no_sse {

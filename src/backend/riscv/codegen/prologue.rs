@@ -52,7 +52,7 @@ impl RiscvCodegen {
         }
 
         let available_regs = crate::backend::generation::filter_available_regs(&all_available, &asm_clobbered_regs);
-        let (reg_assigned, cached_liveness) = crate::backend::generation::run_regalloc_and_merge_clobbers(
+        let (reg_assigned, cached_liveness, _caller_save_spans) = crate::backend::generation::run_regalloc_and_merge_clobbers(
             func, available_regs, Vec::new(), &asm_clobbered_regs,
             &mut self.reg_assignments, &mut self.used_callee_saved,
             true, // RISC-V asm emitter checks reg_assignments for inline asm operands

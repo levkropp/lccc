@@ -140,6 +140,9 @@ pub struct CodegenState {
     pub patchable_function_entry: Option<(u32, u32)>,
     /// Whether to emit endbr64 at function entry points (-fcf-protection=branch).
     pub cf_protection_branch: bool,
+    /// Current program point during codegen (incremented per instruction).
+    /// Used by Phase 2b selective caller-save save/restore.
+    pub current_program_point: u32,
     /// Maps an F128 value ID to the memory location it was loaded from.
     /// This enables full-precision F128 operations (casts, comparisons, stores)
     /// by reloading directly from the original memory location instead of using
@@ -257,6 +260,7 @@ impl CodegenState {
             indirect_branch_thunk: false,
             patchable_function_entry: None,
             cf_protection_branch: false,
+            current_program_point: 0,
             f128_load_sources: FxHashMap::default(),
             f128_direct_slots: FxHashSet::default(),
             current_text_section: ".text".to_string(),

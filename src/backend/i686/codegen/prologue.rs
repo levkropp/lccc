@@ -65,7 +65,7 @@ impl I686Codegen {
 
         let caller_saved_regs = I686_CALLER_SAVED.to_vec();
 
-        let (reg_assigned, cached_liveness) = run_regalloc_and_merge_clobbers(
+        let (reg_assigned, cached_liveness, _caller_save_spans) = run_regalloc_and_merge_clobbers(
             func, available_regs, caller_saved_regs, &asm_clobbered_regs,
             &mut self.reg_assignments, &mut self.used_callee_saved,
             false,
