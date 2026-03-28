@@ -3,7 +3,7 @@
 use crate::ir::reexports::{IrConst, IrBinOp, Instruction, Operand, Value};
 use crate::common::types::{AddressSpace, IrType};
 use crate::backend::state::{StackSlot, SlotAddr};
-use super::emit::{X86Codegen, phys_reg_name};
+use super::emit::{X86Codegen, phys_reg_name, typed_phys_reg_name, is_xmm_reg};
 
 impl X86Codegen {
     /// Try to emit a store using x86-64 SIB indexed addressing mode.
@@ -472,6 +472,41 @@ impl X86Codegen {
                     // Only use immediate form when value fits in i32 (x86 mov mem,imm limitation)
                     if imm >= i32::MIN as i64 && imm <= i32::MAX as i64 {
                         if self.try_emit_const_store(imm as i32, ptr, ty) {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Register-direct fast path: bypass the accumulator when both val
+        // and ptr have register assignments. Saves 2-3 instructions per store.
+        if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128) {
+            if let Operand::Value(v) = val {
+                let v_reg = self.reg_assignments.get(&v.0).copied();
+                let p_reg = self.reg_assignments.get(&ptr.0).copied();
+
+                // Both val and ptr in GPR registers: emit 1 instruction
+                if let (Some(vr), Some(pr)) = (v_reg, p_reg) {
+                    if !is_xmm_reg(vr) && !is_xmm_reg(pr) && !self.state.is_alloca(ptr.0) {
+                        let store_instr = Self::mov_store_for_type(ty);
+                        let v_name = typed_phys_reg_name(vr, ty);
+                        let p_name = phys_reg_name(pr);
+                        self.state.emit_fmt(format_args!("    {} %{}, (%{})", store_instr, v_name, p_name));
+                        self.state.reg_cache.invalidate_acc();
+                        return;
+                    }
+                }
+
+                // Val in register, ptr on stack: 2 instructions (skip emit_save_acc)
+                if let Some(vr) = v_reg {
+                    if !is_xmm_reg(vr) && !self.state.is_alloca(ptr.0) {
+                        if let Some(crate::backend::state::SlotAddr::Indirect(slot)) = self.state.resolve_slot_addr(ptr.0) {
+                            self.emit_load_ptr_from_slot_impl(slot, ptr.0);
+                            let store_instr = Self::mov_store_for_type(ty);
+                            let v_name = typed_phys_reg_name(vr, ty);
+                            self.state.emit_fmt(format_args!("    {} %{}, (%rcx)", store_instr, v_name));
+                            self.state.reg_cache.invalidate_acc();
                             return;
                         }
                     }

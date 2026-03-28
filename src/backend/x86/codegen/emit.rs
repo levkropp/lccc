@@ -105,6 +105,28 @@ pub(super) fn phys_reg_name_32(reg: PhysReg) -> &'static str {
     }
 }
 
+/// Get the typed register name for a PhysReg at a given IrType width.
+/// E.g., PhysReg(1)=rbx → for I32 returns "ebx", for I8 returns "bl".
+pub(super) fn typed_phys_reg_name(reg: PhysReg, ty: IrType) -> &'static str {
+    match ty {
+        IrType::I64 | IrType::U64 | IrType::Ptr => phys_reg_name(reg),
+        IrType::I32 | IrType::U32 | IrType::F32 => phys_reg_name_32(reg),
+        IrType::I16 | IrType::U16 => match reg.0 {
+            1 => "bx", 2 => "r12w", 3 => "r13w", 4 => "r14w", 5 => "r15w",
+            6 => "bp", 10 => "r11w", 11 => "r10w", 12 => "r8w", 13 => "r9w",
+            14 => "di", 15 => "si", 16 => "dx",
+            _ => phys_reg_name(reg),
+        },
+        IrType::I8 | IrType::U8 => match reg.0 {
+            1 => "bl", 2 => "r12b", 3 => "r13b", 4 => "r14b", 5 => "r15b",
+            6 => "bpl", 10 => "r11b", 11 => "r10b", 12 => "r8b", 13 => "r9b",
+            14 => "dil", 15 => "sil", 16 => "dl",
+            _ => phys_reg_name(reg),
+        },
+        _ => phys_reg_name(reg),
+    }
+}
+
 /// Scan inline asm instructions in a function and collect any callee-saved
 /// registers that are used via specific constraints or listed in clobbers.
 /// These must be saved/restored in the function prologue/epilogue.
