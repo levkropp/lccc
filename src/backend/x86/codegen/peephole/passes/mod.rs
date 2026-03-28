@@ -139,8 +139,8 @@ pub fn peephole_optimize(asm: String) -> String {
             if !sk("dead_regs") { changed2 |= dead_code::eliminate_dead_reg_moves(&store, &mut infos); }
             if !sk("dead_stores") { changed2 |= dead_code::eliminate_dead_stores(&store, &mut infos); }
             if !sk("mem_fold") { changed2 |= memory_fold::fold_memory_operands(&mut store, &mut infos); }
-            changed2 |= local_patterns::fold_base_index_addressing(&mut store, &mut infos);
-            changed2 |= local_patterns::coalesce_phi_register_copies(&mut store, &mut infos);
+            if !sk("base_index") { changed2 |= local_patterns::fold_base_index_addressing(&mut store, &mut infos); }
+            if !sk("phi_coalesce") { changed2 |= local_patterns::coalesce_phi_register_copies(&mut store, &mut infos); }
             if !sk("signext_move") { changed2 |= local_patterns::fuse_signext_and_move(&mut store, &mut infos); }
             changed2 |= local_patterns::collapse_increment_chain(&mut store, &mut infos);
             pass_count2 += 1;
