@@ -103,15 +103,12 @@ impl X86Codegen {
                 has_switch = true;
             }
         }
-        // r10 no longer needs exclusion for indirect calls — we use `call *%rax`
-        // instead of `call *%r10` so the function pointer doesn't clobber r10.
-        // (Exception: indirect branch thunks still use r10, but that's rare.)
-        // i128 ops no longer need global register exclusion — they are treated
-        // as call points in liveness analysis (since commit 84e59325), so the
-        // allocator won't assign caller-saved registers to values that span
-        // i128 operations. r8/r9/rdi/rsi are safe for non-spanning values.
-        // r8 no longer needs exclusion for atomic RMW — the cmpxchg loop
-        // now uses rdi instead of r8 for the operation value.
+        // r10: use call *%rax instead of call *%r10 (frees r10 for non-call-spanning).
+        // Exception: indirect branch thunks still use r10 (rare).
+        if has_i128_ops {
+            caller_saved_regs.retain(|r| r.0 != 12 && r.0 != 13 && r.0 != 14 && r.0 != 15); // r8, r9, rdi, rsi
+        }
+        // r8: atomic RMW uses rdi instead of r8 (frees r8 unless i128 excludes it).
         // rdx (PhysReg 16) is available as caller-saved when no codegen path uses
         // it as scratch: no div/rem (implicit rdx), no i128 (rax:rdx pair), no GEP
         // (indirect stores save acc to rdx), no switch (jump tables use rdx), no
