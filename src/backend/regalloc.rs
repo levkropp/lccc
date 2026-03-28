@@ -445,11 +445,21 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     .map(|iv| (iv.value_id, (iv.start, iv.end)))
                     .collect();
 
-                let phase2b_ranges = live_range::build_live_ranges(
-                    &phase2b_intervals,
-                    &liveness.block_loop_depth,
-                    func,
-                );
+                // Lightweight range builder — O(n) instead of O(n × instructions).
+                // The full build_live_ranges scans ALL function instructions for
+                // use-site data, which is too slow for 4000+ Phase 2b intervals
+                // in large functions like sqlite3VdbeExec.
+                let mut phase2b_ranges: Vec<live_range::LiveRange> = phase2b_intervals.iter()
+                    .map(|iv| {
+                        let mut r = live_range::LiveRange::from_interval(*iv, 0);
+                        // Priority: inverse range length (shorter ranges = higher priority)
+                        let len = (iv.end - iv.start).max(1) as u64;
+                        r.priority = 1_000_000 / len;
+                        r.calculate_spill_weight();
+                        r
+                    })
+                    .collect();
+                phase2b_ranges.sort_by(|a, b| a.start.cmp(&b.start).then(b.priority.cmp(&a.priority)));
                 let mut span_allocator =
                     LinearScanAllocator::new(phase2b_ranges, span_regs);
                 span_allocator.run();
