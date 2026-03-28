@@ -412,6 +412,23 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     let mut used_regs: Vec<PhysReg> = used_regs_set.iter().map(|&r| PhysReg(r)).collect();
     used_regs.sort_by_key(|r| r.0);
 
+    if std::env::var("CCC_DEBUG_REGALLOC").is_ok() && eligible.len() > 50 {
+        let total_eligible = eligible.len();
+        let total_assigned = assignments.len();
+        let total_intervals = liveness.intervals.len();
+        let non_call_spanning = liveness.intervals.iter()
+            .filter(|iv| eligible.contains(&iv.value_id) && !spans_any_call(iv, call_points) && iv.end > iv.start)
+            .count();
+        let call_spanning = liveness.intervals.iter()
+            .filter(|iv| eligible.contains(&iv.value_id) && spans_any_call(iv, call_points) && iv.end > iv.start)
+            .count();
+        eprintln!("[REGALLOC] {} eligible, {} assigned ({:.0}%), {} call-spanning, {} non-call, {} callee, {} caller",
+            total_eligible, total_assigned,
+            if total_eligible > 0 { total_assigned as f64 / total_eligible as f64 * 100.0 } else { 0.0 },
+            call_spanning, non_call_spanning,
+            config.available_regs.len(), config.caller_saved_regs.len());
+    }
+
     RegAllocResult {
         assignments,
         used_regs,
