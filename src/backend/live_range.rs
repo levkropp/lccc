@@ -336,9 +336,10 @@ impl LinearScanAllocator {
     pub fn run(&mut self) {
         self.init_registers();
 
-        // Process ranges in order of start point
-        while !self.ranges.is_empty() {
-            let range = self.ranges.remove(0);
+        // Process ranges in order of start point.
+        // Take ownership to iterate without O(n) remove(0) shifts.
+        let ranges = std::mem::take(&mut self.ranges);
+        for range in ranges {
             self.allocate_range(range);
         }
     }
