@@ -334,22 +334,27 @@ fn assign_program_points(
                 | Instruction::VaArgStruct { .. } => {
                     call_points.push(point);
                 }
-                // i128 div/rem emit implicit calls to __divti3/__udivti3/__modti3/__umodti3.
-                // These are BinOp instructions at the IR level but generate `call` at the
-                // assembly level, clobbering all caller-saved registers. We must treat them
-                // as call points so the register allocator doesn't assign caller-saved
-                // registers to values whose live ranges span these operations.
-                Instruction::BinOp { op, ty, .. }
-                    if matches!(ty, IrType::I128 | IrType::U128)
-                        && matches!(op, IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem) =>
+                // i128 operations clobber caller-saved registers (r8, r9, rdi, rsi,
+                // rdx for rax:rdx pairs, plus implicit calls for div/rem/float-cast).
+                // Treat ALL i128 BinOp/UnaryOp/Cmp/Cast as call points so the register
+                // allocator won't assign promoted caller-saved registers to values
+                // that span these operations. This allows promoting r8/r9/rdi/rsi
+                // to the callee-saved pool for the vast majority of values while
+                // still protecting against i128 clobber.
+                Instruction::BinOp { ty, .. } | Instruction::UnaryOp { ty, .. }
+                | Instruction::Cmp { ty, .. }
+                    if matches!(ty, IrType::I128 | IrType::U128) =>
                 {
                     call_points.push(point);
                 }
-                // i128 <-> float casts emit implicit calls to compiler-rt helpers
-                // (__floattidf/__fixdfti/etc.). Same reasoning as i128 div/rem above.
                 Instruction::Cast { from_ty, to_ty, .. }
-                    if (matches!(from_ty, IrType::I128 | IrType::U128) && to_ty.is_float())
-                        || (from_ty.is_float() && matches!(to_ty, IrType::I128 | IrType::U128)) =>
+                    if matches!(from_ty, IrType::I128 | IrType::U128)
+                        || matches!(to_ty, IrType::I128 | IrType::U128) =>
+                {
+                    call_points.push(point);
+                }
+                Instruction::Store { ty, .. }
+                    if matches!(ty, IrType::I128 | IrType::U128) =>
                 {
                     call_points.push(point);
                 }
