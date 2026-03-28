@@ -219,6 +219,18 @@ impl GvnState {
                 Some((ExprKey::Cast { src: src_vn, from_ty: *from_ty, to_ty: *to_ty }, *dest))
             }
             Instruction::GetElementPtr { dest, base, offset, ty } => {
+                // Skip CSE for constant-offset GEPs that will be folded into
+                // Load/Store addressing modes. CSE-ing these creates Copy chains
+                // whose base register may be stale at the fold point, causing
+                // incorrect code. Foldable GEPs are cheap (folded away), so
+                // CSE provides negligible benefit.
+                if let Operand::Const(c) = offset {
+                    if let Some(off) = c.to_i64() {
+                        if off >= i32::MIN as i64 && off <= i32::MAX as i64 {
+                            return None; // Skip CSE for foldable GEPs
+                        }
+                    }
+                }
                 let base_vn = self.operand_to_vn(&Operand::Value(*base));
                 let offset_vn = self.operand_to_vn(offset);
                 Some((ExprKey::Gep { base: base_vn, offset: offset_vn, ty: *ty }, *dest))
