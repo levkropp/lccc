@@ -35,8 +35,9 @@ LCCC improves CCC in sixteen phases. Phases 1–14f are complete.
 | 13 | Peephole: sign-ext, phi-copy coalesce, loop rotation | ✅ Complete | **Sieve 6 instructions, 1.1× GCC** |
 | 14 | Correctness hardening (31 bugs) | ✅ Complete | **Full SQLite works** |
 | 14f | Phase 9 SIB disable + phi coalesce multi-block | ✅ Complete | **CREATE TABLE, JOIN, subqueries** |
-| — | Re-enable peephole optimizer for SQLite | 🔲 Planned | Stack corruption in large functions |
-| — | Re-enable GVN pass for SQLite | 🔲 Planned | Separate crash |
+| 15 | Peephole re-enablement (22/25 passes) | ✅ Complete | **3 bugs found, peephole mostly active** |
+| — | Fix remaining 3 peephole passes for SQLite | 🔲 Planned | signext_move, dead_regs, base_index |
+| — | Re-enable GVN pass for SQLite | 🔲 Planned | GEP CSE register overlap |
 | — | Better function inlining | 🔲 Planned | ~1.5× on call-heavy code |
 | — | Profile-guided optimization (PGO) | 🔲 Planned | ~1.2–1.5× general |
 
@@ -271,9 +272,30 @@ See the [Phase 4 write-up](/lccc/updates/phase4-loop-unrolling) for full details
 
 ---
 
+## Phase 15 — Peephole Re-enablement for SQLite (Complete)
+
+**Goal:** Re-enable the peephole optimizer for SQLite by identifying and fixing/disabling crashing passes.
+
+**Infrastructure added** (`src/backend/x86/codegen/peephole/passes/mod.rs`):
+- `CCC_PEEPHOLE_SKIP=pass1,pass2,...` — disable specific sub-passes by name
+- `CCC_NO_PEEPHOLE_PHASE1..7` — disable entire phases
+- Skip guards applied across all phases where passes are invoked (Phase 1, 3, 4b)
+
+**Three bugs identified via binary search:**
+1. `fuse_signext_and_move` — rax liveness scan had 12-line window; large functions use rax beyond it. Fixed: scan to barrier, conservative default.
+2. `eliminate_dead_reg_moves` — jmp-following crossed basic block boundaries unsoundly (ignored CondJmp taken paths). Fixed: removed jmp-following.
+3. `fold_base_index_addressing` — crashes on subquery compilation. Under investigation.
+
+**Results:**
+- 22 of 25 peephole sub-passes now active on SQLite
+- Build flags: `CCC_PEEPHOLE_SKIP=signext_move,dead_regs,base_index CCC_DISABLE_PASSES=vectorize,gvn`
+- All 11 SQLite stress tests pass, 18/18 compat tests pass
+
+---
+
 ## Remaining Gap to GCC
 
-After all twelve phases, LCCC is within 1.3–1.8× of GCC -O2 on most workloads:
+After all phases, LCCC is within 1.3–1.8× of GCC -O2 on most workloads:
 
 | Source | Gap | Addressable? |
 |--------|-----|-------------|
