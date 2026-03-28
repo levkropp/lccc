@@ -1927,14 +1927,12 @@ pub(super) fn fuse_signext_and_move(
         while n < len {
             if infos[n].is_nop() { n += 1; continue; }
             if infos[n].is_barrier() {
-                // ret implicitly reads rax as the return value
-                if infos[n].kind == LineKind::Ret {
-                    rax_dead = false;
-                } else {
-                    // jmp/label/call: end of basic block, rax is dead
-                    // (call clobbers rax; jmp/label start a new context)
-                    rax_dead = true;
-                }
+                // At ANY barrier, conservatively assume rax is alive.
+                // Even jmp/call could have successors that read rax
+                // (e.g., fall-through after conditional, or rax used
+                // by a different predecessor to the jmp target).
+                // Only explicit overwrite (LoadRbp/Other with dest=0)
+                // proves rax is dead.
                 break;
             }
             // Check if this instruction references rax
