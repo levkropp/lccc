@@ -285,16 +285,15 @@ impl X86Codegen {
                 self.state.out.emit_call(name);
             }
         } else if let Some(ptr) = func_ptr {
-            // Load function pointer into r10 BEFORE any stack manipulation.
-            // operand_to_rax may reference stack slots via %rsp-relative
-            // offsets, so pushq %rax must NOT be between the load and its
-            // stack reference (pushq shifts %rsp by 8, corrupting offsets).
+            // Load function pointer into rax and call through it.
+            // Using rax avoids clobbering r10 which may hold a
+            // register-allocated value.
             self.operand_to_rax(ptr);
-            self.state.emit("    movq %rax, %r10");
             if self.state.indirect_branch_thunk {
+                self.state.emit("    movq %rax, %r10");
                 self.state.emit("    call __x86_indirect_thunk_r10");
             } else {
-                self.state.emit("    call *%r10");
+                self.state.emit("    call *%rax");
             }
         }
         self.state.reg_cache.invalidate_all();

@@ -1257,8 +1257,8 @@ impl X86Codegen {
     /// Expects: rax = operand val, rcx = ptr address.
     /// After: rax = old value.
     pub(super) fn emit_x86_atomic_op_loop(&mut self, ty: IrType, op: &str) {
-        // Save val to r8
-        self.state.emit("    movq %rax, %r8"); // r8 = val
+        // Save val to rdi (using rdi instead of r8 to free r8 for register allocation)
+        self.state.emit("    movq %rax, %rdi"); // rdi = val
         // Load old value
         let load_instr = Self::mov_load_for_type(ty);
         let load_dest = Self::load_dest_reg(ty);
@@ -1269,14 +1269,14 @@ impl X86Codegen {
         self.state.out.emit_named_label(&loop_label);
         // rdx = rax (old)
         self.state.emit("    movq %rax, %rdx");
-        // Apply operation: rdx = op(rdx, r8)
+        // Apply operation: rdx = op(rdx, rdi)
         let size_suffix = Self::type_suffix(ty);
         let rdx_reg = Self::reg_for_type("rdx", ty);
         let r8_reg = match ty {
-            IrType::I8 | IrType::U8 => "r8b",
-            IrType::I16 | IrType::U16 => "r8w",
-            IrType::I32 | IrType::U32 => "r8d",
-            _ => "r8",
+            IrType::I8 | IrType::U8 => "dil",
+            IrType::I16 | IrType::U16 => "di",
+            IrType::I32 | IrType::U32 => "edi",
+            _ => "rdi",
         };
         match op {
             "sub" => self.state.emit_fmt(format_args!("    sub{} %{}, %{}", size_suffix, r8_reg, rdx_reg)),

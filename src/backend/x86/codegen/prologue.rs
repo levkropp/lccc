@@ -47,7 +47,7 @@ impl X86Codegen {
         } else {
             &X86_CALLEE_SAVED
         };
-        let available_regs = crate::backend::generation::filter_available_regs(callee_base, &asm_clobbered_regs);
+        let mut available_regs = crate::backend::generation::filter_available_regs(callee_base, &asm_clobbered_regs);
 
         let mut caller_saved_regs = X86_CALLER_SAVED.to_vec();
         let mut has_indirect_call = false;
@@ -103,15 +103,15 @@ impl X86Codegen {
                 has_switch = true;
             }
         }
-        if has_indirect_call {
-            caller_saved_regs.retain(|r| r.0 != 11); // r10 = PhysReg(11)
-        }
-        if has_i128_ops {
-            caller_saved_regs.retain(|r| r.0 != 12 && r.0 != 13 && r.0 != 14 && r.0 != 15); // r8, r9, rdi, rsi
-        }
-        if has_atomic_rmw {
-            caller_saved_regs.retain(|r| r.0 != 12); // r8
-        }
+        // r10 no longer needs exclusion for indirect calls — we use `call *%rax`
+        // instead of `call *%r10` so the function pointer doesn't clobber r10.
+        // (Exception: indirect branch thunks still use r10, but that's rare.)
+        // i128 ops no longer need global register exclusion — they are treated
+        // as call points in liveness analysis (since commit 84e59325), so the
+        // allocator won't assign caller-saved registers to values that span
+        // i128 operations. r8/r9/rdi/rsi are safe for non-spanning values.
+        // r8 no longer needs exclusion for atomic RMW — the cmpxchg loop
+        // now uses rdi instead of r8 for the operation value.
         // rdx (PhysReg 16) is available as caller-saved when no codegen path uses
         // it as scratch: no div/rem (implicit rdx), no i128 (rax:rdx pair), no GEP
         // (indirect stores save acc to rdx), no switch (jump tables use rdx), no
@@ -119,6 +119,13 @@ impl X86Codegen {
         if !has_div_rem && !has_i128_ops && !has_gep && !has_switch && !has_select {
             caller_saved_regs.push(PhysReg(16)); // rdx
         }
+
+        // Note: promoting caller-saved registers to callee-saved does NOT work
+        // because the x86-64 SysV ABI defines the callee-saved set. When we
+        // promote r11 to callee-saved in function A and A calls function B,
+        // B (following the ABI) freely clobbers r11. A's "callee-saved" r11
+        // value is destroyed. The fix requires per-call save/restore, not
+        // promotion. See binary size investigation in project memory.
 
         // Build set of I32 values that need sign-extension (used in 64-bit contexts).
         // Values NOT in this set can skip movslq after 32-bit register ALU ops.
