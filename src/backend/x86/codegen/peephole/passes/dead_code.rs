@@ -14,7 +14,12 @@ use super::helpers::*;
 // ── Dead register move elimination ──────────────────────────────────────────
 
 /// Maximum forward scan window for dead register move detection.
-const DEAD_MOVE_WINDOW: usize = 48;
+/// Restricted to 2: only eliminate a move when the very NEXT non-NOP
+/// instruction overwrites the destination register. Larger windows
+/// (4, 48) caused miscompilations in sqlite3VdbeExec where the write
+/// classification incorrectly treated some reads as pure writes,
+/// interacting with later peephole passes to produce wrong code.
+const DEAD_MOVE_WINDOW: usize = 2;
 
 pub(super) fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
     let mut changed = false;
