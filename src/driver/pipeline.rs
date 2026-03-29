@@ -1192,11 +1192,12 @@ impl Driver {
             omit_frame_pointer: self.omit_frame_pointer,
             emit_cfi: !self.no_unwind_tables,
         };
-        // Live range splitting (opt-in for testing)
-        if std::env::var("CCC_SPLIT_RANGES").is_ok() {
+        // Live range splitting: convert call-spanning values into short segments
+        // between calls for better caller-saved register allocation.
+        if std::env::var("CCC_NO_SPLIT_RANGES").is_err() {
             for func in &mut module.functions {
                 if !func.is_declaration && func.blocks.len() > 10 {
-                    crate::backend::split_ranges::split_call_spanning_ranges(func, 50);
+                    crate::backend::split_ranges::split_call_spanning_ranges(func, 30);
                 }
             }
         }
