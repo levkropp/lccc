@@ -218,22 +218,11 @@ impl GvnState {
                 let src_vn = self.operand_to_vn(src);
                 Some((ExprKey::Cast { src: src_vn, from_ty: *from_ty, to_ty: *to_ty }, *dest))
             }
-            Instruction::GetElementPtr { dest, base, offset, ty } => {
-                // Skip CSE for constant-offset GEPs that will be folded into
-                // Load/Store addressing modes. CSE-ing these creates Copy chains
-                // whose base register may be stale at the fold point, causing
-                // incorrect code. Foldable GEPs are cheap (folded away), so
-                // CSE provides negligible benefit.
-                if let Operand::Const(c) = offset {
-                    if let Some(off) = c.to_i64() {
-                        if off >= i32::MIN as i64 && off <= i32::MAX as i64 {
-                            return None; // Skip CSE for foldable GEPs
-                        }
-                    }
-                }
-                let base_vn = self.operand_to_vn(&Operand::Value(*base));
-                let offset_vn = self.operand_to_vn(offset);
-                Some((ExprKey::Gep { base: base_vn, offset: offset_vn, ty: *ty }, *dest))
+            Instruction::GetElementPtr { .. } => {
+                // GEP CSE disabled: creates Copy chains whose base register
+                // may be stale at fold points. Both constant-offset (foldable)
+                // and variable-offset GEPs are affected.
+                None
             }
             // Load CSE: two loads from the same pointer with the same type can be
             // CSE'd if no intervening memory modification occurred. The caller
@@ -640,7 +629,17 @@ fn process_block(
                     state.expr_to_value.get(&expr_key).copied()
                 };
 
-                if let Some(existing_value) = existing {
+                // Only CSE within the same block to avoid cross-block Copy issues.
+                // Cross-block CSE creates Copies whose source values may have
+                // their registers reused by the allocator before the Copy executes.
+                let same_block_existing = existing.filter(|ev| {
+                    // Check if existing_value was defined in the current block
+                    // (by checking new_instructions, which holds this block's output)
+                    new_instructions.iter().any(|i| {
+                        i.dest().map_or(false, |d| d.0 == ev.0)
+                    })
+                });
+                if let Some(existing_value) = same_block_existing {
                     let idx = existing_value.0 as usize;
                     let existing_vn = if idx < state.value_numbers.len() && state.value_numbers[idx] != u32::MAX {
                         state.value_numbers[idx]
