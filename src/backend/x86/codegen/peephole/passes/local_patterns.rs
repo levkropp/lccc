@@ -14,7 +14,7 @@
 //!   7. eliminate_redundant_xorl_zero: xorl %eax,%eax when %rax already zero
 
 use super::super::types::*;
-use super::helpers::{is_valid_gp_reg, has_implicit_reg_usage, replace_reg_family, is_callee_saved_reg, get_dest_reg};
+use super::helpers::{is_valid_gp_reg, has_implicit_reg_usage, replace_reg_family, is_callee_saved_reg, get_dest_reg, is_read_modify_write};
 
 /// Format a stack offset string for text matching/generation.
 /// Checks context to decide between (%rbp) and (%rsp).
@@ -1937,10 +1937,32 @@ pub(super) fn fuse_signext_and_move(
             }
             // Check if this instruction references rax
             if infos[n].reg_refs & 1 != 0 {
-                // rax is referenced. Check if it's a write (rax overwritten → dead)
+                // rax is referenced. Check if it's a PURE write (rax overwritten → dead).
+                // Instructions that both read and write rax (like movl %eax, %eax
+                // for zero-extension) are NOT pure writes — they depend on the
+                // current rax value.
                 match infos[n].kind {
-                    LineKind::Other { dest_reg: 0 } => { rax_dead = true; break; }
                     LineKind::LoadRbp { reg: 0, .. } => { rax_dead = true; break; }
+                    LineKind::Other { dest_reg: 0 } => {
+                        // Verify it's a pure write, not a read-modify-write.
+                        let tn = infos[n].trimmed(store.get(n));
+                        if !is_read_modify_write(tn) {
+                            // Also check: source operand must not reference any
+                            // rax-family register (eax, ax, al, rax).
+                            let is_rax_in_src = if let Some(comma) = tn.rfind(',') {
+                                let src = &tn[..comma];
+                                src.contains("%rax") || src.contains("%eax")
+                                    || src.contains("%ax") || src.contains("%al")
+                            } else {
+                                true // single-operand → assumes reads rax
+                            };
+                            if !is_rax_in_src {
+                                rax_dead = true;
+                                break;
+                            }
+                        }
+                        // Falls through: rax is read, not dead
+                    }
                     _ => {}
                 }
                 // Check if it's a cmpl $imm, %eax
