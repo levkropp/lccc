@@ -2825,14 +2825,47 @@ fn insert_reduction_remainder_loop(
             false
         };
 
-        // Update terminator (most likely: Return with accumulator value)
+        // Update all uses of the accumulator phi in the exit block's instructions.
+        // The accumulator may be used in Copy, Store, BinOp, Call args, etc.
+        let acc_id = pattern.accumulator_phi.0;
+        for inst in &mut exit_block.instructions {
+            match inst {
+                Instruction::Copy { src, .. } => {
+                    if let Operand::Value(v) = src { if v.0 == acc_id { *v = sum_rem_phi; updates += 1; } }
+                }
+                Instruction::Store { val, .. } => {
+                    if let Operand::Value(v) = val { if v.0 == acc_id { *v = sum_rem_phi; updates += 1; } }
+                }
+                Instruction::BinOp { lhs, rhs, .. } => {
+                    if let Operand::Value(v) = lhs { if v.0 == acc_id { *v = sum_rem_phi; updates += 1; } }
+                    if let Operand::Value(v) = rhs { if v.0 == acc_id { *v = sum_rem_phi; updates += 1; } }
+                }
+                Instruction::UnaryOp { src, .. } | Instruction::Cast { src, .. } => {
+                    if let Operand::Value(v) = src { if v.0 == acc_id { *v = sum_rem_phi; updates += 1; } }
+                }
+                Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+                    for a in &mut info.args {
+                        if let Operand::Value(v) = a { if v.0 == acc_id { *v = sum_rem_phi; updates += 1; } }
+                    }
+                }
+                Instruction::Phi { incoming, .. } => {
+                    for (op, _) in incoming {
+                        if let Operand::Value(v) = op { if v.0 == acc_id { *v = sum_rem_phi; updates += 1; } }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Also update terminator
         match &mut exit_block.terminator {
             Terminator::Return(Some(op)) => {
                 if replace_in_operand(op, pattern.accumulator_phi.0, sum_rem_phi) {
-                    if debug {
-                        eprintln!("[VEC-RED]   Updated Return: SSA {} → SSA {} (vector → scalar)",
-                                  pattern.accumulator_phi.0, sum_rem_phi.0);
-                    }
+                    updates += 1;
+                }
+            }
+            Terminator::CondBranch { cond, .. } => {
+                if replace_in_operand(cond, pattern.accumulator_phi.0, sum_rem_phi) {
                     updates += 1;
                 }
             }
