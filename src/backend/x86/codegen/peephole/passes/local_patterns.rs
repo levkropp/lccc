@@ -1946,15 +1946,29 @@ pub(super) fn fuse_signext_and_move(
                 // Check if it's a cmpl $imm, %eax
                 let tn = infos[n].trimmed(store.get(n));
                 if tn.starts_with("cmpl $") && tn.ends_with(", %eax") && cmpl_line.is_none() {
-                    // Check src_family is not modified between i and n
+                    // Check src_family is not modified between i and n.
+                    // Must check ALL instruction kinds that can write to a register,
+                    // including calls (clobber caller-saved) and pop.
                     let src_bit = 1u16 << src_family;
                     let mut src_modified = false;
                     for chk in (i + 1)..n {
                         if infos[chk].is_nop() { continue; }
+                        // Calls clobber all caller-saved registers. If src is
+                        // caller-saved (rdi=6, rsi=7, r8-r11=8-11), it's modified.
+                        if infos[chk].kind == LineKind::Call {
+                            if src_family >= 6 { // caller-saved families
+                                src_modified = true; break;
+                            }
+                        }
+                        // Any barrier could modify the register
+                        if infos[chk].is_barrier() && infos[chk].kind == LineKind::Call {
+                            // already handled above
+                        }
                         if infos[chk].reg_refs & src_bit == 0 { continue; }
                         match infos[chk].kind {
                             LineKind::Other { dest_reg: d } if d == src_family => { src_modified = true; break; }
                             LineKind::LoadRbp { reg: r, .. } if r == src_family => { src_modified = true; break; }
+                            LineKind::Pop { reg: r } if r == src_family => { src_modified = true; break; }
                             LineKind::StoreRbp { reg: r, .. } if r == src_family => {} // store reads, doesn't modify
                             _ => {} // read-only reference is fine
                         }
