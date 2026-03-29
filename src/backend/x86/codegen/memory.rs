@@ -573,6 +573,22 @@ impl X86Codegen {
             return;
         }
 
+        // Register-direct load: when ptr has a register, load directly from
+        // (%ptr_reg) into rax, skipping the rcx intermediate. Saves 1 instruction.
+        if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128) {
+            if let Some(p_reg) = self.reg_assignments.get(&ptr.0).copied() {
+                if !is_xmm_reg(p_reg) && !self.state.is_alloca(ptr.0) {
+                    let load_instr = Self::mov_load_for_type(ty);
+                    let p_name = phys_reg_name(p_reg);
+                    let dest_reg = if matches!(ty, IrType::I32 | IrType::U32) { "%eax" } else { "%rax" };
+                    self.state.emit_fmt(format_args!("    {} (%{}), {}", load_instr, p_name, dest_reg));
+                    self.state.reg_cache.set_acc(dest.0, false);
+                    self.store_rax_to(dest);
+                    return;
+                }
+            }
+        }
+
         // Fall back to default load logic
         crate::backend::traits::emit_load_default(self, dest, ptr, ty);
     }
