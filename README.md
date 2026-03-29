@@ -145,9 +145,9 @@ allocator, stack layout, call codegen, phi elimination, and liveness analysis. K
 - Stack arg RSP tracking for functions with >6 arguments
 - Variadic functions forced to use frame pointer
 
-Build flags for SQLite: `CCC_DISABLE_PASSES=vectorize`
+Build flags for SQLite: *(none required — all optimization passes active)*
 
-All 25 peephole sub-passes and GVN are now active on SQLite. Only the vectorization pass remains disabled.
+All optimization passes work correctly on SQLite: 25 peephole sub-passes, GVN, LICM, IVSR, vectorization, and all IR passes.
 
 ### Known Correctness Issues
 
