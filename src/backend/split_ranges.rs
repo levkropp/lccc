@@ -5,9 +5,10 @@
 //! one long call-spanning interval into multiple short non-call-spanning
 //! intervals that can use caller-saved registers (Phase 2 allocation).
 
-use crate::common::fx_hash::FxHashSet;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{IrType, AddressSpace};
 use crate::ir::reexports::{IrFunction, Instruction, Operand, Value, Terminator};
+use crate::ir::analysis::CfgAnalysis;
 
 /// Split call-spanning live ranges in a function.
 /// Returns the number of values split.
@@ -66,34 +67,32 @@ pub fn split_call_spanning_ranges(func: &mut IrFunction, max_splits: usize) -> u
             continue; // Not enough benefit
         }
 
-        // Only split values whose ALL uses are in a single block.
-        // Cross-block splits require dominance analysis and phi insertion.
-        let mut def_block: Option<usize> = None;
-        let mut all_same_block = true;
-        for (bi, block) in func.blocks.iter().enumerate() {
-            let defined_here = block.instructions.iter().any(|i| {
-                i.dest().map_or(false, |d| d.0 == vid)
-            });
-            let used_here = block.instructions.iter().any(|i| inst_uses_value(i, vid));
-            let used_in_term = match &block.terminator {
-                Terminator::Return(Some(Operand::Value(v))) => v.0 == vid,
-                Terminator::CondBranch { cond: Operand::Value(v), .. } => v.0 == vid,
-                Terminator::Switch { val: Operand::Value(v), .. } => v.0 == vid,
-                _ => false,
-            };
-            if defined_here {
-                def_block = Some(bi);
-            }
-            if used_here || used_in_term {
-                if let Some(db) = def_block {
-                    if bi != db { all_same_block = false; break; }
-                } else {
-                    // Used before defined → cross-block (e.g., phi incoming)
-                    all_same_block = false; break;
-                }
-            }
-        }
-        if !all_same_block { continue; }
+        // Skip phi-defined values (their splitting would require phi rewriting)
+        let is_phi_defined = func.blocks.iter().any(|b| {
+            b.instructions.iter().any(|i| matches!(i, Instruction::Phi { dest, .. } if dest.0 == vid))
+        });
+        if is_phi_defined { continue; }
+
+        // Only split values used entirely within a single block.
+        // Cross-block uses keep the original value live across calls even
+        // after splitting, negating the benefit and causing SSA inconsistency.
+        let def_block = func.blocks.iter().position(|b| {
+            b.instructions.iter().any(|i| i.dest().map_or(false, |d| d.0 == vid))
+        });
+        let all_uses_same_block = if let Some(db) = def_block {
+            func.blocks.iter().enumerate().all(|(bi, b)| {
+                bi == db || (!b.instructions.iter().any(|i| inst_uses_value(i, vid))
+                    && !matches!(&b.terminator,
+                        Terminator::Return(Some(Operand::Value(v))) if v.0 == vid)
+                    && !matches!(&b.terminator,
+                        Terminator::CondBranch { cond: Operand::Value(v), .. } if v.0 == vid)
+                    && !matches!(&b.terminator,
+                        Terminator::Switch { val: Operand::Value(v), .. } if v.0 == vid))
+            })
+        } else {
+            false
+        };
+        if !all_uses_same_block { continue; }
 
         candidates.push(SplitCandidate {
             value_id: vid,
@@ -126,7 +125,10 @@ pub fn split_call_spanning_ranges(func: &mut IrFunction, max_splits: usize) -> u
         }
     }
 
-    // Step 4: Split top-N candidates
+    // Step 4: Compute dominator tree for cross-block use replacement
+    let cfg = CfgAnalysis::build(func);
+
+    // Step 5: Split top-N candidates
     let mut splits = 0;
     let mut next_val = func.next_value_id;
 
@@ -229,6 +231,11 @@ pub fn split_call_spanning_ranges(func: &mut IrFunction, max_splits: usize) -> u
 
             func.blocks[block_idx].instructions = new_insts;
             func.blocks[block_idx].source_spans.clear();
+
+            // Note: cross-block replacement requires proper SSA reconstruction
+            // (phi insertion at dominance frontiers). For now, only same-block
+            // replacement is done. Cross-block uses still reference the original
+            // value, which will be spilled by the register allocator.
         }
 
         if any_split { splits += 1; }
