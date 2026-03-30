@@ -1,29 +1,26 @@
 //! Live range splitting for call-spanning values.
 //!
-//! Splits high-priority call-spanning values by inserting explicit
-//! Store/Load instructions around Call instructions. This converts
-//! one long call-spanning interval into multiple short non-call-spanning
-//! intervals that can use caller-saved registers (Phase 2 allocation).
+//! Demotes high-priority call-spanning values to stack allocas, then lets
+//! mem2reg re-promote them with proper phi insertion. This creates short-lived
+//! SSA values between calls that can use caller-saved registers.
 
-use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::fx_hash::FxHashSet;
 use crate::common::types::{IrType, AddressSpace};
 use crate::ir::reexports::{IrFunction, Instruction, Operand, Value, Terminator};
-use crate::ir::analysis::CfgAnalysis;
 
-/// Split call-spanning live ranges in a function.
+/// Split call-spanning live ranges by demoting to alloca + mem2reg.
 /// Returns the number of values split.
 pub fn split_call_spanning_ranges(func: &mut IrFunction, max_splits: usize) -> usize {
     if func.blocks.is_empty() || max_splits == 0 {
         return 0;
     }
 
-    // Step 1: Compute liveness to find call-spanning values and their ranges
+    // Step 1: Compute liveness
     let liveness = super::liveness::compute_live_intervals(func);
     if liveness.call_points.is_empty() {
         return 0;
     }
 
-    // Build alloca set to exclude
     let alloca_set: FxHashSet<u32> = func.blocks.iter()
         .flat_map(|b| b.instructions.iter())
         .filter_map(|i| match i {
@@ -32,87 +29,60 @@ pub fn split_call_spanning_ranges(func: &mut IrFunction, max_splits: usize) -> u
         })
         .collect();
 
-    // Step 2: Find eligible values with cost/benefit analysis
-    let mut candidates: Vec<SplitCandidate> = Vec::new();
+    // Step 2: Find eligible call-spanning values with cost/benefit
+    let mut candidates: Vec<(u32, u32, u32)> = Vec::new(); // (value_id, uses, calls_in_range)
 
     for iv in &liveness.intervals {
         if alloca_set.contains(&iv.value_id) { continue; }
         if iv.end <= iv.start { continue; }
 
-        // Count calls within the value's live range
+        // Count calls in range
         let start_idx = liveness.call_points.partition_point(|&cp| cp < iv.start);
-        let mut calls_in_range = 0u32;
+        let mut calls = 0u32;
         let mut idx = start_idx;
         while idx < liveness.call_points.len() && liveness.call_points[idx] <= iv.end {
-            calls_in_range += 1;
+            calls += 1;
             idx += 1;
         }
-        if calls_in_range == 0 { continue; }
+        if calls == 0 { continue; }
 
         // Count uses
         let vid = iv.value_id;
-        let mut use_count = 0u32;
+        let mut uses = 0u32;
         for block in &func.blocks {
             for inst in &block.instructions {
-                if inst_uses_value(inst, vid) { use_count += 1; }
+                if inst_uses_value(inst, vid) { uses += 1; }
             }
         }
 
-        // Cost/benefit: each call within range costs 2 instructions (Store+Load).
-        // Each use that gets a register saves ~2 instructions (vs spill/reload path).
-        // Only split if expected savings > cost.
-        // Savings = use_count * 2 (optimistic: assumes all uses benefit from register)
-        // Cost = calls_in_range * 2 (Store+Load pairs)
-        if use_count * 2 <= calls_in_range * 2 + 4 {
-            continue; // Not enough benefit
-        }
-
-        // Skip phi-defined values (their splitting would require phi rewriting)
-        let is_phi_defined = func.blocks.iter().any(|b| {
+        // Skip phi-defined values
+        let is_phi = func.blocks.iter().any(|b| {
             b.instructions.iter().any(|i| matches!(i, Instruction::Phi { dest, .. } if dest.0 == vid))
         });
-        if is_phi_defined { continue; }
+        if is_phi { continue; }
 
-        candidates.push(SplitCandidate {
-            value_id: vid,
-            use_count,
-            calls_in_range,
-            start: iv.start,
-            end: iv.end,
-        });
+        // Cost/benefit: demoting adds 1 Store (at def) + 1 Load per use.
+        // Benefit: each Load creates a short-lived value eligible for caller-saved.
+        // Only split if the value has enough uses to justify the overhead.
+        // Each use with a caller-saved register saves ~2 instructions vs spill path.
+        // The Store at def costs 1 instruction. Each Load costs 1.
+        // Break-even: uses * 1 (load overhead) < uses * 2 (register savings) → always true
+        // But we also need the value to actually GET a register. With 6 caller-saved
+        // regs and many short intervals competing, some won't get registers.
+        // Conservatively require uses > calls + 4.
+        if uses <= calls + 4 { continue; }
+
+        candidates.push((vid, uses, calls));
     }
 
-    // Sort by net benefit (uses - calls) descending
-    candidates.sort_by(|a, b| {
-        let a_benefit = a.use_count as i64 - a.calls_in_range as i64;
-        let b_benefit = b.use_count as i64 - b.calls_in_range as i64;
-        b_benefit.cmp(&a_benefit)
-    });
+    candidates.sort_by(|a, b| b.1.cmp(&a.1)); // Sort by use count desc
 
-    // Step 3: Map instruction positions to (block_idx, inst_idx) for call lookup
-    let mut call_positions: Vec<(u32, usize, usize)> = Vec::new(); // (program_point, block_idx, inst_idx)
-    {
-        let mut point = 0u32;
-        for (bi, block) in func.blocks.iter().enumerate() {
-            for (ii, inst) in block.instructions.iter().enumerate() {
-                if matches!(inst, Instruction::Call { .. } | Instruction::CallIndirect { .. }) {
-                    call_positions.push((point, bi, ii));
-                }
-                point += 1;
-            }
-            point += 1; // terminator
-        }
-    }
-
-    // Step 4: Compute dominator tree for cross-block use replacement
-    let cfg = CfgAnalysis::build(func);
-
-    // Step 5: Split top-N candidates
+    // Step 3: Demote top-N values to allocas
     let mut splits = 0;
     let mut next_val = func.next_value_id;
 
-    for cand in candidates.iter().take(max_splits) {
-        let val_type = match find_value_type(func, cand.value_id) {
+    for &(val_id, _uses, _calls) in candidates.iter().take(max_splits) {
+        let val_type = match find_value_type(func, val_id) {
             Some(t) => t,
             None => continue,
         };
@@ -120,15 +90,7 @@ pub fn split_call_spanning_ranges(func: &mut IrFunction, max_splits: usize) -> u
             continue;
         }
 
-        // Find calls within this value's range
-        let calls_in_range: Vec<(usize, usize)> = call_positions.iter()
-            .filter(|(pt, _, _)| *pt >= cand.start && *pt <= cand.end)
-            .map(|(_, bi, ii)| (*bi, *ii))
-            .collect();
-
-        if calls_in_range.is_empty() { continue; }
-
-        // Create spill alloca in entry block
+        // Create alloca in entry block
         let alloca_val = Value(next_val);
         next_val += 1;
         func.blocks[0].instructions.insert(0, Instruction::Alloca {
@@ -141,123 +103,129 @@ pub fn split_call_spanning_ranges(func: &mut IrFunction, max_splits: usize) -> u
         if !func.blocks[0].source_spans.is_empty() {
             func.blocks[0].source_spans.insert(0, crate::common::source::Span::dummy());
         }
-        // Adjust call positions for blocks[0] since we inserted at index 0
-        // (all instruction indices in block 0 shift by 1)
 
-        // Group calls by block
-        let mut block_calls: std::collections::BTreeMap<usize, Vec<usize>> = std::collections::BTreeMap::new();
-        for &(bi, ii) in &calls_in_range {
-            // Adjust for the alloca we just inserted in block 0
-            let adjusted_ii = if bi == 0 { ii + 1 } else { ii };
-            block_calls.entry(bi).or_default().push(adjusted_ii);
+        // Find the definition and insert Store right after it
+        let mut def_found = false;
+        for block in &mut func.blocks {
+            let def_pos = block.instructions.iter().position(|i| {
+                i.dest().map_or(false, |d| d.0 == val_id)
+            });
+            if let Some(pos) = def_pos {
+                // Insert Store(val, alloca) right after the definition
+                block.instructions.insert(pos + 1, Instruction::Store {
+                    val: Operand::Value(Value(val_id)),
+                    ptr: alloca_val,
+                    ty: val_type,
+                    seg_override: AddressSpace::Default,
+                });
+                if !block.source_spans.is_empty() && pos + 1 < block.source_spans.len() {
+                    block.source_spans.insert(pos + 1, crate::common::source::Span::dummy());
+                }
+                def_found = true;
+                break;
+            }
         }
+        if !def_found { continue; }
 
-        let mut any_split = false;
-        for (&block_idx, call_indices) in &block_calls {
-            // Check value is actually used in this block
-            let used = func.blocks[block_idx].instructions.iter()
-                .any(|inst| inst_uses_value(inst, cand.value_id));
-            if !used { continue; }
+        // Replace all USES of val_id with Load(alloca)
+        // (except the Store we just inserted, and except the definition itself)
+        for block in &mut func.blocks {
+            let mut i = 0;
+            let mut insertions: Vec<(usize, Value)> = Vec::new();
 
-            // Rebuild the block's instruction list with Store/Load around calls
-            let old_insts = std::mem::take(&mut func.blocks[block_idx].instructions);
-            let call_set: FxHashSet<usize> = call_indices.iter().copied().collect();
-            let mut new_insts = Vec::with_capacity(old_insts.len() + call_indices.len() * 2);
-            let mut current_val = cand.value_id;
+            while i < block.instructions.len() {
+                let inst = &block.instructions[i];
 
-            for (ii, inst) in old_insts.into_iter().enumerate() {
-                if call_set.contains(&ii) {
-                    // Store before call
-                    new_insts.push(Instruction::Store {
-                        val: Operand::Value(Value(current_val)),
-                        ptr: alloca_val,
-                        ty: val_type,
-                        seg_override: AddressSpace::Default,
-                    });
-                    // The call
-                    new_insts.push(inst);
-                    // Load after call
+                // Skip the definition itself
+                if inst.dest().map_or(false, |d| d.0 == val_id) {
+                    i += 1;
+                    // Skip the Store we inserted right after
+                    if i < block.instructions.len() {
+                        if let Instruction::Store { ptr, .. } = &block.instructions[i] {
+                            if ptr.0 == alloca_val.0 { i += 1; }
+                        }
+                    }
+                    continue;
+                }
+
+                // Skip Store to our alloca
+                if let Instruction::Store { ptr, .. } = inst {
+                    if ptr.0 == alloca_val.0 { i += 1; continue; }
+                }
+
+                // Check if this instruction uses val_id
+                if inst_uses_value(inst, val_id) {
+                    // Create a Load and replace the use
                     let new_val = Value(next_val);
                     next_val += 1;
-                    new_insts.push(Instruction::Load {
-                        dest: new_val,
-                        ptr: alloca_val,
-                        ty: val_type,
-                        seg_override: AddressSpace::Default,
-                    });
-                    current_val = new_val.0;
-                    any_split = true;
-                } else {
-                    // Replace uses of original value with current_val (same-block only)
-                    if current_val != cand.value_id {
-                        let mut inst = inst;
-                        replace_value_uses(&mut inst, cand.value_id, Value(current_val));
-                        new_insts.push(inst);
-                    } else {
-                        new_insts.push(inst);
-                    }
+                    insertions.push((i, new_val));
                 }
+
+                i += 1;
             }
 
-            // Replace uses in the terminator (same-block)
-            if current_val != cand.value_id {
-                replace_terminator_uses(
-                    &mut func.blocks[block_idx].terminator,
-                    cand.value_id,
-                    Value(current_val),
-                );
+            // Insert Loads BEFORE each use (in reverse order to preserve indices)
+            for &(pos, new_val) in insertions.iter().rev() {
+                block.instructions.insert(pos, Instruction::Load {
+                    dest: new_val,
+                    ptr: alloca_val,
+                    ty: val_type,
+                    seg_override: AddressSpace::Default,
+                });
+                // Replace uses in the instruction that follows
+                let use_inst = &mut block.instructions[pos + 1];
+                replace_value_uses(use_inst, val_id, new_val);
             }
 
-            func.blocks[block_idx].instructions = new_insts;
-            func.blocks[block_idx].source_spans.clear();
+            // Handle terminator uses
+            if term_uses_value(&block.terminator, val_id) {
+                let new_val = Value(next_val);
+                next_val += 1;
+                block.instructions.push(Instruction::Load {
+                    dest: new_val,
+                    ptr: alloca_val,
+                    ty: val_type,
+                    seg_override: AddressSpace::Default,
+                });
+                replace_terminator_uses(&mut block.terminator, val_id, new_val);
+            }
 
-            // Note: cross-block replacement requires proper SSA reconstruction
-            // (phi insertion at dominance frontiers). For now, only same-block
-            // replacement is done. Cross-block uses still reference the original
-            // value, which will be spilled by the register allocator.
+            block.source_spans.clear();
         }
 
-        if any_split { splits += 1; }
+        splits += 1;
     }
 
     func.next_value_id = next_val;
-    splits
-}
 
-struct SplitCandidate {
-    value_id: u32,
-    use_count: u32,
-    calls_in_range: u32,
-    start: u32,
-    end: u32,
+    // Step 4: Run mem2reg to re-promote the new allocas to SSA form
+    // This inserts phi nodes at merge points and optimizes away redundant loads
+    if splits > 0 {
+        crate::ir::mem2reg::promote::promote_function(func, false);
+    }
+
+    splits
 }
 
 fn find_value_type(func: &IrFunction, val_id: u32) -> Option<IrType> {
     for block in &func.blocks {
         for inst in &block.instructions {
             match inst {
-                Instruction::BinOp { dest, ty, .. } |
-                Instruction::UnaryOp { dest, ty, .. } |
-                Instruction::Load { dest, ty, .. } |
-                Instruction::Cmp { dest, ty, .. } => {
+                Instruction::BinOp { dest, ty, .. } | Instruction::UnaryOp { dest, ty, .. }
+                | Instruction::Load { dest, ty, .. } | Instruction::Cmp { dest, ty, .. } => {
                     if dest.0 == val_id { return Some(*ty); }
                 }
                 Instruction::Cast { dest, to_ty, .. } => {
                     if dest.0 == val_id { return Some(*to_ty); }
                 }
-                Instruction::Copy { dest, .. } |
-                Instruction::GetElementPtr { dest, .. } |
-                Instruction::GlobalAddr { dest, .. } |
-                Instruction::LabelAddr { dest, .. } => {
+                Instruction::Copy { dest, .. } | Instruction::GetElementPtr { dest, .. }
+                | Instruction::GlobalAddr { dest, .. } | Instruction::LabelAddr { dest, .. } => {
                     if dest.0 == val_id { return Some(IrType::Ptr); }
                 }
                 Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
-                    if let Some(d) = info.dest {
-                        if d.0 == val_id { return Some(info.return_type); }
-                    }
+                    if let Some(d) = info.dest { if d.0 == val_id { return Some(info.return_type); } }
                 }
-                Instruction::Select { dest, ty, .. } |
-                Instruction::Phi { dest, ty, .. } => {
+                Instruction::Select { dest, ty, .. } | Instruction::Phi { dest, ty, .. } => {
                     if dest.0 == val_id { return Some(*ty); }
                 }
                 _ => {}
@@ -277,6 +245,15 @@ fn inst_uses_value(inst: &Instruction, val_id: u32) -> bool {
         Instruction::GetElementPtr { base, offset, .. } => base.0 == val_id || check(offset),
         Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => info.args.iter().any(|a| check(a)),
         Instruction::Select { cond, true_val, false_val, .. } => check(cond) || check(true_val) || check(false_val),
+        _ => false,
+    }
+}
+
+fn term_uses_value(term: &Terminator, val_id: u32) -> bool {
+    match term {
+        Terminator::Return(Some(Operand::Value(v))) => v.0 == val_id,
+        Terminator::CondBranch { cond: Operand::Value(v), .. } => v.0 == val_id,
+        Terminator::Switch { val: Operand::Value(v), .. } => v.0 == val_id,
         _ => false,
     }
 }
