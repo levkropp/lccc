@@ -76,7 +76,7 @@ struct AllocaInfo {
 /// Promote allocas in a single function to SSA form.
 /// If `promote_params` is true, parameter allocas in the entry block are also
 /// eligible for promotion.
-fn promote_function(func: &mut IrFunction, promote_params: bool) {
+pub fn promote_function(func: &mut IrFunction, promote_params: bool) {
     if func.blocks.is_empty() {
         return;
     }
