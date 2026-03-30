@@ -1192,8 +1192,8 @@ impl Driver {
             omit_frame_pointer: self.omit_frame_pointer,
             emit_cfi: !self.no_unwind_tables,
         };
-        // Live range splitting (opt-in: needs correctness fix)
-        if std::env::var("CCC_SPLIT_RANGES").is_ok() {
+        // Live range splitting: demote+reload call-spanning values
+        if std::env::var("CCC_NO_SPLIT_RANGES").is_err() {
             let max_splits = std::env::var("CCC_SPLIT_MAX")
                 .ok().and_then(|s| s.parse().ok()).unwrap_or(30);
             for func in &mut module.functions {
