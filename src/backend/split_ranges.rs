@@ -53,6 +53,7 @@ pub fn split_call_spanning_ranges(func: &mut IrFunction, max_splits: usize) -> u
 
     let mut splits = 0;
     let mut next_val = func.next_value_id;
+    let mut new_alloca_ids: FxHashSet<u32> = FxHashSet::default();
 
     for &(val_id, _uses, _calls) in candidates.iter().take(max_splits) {
         let val_type = match find_value_type(func, val_id) {
@@ -118,6 +119,7 @@ pub fn split_call_spanning_ranges(func: &mut IrFunction, max_splits: usize) -> u
 
         // Create alloca for spill slot — insert AFTER existing allocas in entry block
         let alloca_val = Value(next_val); next_val += 1;
+        new_alloca_ids.insert(alloca_val.0);
         let insert_pos = func.blocks[0].instructions.iter()
             .position(|i| !matches!(i, Instruction::Alloca { .. }))
             .unwrap_or(func.blocks[0].instructions.len());
@@ -205,10 +207,49 @@ pub fn split_call_spanning_ranges(func: &mut IrFunction, max_splits: usize) -> u
 
     func.next_value_id = next_val;
 
-    // Note: mem2reg promotion of the spill allocas crashes on SQLite.
-    // The allocas stay as stack slots. The Store/Load pairs correctly
-    // preserve values across calls but add ~2KB per split value.
-    // To reduce overhead, need mem2reg to eliminate redundant pairs.
+    // Promote spill allocas via mem2reg. To avoid re-promoting existing
+    // allocas (which may have non-promotable patterns), temporarily mark
+    // all PRE-EXISTING non-param allocas as volatile. Our new allocas
+    // are non-volatile and will be promoted by mem2reg.
+    if splits > 0 && std::env::var("CCC_NO_SPLIT_MEM2REG").is_err() {
+        // Mark existing allocas as volatile (skip first num_params)
+        let num_params = func.params.len();
+        let mut alloca_idx = 0;
+        let mut made_volatile: Vec<u32> = Vec::new();
+        for inst in &mut func.blocks[0].instructions {
+            if let Instruction::Alloca { dest, volatile, .. } = inst {
+                if alloca_idx >= num_params && !*volatile && !new_alloca_ids.contains(&dest.0) {
+                    *volatile = true;
+                    made_volatile.push(dest.0);
+                }
+                alloca_idx += 1;
+            }
+        }
+        // Also mark allocas in non-entry blocks
+        for block in &mut func.blocks[1..] {
+            for inst in &mut block.instructions {
+                if let Instruction::Alloca { dest, volatile, .. } = inst {
+                    if !*volatile && !new_alloca_ids.contains(&dest.0) {
+                        *volatile = true;
+                        made_volatile.push(dest.0);
+                    }
+                }
+            }
+        }
+
+        crate::ir::mem2reg::promote::promote_function(func, false);
+
+        // Restore volatility
+        for block in &mut func.blocks {
+            for inst in &mut block.instructions {
+                if let Instruction::Alloca { dest, volatile, .. } = inst {
+                    if made_volatile.contains(&dest.0) {
+                        *volatile = false;
+                    }
+                }
+            }
+        }
+    }
 
     splits
 }
