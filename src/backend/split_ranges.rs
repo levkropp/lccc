@@ -37,7 +37,9 @@ pub fn split_call_spanning_ranges(func: &mut IrFunction, max_splits: usize) -> u
         if is_phi { continue; }
         let mut uses = 0u32;
         for b in &func.blocks { for i in &b.instructions { if inst_uses_value(i, vid) { uses += 1; } } }
-        if uses <= calls + 2 { continue; }
+        // Need many more uses than calls for the splitting to pay off:
+        // each call costs ~14 bytes (Store+Load), each registered use saves ~4 bytes
+        if uses < calls * 4 + 5 { continue; }
         candidates.push((vid, uses, calls));
     }
     candidates.sort_by(|a, b| b.1.cmp(&a.1));
@@ -168,9 +170,14 @@ pub fn split_call_spanning_ranges(func: &mut IrFunction, max_splits: usize) -> u
                 0 // all calls are after def for dominated blocks
             };
 
-            // Filter to calls after the def
+            // Filter to calls after the def AND where value is used after the call
+            let insts = &func.blocks[bi].instructions;
             let call_indices: Vec<usize> = call_indices.into_iter()
                 .filter(|&ci| ci > def_pos_in_block)
+                .filter(|&ci| {
+                    // Check if value is used AFTER this call in the block
+                    (ci + 1..insts.len()).any(|j| inst_uses_value(&insts[j], val_id))
+                })
                 .collect();
             if call_indices.is_empty() { continue; }
 

@@ -1085,6 +1085,29 @@ impl Driver {
         run_passes(&mut module, self.opt_level, self.target);
         if time_phases { eprintln!("[TIME] opt passes: {:.3}s", t6.elapsed().as_secs_f64()); }
 
+        // Live range splitting: split call-spanning values, then clean up
+        if std::env::var("CCC_NO_SPLIT_RANGES").is_err() {
+            let max_splits = std::env::var("CCC_SPLIT_MAX")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(30);
+            let mut did_split = false;
+            for func in &mut module.functions {
+                if !func.is_declaration && func.blocks.len() > 10 {
+                    let n = crate::backend::split_ranges::split_call_spanning_ranges(func, max_splits);
+                    if n > 0 { did_split = true; }
+                }
+            }
+            // Run cleanup passes on split IR: copy propagation + DCE
+            // to eliminate redundant Store/Load → Copy chains from mem2reg
+            if did_split {
+                for func in &mut module.functions {
+                    if !func.is_declaration && !func.blocks.is_empty() {
+                        crate::passes::copy_prop::propagate_copies(func);
+                        crate::passes::dce::eliminate_dead_code(func);
+                    }
+                }
+            }
+        }
+
         // Lower SSA phi nodes to copies before codegen
         let t7 = std::time::Instant::now();
         eliminate_phis(&mut module);
@@ -1192,17 +1215,6 @@ impl Driver {
             omit_frame_pointer: self.omit_frame_pointer,
             emit_cfi: !self.no_unwind_tables,
         };
-        // Live range splitting (opt-in: adds overhead without mem2reg)
-        if std::env::var("CCC_SPLIT_RANGES").is_ok() {
-            let max_splits = std::env::var("CCC_SPLIT_MAX")
-                .ok().and_then(|s| s.parse().ok()).unwrap_or(30);
-            for func in &mut module.functions {
-                if !func.is_declaration && func.blocks.len() > 10 {
-                    crate::backend::split_ranges::split_call_spanning_ranges(func, max_splits);
-                }
-            }
-        }
-
         let asm = self.target.generate_assembly_with_opts_and_debug(
             &module, &opts, source_manager.as_ref(),
         );
