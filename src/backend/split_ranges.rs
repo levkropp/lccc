@@ -73,27 +73,6 @@ pub fn split_call_spanning_ranges(func: &mut IrFunction, max_splits: usize) -> u
         });
         if is_phi_defined { continue; }
 
-        // Only split values used entirely within a single block.
-        // Cross-block uses keep the original value live across calls even
-        // after splitting, negating the benefit and causing SSA inconsistency.
-        let def_block = func.blocks.iter().position(|b| {
-            b.instructions.iter().any(|i| i.dest().map_or(false, |d| d.0 == vid))
-        });
-        let all_uses_same_block = if let Some(db) = def_block {
-            func.blocks.iter().enumerate().all(|(bi, b)| {
-                bi == db || (!b.instructions.iter().any(|i| inst_uses_value(i, vid))
-                    && !matches!(&b.terminator,
-                        Terminator::Return(Some(Operand::Value(v))) if v.0 == vid)
-                    && !matches!(&b.terminator,
-                        Terminator::CondBranch { cond: Operand::Value(v), .. } if v.0 == vid)
-                    && !matches!(&b.terminator,
-                        Terminator::Switch { val: Operand::Value(v), .. } if v.0 == vid))
-            })
-        } else {
-            false
-        };
-        if !all_uses_same_block { continue; }
-
         candidates.push(SplitCandidate {
             value_id: vid,
             use_count,
