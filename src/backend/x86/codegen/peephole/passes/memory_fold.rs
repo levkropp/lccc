@@ -437,6 +437,94 @@ pub(super) fn fold_extend_relay(store: &mut LineStore, infos: &mut [LineInfo]) -
     changed
 }
 
+/// General accumulator relay fold: retarget instructions that write to %rax
+/// when the result is immediately copied to another register.
+///
+/// Handles:
+///   leaq   X, %rax  +  movq %rax, %REG  →  leaq X, %REG
+///   movslq X, %rax   +  movq %rax, %REG  →  movslq X, %REG
+///   xorl   %eax, %eax + movq %rax, %REG  →  xorl %REGd, %REGd
+///   addq   X, %rax  +  movq %rax, %REG  →  (not safe: flags + read-modify-write)
+///
+/// Only applies to instructions that purely write %rax without reading it first,
+/// and where %rax is dead after the copy.
+pub(super) fn fold_general_relay(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+
+    while i + 1 < len {
+        if infos[i].is_nop() { i += 1; continue; }
+
+        // Step 1: Instruction writes to %rax (dest_reg == 0).
+        if let LineKind::Other { dest_reg: 0 } = infos[i].kind {
+            let line_i = infos[i].trimmed(store.get(i));
+
+            // Step 2: Next must be movq %rax, %DEST.
+            let mut j = i + 1;
+            while j < len && infos[j].is_nop() { j += 1; }
+            if j >= len { i += 1; continue; }
+            let dest_reg = match infos[j].kind {
+                LineKind::Other { dest_reg } if dest_reg != REG_NONE && dest_reg != 0 && dest_reg <= REG_GP_MAX => {
+                    let lj = infos[j].trimmed(store.get(j));
+                    if lj.starts_with("movq %rax, %") && !lj.contains('(') {
+                        dest_reg
+                    } else { i += 1; continue; }
+                }
+                _ => { i += 1; continue; }
+            };
+
+            // Step 3: Check rax is dead after.
+            if !is_rax_dead_after(store, infos, j + 1, len) { i += 1; continue; }
+
+            let dest_64 = REG_NAMES[0][dest_reg as usize];
+            let dest_32 = REG_NAMES[1][dest_reg as usize];
+
+            // Step 4: Match specific retargetable patterns.
+            let new_inst = if line_i.starts_with("leaq ") && line_i.ends_with(", %rax") {
+                // leaq X, %rax → leaq X, %REG
+                // Safe: leaq doesn't read %rax (it computes an address, doesn't deref).
+                // But check the source doesn't reference rax!
+                let src = &line_i[5..line_i.len() - 6]; // between "leaq " and ", %rax"
+                if src.contains("%rax") || src.contains("%eax") {
+                    i += 1; continue;
+                }
+                Some(format!("    leaq {}, {}", src, dest_64))
+            } else if line_i.starts_with("movslq ") && line_i.ends_with(", %rax") {
+                // movslq X, %rax → movslq X, %REG
+                let src = &line_i[7..line_i.len() - 6];
+                if src.contains("%rax") || src.contains("%eax") {
+                    i += 1; continue;
+                }
+                Some(format!("    movslq {}, {}", src, dest_64))
+            } else if line_i == "xorl %eax, %eax" {
+                // xorl %eax, %eax → xorl %REGd, %REGd
+                Some(format!("    xorl {}, {}", dest_32, dest_32))
+            } else if line_i.starts_with("movq $") && line_i.ends_with(", %rax") {
+                // movq $imm, %rax → movq $imm, %REG
+                let imm = &line_i[5..line_i.len() - 6];
+                Some(format!("    movq {}, {}", imm, dest_64))
+            } else if line_i.starts_with("movl $") && line_i.ends_with(", %eax") {
+                // movl $imm, %eax → movl $imm, %REGd
+                let imm = &line_i[5..line_i.len() - 6];
+                Some(format!("    movl {}, {}", imm, dest_32))
+            } else {
+                None
+            };
+
+            if let Some(new_text) = new_inst {
+                replace_line(store, &mut infos[i], i, new_text);
+                mark_nop(&mut infos[j]);
+                changed = true;
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    changed
+}
+
 /// Check if %rax is dead starting from instruction index `start`.
 /// Returns true if rax is overwritten before being read within a 16-instruction window.
 fn is_rax_dead_after(store: &LineStore, infos: &[LineInfo], start: usize, len: usize) -> bool {
