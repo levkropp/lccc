@@ -2529,7 +2529,12 @@ fn insert_reduction_remainder_loop(
                 }
             }
         }
-        base.unwrap_or(pattern.array_a_gep)
+        let result = base.unwrap_or(pattern.array_a_gep);
+        if std::env::var("LCCC_DEBUG_VECTORIZE").is_ok() {
+            eprintln!("[VEC-RED] array_a_base = Value({}), array_a_gep = Value({})",
+                result.0, pattern.array_a_gep.0);
+        }
+        result
     };
 
     let array_b_base = pattern.array_b_gep.and_then(|gep| {

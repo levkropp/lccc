@@ -415,7 +415,10 @@ fn classify_value(
         Some(IrType::I32) | Some(IrType::U32) |
         Some(IrType::F32)
     );
-    let slot_size: i64 = if is_i128 || is_f128 {
+    let is_vector = state.vector_values.contains(&dest.0);
+    let slot_size: i64 = if is_vector {
+        32 // AVX2 256-bit vectors need 32 bytes
+    } else if is_i128 || is_f128 {
         16
     } else {
         8
@@ -672,6 +675,7 @@ pub(super) fn assign_tier3_block_local_slots(
         let mut active: Vec<(usize, i64, i64)> = Vec::new(); // (last_use, offset, size)
         let mut free_8: Vec<i64> = Vec::new();
         let mut free_16: Vec<i64> = Vec::new();
+        let mut free_32: Vec<i64> = Vec::new();
         let mut block_peak: i64 = block_space.get(blk_idx).copied().unwrap_or(0);
 
         for &(dest_id, slot_size) in values {
@@ -682,7 +686,7 @@ pub(super) fn assign_tier3_block_local_slots(
             while i < active.len() {
                 if active[i].0 < my_def {
                     let (_, off, sz) = active.swap_remove(i);
-                    if sz == 16 { free_16.push(off); } else { free_8.push(off); }
+                    if sz >= 32 { free_32.push(off); } else if sz == 16 { free_16.push(off); } else { free_8.push(off); }
                 } else {
                     i += 1;
                 }
@@ -691,7 +695,7 @@ pub(super) fn assign_tier3_block_local_slots(
             // Try to reuse a freed slot of matching size.
             // Protected values (DynAlloca results, vector temps) must get unique slots.
             let can_reuse = !state.protected_slot_values.contains(&dest_id);
-            let free_list = if slot_size == 16 { &mut free_16 } else { &mut free_8 };
+            let free_list = if slot_size >= 32 { &mut free_32 } else if slot_size == 16 { &mut free_16 } else { &mut free_8 };
             let offset = if can_reuse && free_list.len() > 0 {
                 let reused = free_list.pop().unwrap();
                 if debug_protect {
@@ -765,9 +769,12 @@ pub(super) fn assign_tier2_liveness_packed_slots(
     let mut values_16: Vec<(u32, u32, u32)> = Vec::new();
     let mut no_interval: Vec<(u32, i64)> = Vec::new();
 
+    let mut values_32: Vec<(u32, u32, u32)> = Vec::new();
     for mbv in multi_block_values {
         if let Some(&(start, end)) = interval_map.get(&mbv.dest_id) {
-            if mbv.slot_size == 16 {
+            if mbv.slot_size >= 32 {
+                values_32.push((mbv.dest_id, start, end));
+            } else if mbv.slot_size == 16 {
                 values_16.push((mbv.dest_id, start, end));
             } else {
                 values_8.push((mbv.dest_id, start, end));
@@ -779,6 +786,7 @@ pub(super) fn assign_tier2_liveness_packed_slots(
 
     pack_values_into_slots(&mut values_8, state, non_local_space, 8, assign_slot);
     pack_values_into_slots(&mut values_16, state, non_local_space, 16, assign_slot);
+    pack_values_into_slots(&mut values_32, state, non_local_space, 32, assign_slot);
 
     // Assign permanent slots for values without interval info.
     for (dest_id, size) in no_interval {
