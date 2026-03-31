@@ -259,8 +259,31 @@ impl X86Codegen {
                     float_count += 1;
                 }
                 CallArgClass::IntReg { reg_idx } => {
-                    self.operand_to_rax(arg);
-                    self.state.out.emit_instr_reg_reg("    movq", "rax", X86_ARG_REGS[reg_idx]);
+                    let target_reg = X86_ARG_REGS[reg_idx];
+                    // Register-direct for constants: skip rax for zero and small imm
+                    let did_direct = if let Operand::Const(c) = arg {
+                        if let Some(imm) = c.to_i64() {
+                            if imm == 0 {
+                                let target_32 = match target_reg {
+                                    "rdi" => "edi", "rsi" => "esi", "rdx" => "edx",
+                                    "rcx" => "ecx", "r8" => "r8d", "r9" => "r9d",
+                                    _ => target_reg,
+                                };
+                                self.state.emit_fmt(format_args!("    xorl %{}, %{}", target_32, target_32));
+                            } else {
+                                self.state.out.emit_instr_imm_reg("    movq", imm, target_reg);
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if !did_direct {
+                        self.operand_to_rax(arg);
+                        self.state.out.emit_instr_reg_reg("    movq", "rax", target_reg);
+                    }
                 }
                 _ => {}
             }
