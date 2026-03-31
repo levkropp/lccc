@@ -429,6 +429,9 @@ impl X86Codegen {
                                     self.state.out.emit_instr_reg_reg(
                                         "    movq", X86_ARG_REGS[reg_idx], dest_reg);
                                     self.state.param_pre_stored.insert(i);
+                                    // Track the source arg register for this callee-saved reg
+                                    // so register-direct call arg loading can avoid round-trips
+                                    self.param_source_regs.insert(phys_reg.0, X86_ARG_REGS[reg_idx]);
                                 } // TODO: handle StackSlot/SSE params
                             }
                         }
