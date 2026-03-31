@@ -132,22 +132,17 @@ $ Prepared statements with parameter binding ✅
 $ typeof(), coalesce(), CASE/WHEN          ✅
 ```
 
-**31 correctness bugs fixed** to reach this point, across peephole optimizer, register
-allocator, stack layout, call codegen, phi elimination, and liveness analysis. Key fixes:
-- Phi coalescing safety for multi-block loop bodies (cross-block src definition)
-- Phase 9 SIB indexed store/load disabled (stale register after emitted GEP)
-- SIB indexed store register conflict detection
-- Alloca address materialization in Copy instructions
-- RSP/RBP addressing mode leak between functions
-- FPO stack parameter base offset (off-by-8)
-- Post-decrement `while(n--)` volatile alloca preservation
-- Callee-save slot boundary collision (+8 padding)
-- Stack arg RSP tracking for functions with >6 arguments
-- Variadic functions forced to use frame pointer
+**36+ correctness bugs fixed** across peephole optimizer, register allocator, GVN,
+vectorizer, stack layout, call codegen, phi elimination, and liveness analysis.
 
-Build flags for SQLite: *(none required — all optimization passes active)*
-
-All optimization passes work correctly on SQLite: 25 peephole sub-passes, GVN, LICM, IVSR, vectorization, and all IR passes.
+All optimization passes active. 18/18 compatibility tests pass. Key improvements:
+- All 25 peephole sub-passes working (10 bugs fixed: signext_move, dead_regs, base_index, etc.)
+- GVN re-enabled with same-block CSE restriction (2 bugs fixed)
+- Vectorizer: 32-byte slots for AVX2 vectors, exit-block accumulator fix
+- Register-direct store/load/call-arg paths bypass accumulator (-78KB .text)
+- Live range splitting with mem2reg SSA reconstruction (enabled by default)
+- Phi coalescing safety for multi-block loop bodies
+- Scratch register refactoring (r10→call *%rax, r8→rdi in atomics)
 
 ### Known Correctness Issues
 

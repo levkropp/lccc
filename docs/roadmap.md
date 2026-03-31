@@ -35,9 +35,11 @@ LCCC improves CCC in sixteen phases. Phases 1–14f are complete.
 | 13 | Peephole: sign-ext, phi-copy coalesce, loop rotation | ✅ Complete | **Sieve 6 instructions, 1.1× GCC** |
 | 14 | Correctness hardening (31 bugs) | ✅ Complete | **Full SQLite works** |
 | 14f | Phase 9 SIB disable + phi coalesce multi-block | ✅ Complete | **CREATE TABLE, JOIN, subqueries** |
-| 15 | Peephole re-enablement (22/25 passes) | ✅ Complete | **3 bugs found, peephole mostly active** |
-| — | Fix remaining 3 peephole passes for SQLite | 🔲 Planned | signext_move, dead_regs, base_index |
-| — | Re-enable GVN pass for SQLite | 🔲 Planned | GEP CSE register overlap |
+| 15 | Peephole: all 25 passes working | ✅ Complete | **signext_move ×3, dead_regs, base_index** |
+| 16 | GVN re-enabled (same-block CSE) | ✅ Complete | **Cross-block Copy stale register fix** |
+| 17 | Register-direct codegen | ✅ Complete | **-78KB: store/load/call-arg bypass accumulator** |
+| 18 | Vectorizer fixes | ✅ Complete | **32-byte AVX2 slots, 18/18 compat tests** |
+| 19 | Live range splitting | ✅ Complete | **IR-level with mem2reg SSA reconstruction** |
 | — | Better function inlining | 🔲 Planned | ~1.5× on call-heavy code |
 | — | Profile-guided optimization (PGO) | 🔲 Planned | ~1.2–1.5× general |
 
