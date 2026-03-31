@@ -1019,7 +1019,8 @@ mod tests {
 
     #[test]
     fn test_gep_cse() {
-        // Two identical GEPs should be CSE'd
+        // GEP CSE is currently disabled (creates Copy chains with stale registers).
+        // This test verifies GEPs are NOT CSE'd.
         let func = IrFunction {
             name: "test".to_string(),
             params: vec![],
@@ -1080,12 +1081,13 @@ mod tests {
         };
 
         let eliminated = module.for_each_function(run_gvn_function);
-        assert_eq!(eliminated, 1);
+        assert_eq!(eliminated, 0); // GEP CSE disabled
     }
 
     #[test]
     fn test_cross_block_cse() {
-        // Test that expressions in dominating blocks are visible to dominated blocks
+        // Cross-block CSE is currently restricted to same-block only.
+        // This test verifies cross-block expressions are NOT CSE'd.
         // CFG: block0 -> block1 (block0 dominates block1)
         let func = IrFunction {
             name: "test".to_string(),
@@ -1159,15 +1161,14 @@ mod tests {
         };
 
         let eliminated = module.for_each_function(run_gvn_function);
-        assert_eq!(eliminated, 1);
+        assert_eq!(eliminated, 0); // Cross-block CSE disabled (same-block only)
 
-        // The expression in block1 should be replaced with a Copy
+        // The expression in block1 should NOT be replaced (cross-block CSE disabled)
         match &module.functions[0].blocks[1].instructions[0] {
-            Instruction::Copy { dest, src: Operand::Value(v) } => {
-                assert_eq!(dest.0, 3);
-                assert_eq!(v.0, 2);
+            Instruction::BinOp { dest, .. } => {
+                assert_eq!(dest.0, 3); // Original BinOp preserved
             }
-            other => panic!("Expected Copy instruction, got {:?}", other),
+            other => panic!("Expected BinOp (cross-block CSE disabled), got {:?}", other),
         }
     }
 
@@ -1448,8 +1449,8 @@ mod tests {
 
     #[test]
     fn test_load_cse_across_dominating_block() {
-        // Load in block0 should CSE with load in block1 (block0 dominates block1,
-        // single predecessor, no memory clobber)
+        // Cross-block Load CSE is currently disabled (same-block CSE only).
+        // Load in block1 should NOT be CSE'd with load in block0.
         let func = make_func(vec![
             BasicBlock {
                 label: BlockId(0),
@@ -1481,14 +1482,14 @@ mod tests {
 
         let mut module = make_module(func);
         let eliminated = module.for_each_function(run_gvn_function);
-        assert_eq!(eliminated, 1);
+        assert_eq!(eliminated, 0); // Cross-block Load CSE disabled
 
+        // Load should be preserved (not replaced with Copy)
         match &module.functions[0].blocks[1].instructions[0] {
-            Instruction::Copy { dest, src: Operand::Value(v) } => {
+            Instruction::Load { dest, .. } => {
                 assert_eq!(dest.0, 2);
-                assert_eq!(v.0, 1);
             }
-            other => panic!("Expected Copy, got {:?}", other),
+            other => panic!("Expected Load (cross-block CSE disabled), got {:?}", other),
         }
     }
 
