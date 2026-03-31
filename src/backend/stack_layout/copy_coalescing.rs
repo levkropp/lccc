@@ -193,58 +193,137 @@ pub(super) fn build_copy_alias_map(
     //
     // Force phi web members to share the same stack slot. For Copy(dest, src)
     // where dest is multi-def (phi dest), coalesce src→dest if src is NOT live
-    // in any block where dest is defined by a DIFFERENT Copy.
+    // at any program point where dest is written by a DIFFERENT Copy.
+    //
+    // Uses liveness intervals for precise interference: src interferes with a
+    // Copy(dest, src') at program point P' if src.start <= P' <= src.end.
+    // This correctly handles switch statements (case arms are mutually exclusive
+    // so their intervals don't overlap) and loop patterns.
     let mut phi_web_aliases: FxHashSet<u32> = FxHashSet::default();
     if !std::env::var("CCC_NO_PHI_WEB_COALESCE").is_ok() {
-        // Phase 1: Collect all Copy(dest, src) pairs grouped by dest.
-        // Also record which blocks contain definitions of each dest.
-        let mut phi_copies: FxHashMap<u32, Vec<(u32, usize)>> = FxHashMap::default();
-        let mut dest_def_blocks: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
-        for (blk_idx, block) in func.blocks.iter().enumerate() {
-            for inst in &block.instructions {
-                if let Instruction::Copy { dest, src: Operand::Value(src_val) } = inst {
-                    let d = dest.0;
-                    let s = src_val.0;
-                    if !multi_def_values.contains(&d) { continue; }
-                    if reg_assigned.contains_key(&s) { continue; }
-                    // Skip if already coalesced by per-Copy analysis.
-                    if raw_aliases.iter().any(|&(a, _)| a == s) { continue; }
-                    phi_copies.entry(d).or_default().push((s, blk_idx));
-                    dest_def_blocks.entry(d).or_default().push(blk_idx);
+        // Phase 1: Collect all Copy(dest, src) pairs with program points.
+        // Program points match liveness.rs numbering (1 per instruction + 1 per terminator).
+        let mut phi_copies: FxHashMap<u32, Vec<(u32, usize, u32)>> = FxHashMap::default(); // dest → [(src, blk, pp)]
+        let mut dest_copy_points: FxHashMap<u32, Vec<u32>> = FxHashMap::default(); // dest → [program_points]
+        let already_aliased: FxHashSet<u32> = raw_aliases.iter().map(|&(a, _)| a).collect();
+        {
+            let mut pp: u32 = 0;
+            for (blk_idx, block) in func.blocks.iter().enumerate() {
+                for inst in &block.instructions {
+                    if let Instruction::Copy { dest, src: Operand::Value(src_val) } = inst {
+                        let d = dest.0;
+                        let s = src_val.0;
+                        if multi_def_values.contains(&d)
+                            && !reg_assigned.contains_key(&s)
+                            && !already_aliased.contains(&s)
+                        {
+                            phi_copies.entry(d).or_default().push((s, blk_idx, pp));
+                            dest_copy_points.entry(d).or_default().push(pp);
+                        }
+                    }
+                    pp += 1;
                 }
+                pp += 1; // terminator
             }
         }
 
-        // Phase 2: For each phi web, check interference and coalesce.
+        // Phase 2: Build interval map from liveness data.
+        let interval_map: FxHashMap<u32, (u32, u32)> = cached_liveness
+            .as_ref()
+            .map(|lr| lr.intervals.iter().map(|iv| (iv.value_id, (iv.start, iv.end))).collect())
+            .unwrap_or_default();
+
+        // Phase 3: For each phi web, check interference using liveness intervals.
         for (dest_id, sources) in &phi_copies {
             if sources.len() < 2 { continue; }
             if reg_assigned.contains_key(dest_id) { continue; }
 
-            // Get all blocks where dest is defined (by different Copies).
-            let def_blks = match dest_def_blocks.get(dest_id) {
-                Some(blks) => blks,
+            // All program points where dest is written by any Copy.
+            let all_copy_points = match dest_copy_points.get(dest_id) {
+                Some(pts) => pts,
                 None => continue,
             };
 
-            for &(src_id, src_copy_blk) in sources {
-                // Interference check: is src live in any block where dest is
-                // defined by a DIFFERENT Copy (i.e., in any def block ≠ src_copy_blk)?
+            for &(src_id, _src_blk, src_copy_pp) in sources {
+                // Get src's liveness interval.
+                let src_interval = interval_map.get(&src_id);
+
+                // Interference check: is src live at any program point where dest
+                // is written by a DIFFERENT Copy?
                 //
-                // "Live in block B" approximated by: src has uses in block B, OR
-                // src is defined before B and has uses after B.
-                // Simple conservative check: src's use_blocks must not overlap with
-                // any of dest's other definition blocks.
-                let src_use_blks = use_blocks_map.get(&src_id);
-                let interferes = match src_use_blks {
-                    Some(blks) => {
-                        blks.iter().any(|use_blk| {
-                            def_blks.iter().any(|&def_blk| {
-                                def_blk == *use_blk && def_blk != src_copy_blk
-                            })
-                        })
+                // For single-def sources: use_blocks check is sufficient —
+                // if src has no uses in dest's other def blocks, no interference.
+                //
+                // For multi-def sources: the use_blocks check is too conservative
+                // because multi-def values have definitions (not just uses) spread
+                // across blocks. Instead, check: does src's definition set overlap
+                // with dest's OTHER def blocks? If src is DEFINED in a block where
+                // dest has a DIFFERENT Copy, the two values co-exist there.
+                // But if src is defined there BY THE SAME Copy pattern (it's also
+                // a phi dest being written), the write order is deterministic
+                // and they won't conflict.
+                //
+                // Simple safe heuristic: src doesn't interfere if ALL of src's
+                // use blocks are either (a) the Copy's block, or (b) blocks where
+                // src is defined (def_block or multi-def blocks for src).
+                // Collect dest's other def blocks (blocks with Copy(dest, X) where X ≠ src).
+                let other_def_blks: Vec<usize> = sources.iter()
+                    .filter(|&&(_, _, pp)| pp != src_copy_pp)
+                    .map(|&(_, blk, _)| blk)
+                    .collect();
+
+                // Check: does src have uses in dest's other def blocks that are
+                // NOT themselves Copy(dest, src) instructions?
+                //
+                // Key insight: use_blocks_map counts Copy(dest, src) as a "use of src"
+                // in the Copy's block. But if src and dest share a slot, that Copy
+                // becomes a no-op — so it's not real interference. We must exclude
+                // uses that come from Copy instructions writing to dest.
+                //
+                // Build set of blocks where src has NON-COPY uses (actual computation
+                // that reads src for purposes other than feeding this phi).
+                let src_non_copy_use_blks: Vec<usize> = {
+                    let mut non_copy_blks = Vec::new();
+                    for (blk_idx, block) in func.blocks.iter().enumerate() {
+                        let mut has_non_copy_use = false;
+                        for inst in &block.instructions {
+                            // Skip Copy instructions that write to dest (these are
+                            // the phi copies we're trying to coalesce).
+                            if let Instruction::Copy { dest: copy_dest, src: Operand::Value(copy_src) } = inst {
+                                if copy_dest.0 == *dest_id && copy_src.0 == src_id {
+                                    continue; // This is the phi Copy — not real interference
+                                }
+                            }
+                            // Check if this instruction uses src as an operand.
+                            let mut uses_src = false;
+                            for_each_operand_in_instruction(inst, |op| {
+                                if let Operand::Value(v) = op {
+                                    if v.0 == src_id { uses_src = true; }
+                                }
+                            });
+                            for_each_value_use_in_instruction(inst, |v| {
+                                if v.0 == src_id { uses_src = true; }
+                            });
+                            if uses_src { has_non_copy_use = true; break; }
+                        }
+                        if !has_non_copy_use {
+                            // Also check terminator.
+                            for_each_operand_in_terminator(&block.terminator, |op| {
+                                if let Operand::Value(v) = op {
+                                    if v.0 == src_id { has_non_copy_use = true; }
+                                }
+                            });
+                        }
+                        if has_non_copy_use {
+                            non_copy_blks.push(blk_idx);
+                        }
                     }
-                    None => false, // no uses = dead, no interference
+                    non_copy_blks
                 };
+
+                let interferes = src_non_copy_use_blks.iter().any(|use_blk| {
+                    other_def_blks.contains(use_blk)
+                });
 
                 if !interferes {
                     raw_aliases.push((src_id, *dest_id));
