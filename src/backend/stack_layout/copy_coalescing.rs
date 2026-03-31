@@ -32,6 +32,7 @@ pub(super) fn build_copy_alias_map(
     multi_def_values: &FxHashSet<u32>,
     reg_assigned: &FxHashMap<u32, PhysReg>,
     use_blocks_map: &FxHashMap<u32, Vec<usize>>,
+    cached_liveness: &Option<crate::backend::liveness::LivenessResult>,
 ) -> FxHashMap<u32, u32> {
     // Count uses of each value across all instructions.
     let mut use_count: FxHashMap<u32, u32> = FxHashMap::default();
@@ -53,10 +54,45 @@ pub(super) fn build_copy_alias_map(
         });
     }
 
+    // Build last-use instruction point map (NOT using LiveInterval.end which
+    // includes live-through extensions from backward dataflow). We compute actual
+    // last-instruction-use points by scanning all instructions directly.
+    // This correctly identifies values whose last explicit use IS the Copy instruction.
+    let mut last_use_instr: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut copy_program_points: FxHashMap<(usize, usize), u32> = FxHashMap::default();
+    if cached_liveness.is_some() {
+        let mut pp: u32 = 0;
+        for (blk_idx, block) in func.blocks.iter().enumerate() {
+            for (inst_idx, inst) in block.instructions.iter().enumerate() {
+                // Record program point for Copy instructions.
+                if matches!(inst, Instruction::Copy { .. }) {
+                    copy_program_points.insert((blk_idx, inst_idx), pp);
+                }
+                // Track last-use for all operands (reads of values).
+                for_each_operand_in_instruction(inst, |op| {
+                    if let Operand::Value(v) = op {
+                        last_use_instr.insert(v.0, pp);
+                    }
+                });
+                for_each_value_use_in_instruction(inst, |v| {
+                    last_use_instr.insert(v.0, pp);
+                });
+                pp += 1;
+            }
+            // Terminators also use operands.
+            for_each_operand_in_terminator(&block.terminator, |op| {
+                if let Operand::Value(v) = op {
+                    last_use_instr.insert(v.0, pp);
+                }
+            });
+            pp += 1;
+        }
+    }
+
     // Collect Copy instructions eligible for aliasing.
     let mut raw_aliases: Vec<(u32, u32)> = Vec::new();
     for (blk_idx, block) in func.blocks.iter().enumerate() {
-        for inst in &block.instructions {
+        for (inst_idx, inst) in block.instructions.iter().enumerate() {
             if let Instruction::Copy { dest, src: Operand::Value(src_val) } = inst {
                 let d = dest.0;
                 let s = src_val.0;
@@ -69,9 +105,46 @@ pub(super) fn build_copy_alias_map(
                 if reg_assigned.contains_key(&d) || reg_assigned.contains_key(&s) {
                     continue;
                 }
-                // Only coalesce if Copy is the sole use of the source.
-                if use_count.get(&s).copied().unwrap_or(0) != 1 {
-                    continue;
+                // Coalesce if Copy is the sole use of the source, OR if the
+                // source's live interval ends at/before this Copy (src is dead after).
+                let sole_use = use_count.get(&s).copied().unwrap_or(0) == 1;
+                if !sole_use {
+                    // Block-local dead-after-copy check: is src unused after this
+                    // Copy within this block, AND not used in any other block?
+                    // (The global last_use_instr doesn't work because phi sources
+                    // may have Copies in multiple predecessor blocks.)
+                    let src_use_blocks = use_blocks_map.get(&s);
+                    let src_only_in_this_block = src_use_blocks
+                        .map(|blks| blks.iter().all(|&b| b == blk_idx))
+                        .unwrap_or(true);
+                    if !src_only_in_this_block {
+                        continue;
+                    }
+                    // Check: is src used AFTER this Copy instruction in this block?
+                    let mut used_after = false;
+                    for later_inst in &block.instructions[inst_idx + 1..] {
+                        let mut found = false;
+                        for_each_operand_in_instruction(later_inst, |op| {
+                            if let Operand::Value(v) = op {
+                                if v.0 == s { found = true; }
+                            }
+                        });
+                        for_each_value_use_in_instruction(later_inst, |v| {
+                            if v.0 == s { found = true; }
+                        });
+                        if found { used_after = true; break; }
+                    }
+                    // Also check the terminator.
+                    if !used_after {
+                        for_each_operand_in_terminator(&block.terminator, |op| {
+                            if let Operand::Value(v) = op {
+                                if v.0 == s { used_after = true; }
+                            }
+                        });
+                    }
+                    if used_after {
+                        continue;
+                    }
                 }
 
                 let src_def_blk = def_block.get(&s).copied();

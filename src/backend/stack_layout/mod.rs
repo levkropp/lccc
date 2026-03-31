@@ -244,7 +244,7 @@ pub fn calculate_stack_space_common(
 
     // Phase 1: Build analysis context (use-blocks, def-blocks, used values,
     //          dead param allocas, alloca coalescability, copy aliases).
-    let ctx = build_layout_context(func, coalesce, reg_assigned, callee_saved_regs, lhs_first_binop);
+    let ctx = build_layout_context(func, coalesce, reg_assigned, callee_saved_regs, lhs_first_binop, &cached_liveness);
 
     // Tell CodegenState which values are register-assigned so that
     // resolve_slot_addr can return a dummy Indirect slot for them.
@@ -302,6 +302,7 @@ fn build_layout_context(
     reg_assigned: &FxHashMap<u32, PhysReg>,
     callee_saved_regs: &[PhysReg],
     lhs_first_binop: bool,
+    cached_liveness: &Option<super::liveness::LivenessResult>,
 ) -> StackLayoutContext {
     // Build use-block map
     let mut use_blocks_map = if coalesce {
@@ -344,6 +345,7 @@ fn build_layout_context(
     // Copy coalescing analysis.
     let copy_alias = copy_coalescing::build_copy_alias_map(
         func, &def_block, &multi_def_values, reg_assigned, &use_blocks_map,
+        cached_liveness,
     );
 
     // Immediately-consumed value analysis: identify values that can skip stack slots.
