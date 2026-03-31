@@ -16,6 +16,7 @@
 //! rcx=1, rdx=2) to avoid breaking live register values.
 
 use super::super::types::*;
+use super::helpers::is_read_modify_write;
 
 /// Format a stack slot as an assembly memory operand string.
 /// Uses (%rbp) or (%rsp) depending on the original instruction text.
@@ -133,6 +134,338 @@ pub(super) fn fold_fp_memory_operands(store: &mut LineStore, infos: &mut [LineIn
     changed
 }
 
+/// Fold stack-load-to-scratch relay moves: eliminate the scratch register
+/// as intermediary when loading from a stack slot to another register.
+///
+/// Pattern:
+///   movq  -N(%rbp), %rax       ; LoadRbp { reg: 0(rax), offset: -N, size: Q }
+///   movq  %rax, %r12           ; Other: copy rax to callee-saved/arg register
+///
+/// Transformed to:
+///   movq  -N(%rbp), %r12       ; direct load to destination register
+///
+/// Safety: The scratch register (rax) must not be read between the load and
+/// the copy. We only fold loads to rax (reg 0) since codegen guarantees rax
+/// is a temporary. The destination register must be a different GP register.
+/// We verify rax is dead after (not read before being overwritten) to ensure
+/// we don't break code that uses rax after the copy.
+pub(super) fn fold_load_relay(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+
+    while i + 1 < len {
+        if infos[i].is_nop() { i += 1; continue; }
+
+        // Step 1: Find a load from stack to %rax (scratch register).
+        if let LineKind::LoadRbp { reg: 0, offset, size } = infos[i].kind {
+            // Only fold Q and L loads (not sign-extending SLQ, which changes value).
+            if size != MoveSize::Q && size != MoveSize::L {
+                i += 1; continue;
+            }
+
+            // Step 2: Find next non-NOP instruction.
+            let mut j = i + 1;
+            while j < len && infos[j].is_nop() { j += 1; }
+            if j >= len { i += 1; continue; }
+
+            // Step 3: Check if it's "movq %rax, %DEST" or "movl %eax, %DESTd"
+            // where DEST is a different GP register.
+            let dest_reg = match infos[j].kind {
+                LineKind::Other { dest_reg } if dest_reg != REG_NONE && dest_reg != 0 && dest_reg <= REG_GP_MAX => {
+                    let line_j = infos[j].trimmed(store.get(j));
+                    // Must be a simple register-to-register mov
+                    let is_movq_rax = line_j.starts_with("movq %rax, %") && !line_j.contains('(');
+                    let is_movl_eax = line_j.starts_with("movl %eax, %") && !line_j.contains('(');
+                    if is_movq_rax || is_movl_eax {
+                        dest_reg
+                    } else {
+                        i += 1; continue;
+                    }
+                }
+                _ => { i += 1; continue; }
+            };
+
+            // Step 4: Verify no intervening store to the same offset.
+            let mut intervening_store = false;
+            for k in (i + 1)..j {
+                if let LineKind::StoreRbp { offset: so, .. } = infos[k].kind {
+                    if so == offset { intervening_store = true; break; }
+                }
+            }
+            if intervening_store { i += 1; continue; }
+
+            // Step 5: Check rax liveness after the copy.
+            if !is_rax_dead_after(store, infos, j + 1, len) { i += 1; continue; }
+
+            // Step 6: Transform! Replace load target and eliminate the copy.
+            let load_line = infos[i].trimmed(store.get(i));
+            let mem_op = format_stack_offset(offset, load_line);
+            let dest_name = REG_NAMES[if size == MoveSize::L { 1 } else { 0 }][dest_reg as usize];
+            let mnemonic = size.mnemonic();
+            let new_load = format!("    {} {}, {}", mnemonic, mem_op, dest_name);
+
+            replace_line(store, &mut infos[i], i, new_load);
+            mark_nop(&mut infos[j]);
+            changed = true;
+            i = j + 1;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    changed
+}
+
+/// Fold load+leaq+store relay: eliminate accumulator relay for address computation.
+///
+/// Pattern:
+///   movq  -N(%rbp), %rax       ; load base pointer from stack
+///   leaq  K(%rax), %rax        ; compute base + offset
+///   movq  %rax, %r12           ; store result to dest register
+///
+/// Transformed to:
+///   movq  -N(%rbp), %r12       ; load directly to dest
+///   leaq  K(%r12), %r12        ; compute offset in-place
+///
+/// Saves 1 instruction per occurrence. Safe when %rax is dead after the copy.
+pub(super) fn fold_leaq_relay(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+
+    while i + 2 < len {
+        if infos[i].is_nop() { i += 1; continue; }
+
+        // Step 1: Load from stack to %rax.
+        if let LineKind::LoadRbp { reg: 0, offset, size: MoveSize::Q } = infos[i].kind {
+            // Step 2: Next must be leaq K(%rax), %rax
+            let mut j = i + 1;
+            while j < len && infos[j].is_nop() { j += 1; }
+            if j >= len { i += 1; continue; }
+
+            let leaq_offset = {
+                let lj = infos[j].trimmed(store.get(j));
+                if !lj.starts_with("leaq ") || !lj.ends_with(", %rax") { i += 1; continue; }
+                let inner = &lj[5..lj.len() - 6]; // between "leaq " and ", %rax"
+                if !inner.ends_with("(%rax)") { i += 1; continue; }
+                let num_str = &inner[..inner.len() - 6]; // before "(%rax)"
+                match num_str.parse::<i64>() {
+                    Ok(v) => v,
+                    Err(_) => { i += 1; continue; }
+                }
+            };
+
+            // Step 3: Next must be movq %rax, %DEST
+            let mut k = j + 1;
+            while k < len && infos[k].is_nop() { k += 1; }
+            if k >= len { i += 1; continue; }
+
+            let dest_reg = match infos[k].kind {
+                LineKind::Other { dest_reg } if dest_reg != REG_NONE && dest_reg != 0 && dest_reg <= REG_GP_MAX => {
+                    let lk = infos[k].trimmed(store.get(k));
+                    if lk.starts_with("movq %rax, %") && !lk.contains('(') {
+                        dest_reg
+                    } else { i += 1; continue; }
+                }
+                _ => { i += 1; continue; }
+            };
+
+            // Step 4: Check rax is dead after k.
+            let rax_dead = is_rax_dead_after(store, infos, k + 1, len);
+            if !rax_dead { i += 1; continue; }
+
+            // Step 5: Transform.
+            let load_line = infos[i].trimmed(store.get(i));
+            let mem_op = format_stack_offset(offset, load_line);
+            let dest_64 = REG_NAMES[0][dest_reg as usize];
+            let new_load = format!("    movq {}, {}", mem_op, dest_64);
+            let new_leaq = format!("    leaq {}({}), {}", leaq_offset, dest_64, dest_64);
+
+            replace_line(store, &mut infos[i], i, new_load);
+            replace_line(store, &mut infos[j], j, new_leaq);
+            mark_nop(&mut infos[k]);
+            changed = true;
+            i = k + 1;
+            continue;
+        }
+        i += 1;
+    }
+    changed
+}
+
+/// Fold load+cltq+store relay: eliminate accumulator relay for sign-extend load.
+///
+/// Pattern:
+///   movq  -N(%rbp), %rax       ; load 64-bit value (only lower 32 used)
+///   cltq                       ; sign-extend %eax → %rax
+///   movq  %rax, %r12           ; store sign-extended result
+///
+/// Transformed to:
+///   movslq -N(%rbp), %r12      ; sign-extending load directly to dest
+///
+/// Saves 2 instructions per occurrence.
+pub(super) fn fold_cltq_relay(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+
+    while i + 2 < len {
+        if infos[i].is_nop() { i += 1; continue; }
+
+        // Step 1: Load from stack to %rax (either movq or movl).
+        if let LineKind::LoadRbp { reg: 0, offset, size } = infos[i].kind {
+            if size != MoveSize::Q && size != MoveSize::L { i += 1; continue; }
+
+            // Step 2: Next must be cltq.
+            let mut j = i + 1;
+            while j < len && infos[j].is_nop() { j += 1; }
+            if j >= len { i += 1; continue; }
+            {
+                let lj = infos[j].trimmed(store.get(j));
+                if lj != "cltq" { i += 1; continue; }
+            }
+
+            // Step 3: Next must be movq %rax, %DEST.
+            let mut k = j + 1;
+            while k < len && infos[k].is_nop() { k += 1; }
+            if k >= len { i += 1; continue; }
+
+            let dest_reg = match infos[k].kind {
+                LineKind::Other { dest_reg } if dest_reg != REG_NONE && dest_reg != 0 && dest_reg <= REG_GP_MAX => {
+                    let lk = infos[k].trimmed(store.get(k));
+                    if lk.starts_with("movq %rax, %") && !lk.contains('(') {
+                        dest_reg
+                    } else { i += 1; continue; }
+                }
+                _ => { i += 1; continue; }
+            };
+
+            // Step 4: Check rax is dead after k.
+            let rax_dead = is_rax_dead_after(store, infos, k + 1, len);
+            if !rax_dead { i += 1; continue; }
+
+            // Step 5: Transform! Replace all 3 instructions with one movslq.
+            let load_line = infos[i].trimmed(store.get(i));
+            let mem_op = format_stack_offset(offset, load_line);
+            let dest_64 = REG_NAMES[0][dest_reg as usize];
+            let new_inst = format!("    movslq {}, {}", mem_op, dest_64);
+
+            replace_line(store, &mut infos[i], i, new_inst);
+            mark_nop(&mut infos[j]);
+            mark_nop(&mut infos[k]);
+            changed = true;
+            i = k + 1;
+            continue;
+        }
+        i += 1;
+    }
+    changed
+}
+
+/// Fold movzbq/movzwq/movsbq/movswq relay: eliminate rax as intermediary
+/// for zero/sign-extend-then-copy patterns.
+///
+/// Pattern:
+///   movzbq  %al, %rax          ; zero-extend byte result to 64-bit
+///   movq    %rax, %r12         ; copy to dest register
+///
+/// Transformed to:
+///   movzbl  %al, %r12d         ; zero-extend directly to dest (32-bit write, implicit 64-bit zext)
+///
+/// Also handles movzwq→movq, movsbq→movq, movswq→movq, and movslq→movq.
+/// Saves 1 instruction per occurrence.
+pub(super) fn fold_extend_relay(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+
+    while i + 1 < len {
+        if infos[i].is_nop() { i += 1; continue; }
+
+        // Step 1: Look for extension instructions writing to %rax from %al/%ax/%eax.
+        if let LineKind::Other { dest_reg: 0 } = infos[i].kind {
+            let line_i = infos[i].trimmed(store.get(i));
+
+            // Parse the extension type and source sub-register.
+            let (new_op, src_sub_idx) = if line_i == "movzbq %al, %rax" {
+                // movzbq %al, %rax → movzbl %al, %DESTd
+                ("movzbl", 3usize) // 3 = B (byte) index in REG_NAMES
+            } else if line_i == "movzwq %ax, %rax" {
+                ("movzwl", 2) // W (word)
+            } else if line_i == "movsbq %al, %rax" {
+                ("movsbl", 3) // B
+            } else if line_i == "movswq %ax, %rax" {
+                ("movswl", 2) // W
+            } else {
+                i += 1; continue;
+            };
+
+            // Step 2: Next must be movq %rax, %DEST.
+            let mut j = i + 1;
+            while j < len && infos[j].is_nop() { j += 1; }
+            if j >= len { i += 1; continue; }
+
+            let dest_reg = match infos[j].kind {
+                LineKind::Other { dest_reg } if dest_reg != REG_NONE && dest_reg != 0 && dest_reg <= REG_GP_MAX => {
+                    let lj = infos[j].trimmed(store.get(j));
+                    if lj.starts_with("movq %rax, %") && !lj.contains('(') {
+                        dest_reg
+                    } else { i += 1; continue; }
+                }
+                _ => { i += 1; continue; }
+            };
+
+            // Step 3: Check rax is dead after.
+            if !is_rax_dead_after(store, infos, j + 1, len) { i += 1; continue; }
+
+            // Step 4: Transform.
+            // Use the same sub-register for the source (al/ax from rax family=0).
+            let src_name = REG_NAMES[src_sub_idx][0]; // %al or %ax
+            let dest_32 = REG_NAMES[1][dest_reg as usize]; // %r12d etc.
+            let new_inst = format!("    {} {}, {}", new_op, src_name, dest_32);
+
+            replace_line(store, &mut infos[i], i, new_inst);
+            mark_nop(&mut infos[j]);
+            changed = true;
+            i = j + 1;
+            continue;
+        }
+        i += 1;
+    }
+    changed
+}
+
+/// Check if %rax is dead starting from instruction index `start`.
+/// Returns true if rax is overwritten before being read within a 16-instruction window.
+fn is_rax_dead_after(store: &LineStore, infos: &[LineInfo], start: usize, len: usize) -> bool {
+    let scan_limit = (start + 16).min(len);
+    let mut scan = start;
+    while scan < scan_limit {
+        if infos[scan].is_nop() { scan += 1; continue; }
+        // Control flow = rax is dead (caller-saved)
+        if infos[scan].is_barrier() { return true; }
+        if infos[scan].reg_refs & 1 != 0 {
+            match infos[scan].kind {
+                LineKind::LoadRbp { reg: 0, .. } => return true,
+                LineKind::Other { dest_reg: 0 } => {
+                    let t = infos[scan].trimmed(store.get(scan));
+                    if (t.ends_with(", %rax") || t.ends_with(", %eax"))
+                        && !is_read_modify_write(t) {
+                        return true;
+                    }
+                    if t == "xorl %eax, %eax" { return true; }
+                    return false; // rax read
+                }
+                _ => return false, // rax read
+            }
+        }
+        scan += 1;
+    }
+    true // ran out of window = assume dead
+}
+
 /// Fold stack loads into subsequent ALU instructions as memory operands.
 ///
 /// Safety: We only fold when the loaded register (the one being eliminated) is
@@ -179,6 +512,28 @@ pub(super) fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]
                 LineKind::Other { .. } | LineKind::Cmp);
             if is_foldable_target {
                 let trimmed_j = infos[j].trimmed(store.get(j));
+
+                // Special case: testq/testl %REG, %REG where REG is the loaded scratch reg.
+                // Fold to cmpq/cmpl $0, -N(%rbp) — both set ZF/SF/PF identically.
+                let test_self = if load_reg == 0 {
+                    trimmed_j == "testq %rax, %rax" || trimmed_j == "testl %eax, %eax"
+                } else if load_reg == 1 {
+                    trimmed_j == "testq %rcx, %rcx" || trimmed_j == "testl %ecx, %ecx"
+                } else {
+                    trimmed_j == "testq %rdx, %rdx" || trimmed_j == "testl %edx, %edx"
+                };
+                if test_self {
+                    let load_line = infos[i].trimmed(store.get(i));
+                    let mem_op = format_stack_offset(offset, load_line);
+                    let cmp_suffix = if load_size == MoveSize::L { "cmpl" } else { "cmpq" };
+                    let new_inst = format!("    {} $0, {}", cmp_suffix, mem_op);
+                    mark_nop(&mut infos[i]);
+                    replace_line(store, &mut infos[j], j, new_inst);
+                    changed = true;
+                    i = j + 1;
+                    continue;
+                }
+
                 if let Some((op_suffix, dst_str, src_fam, dst_fam)) = parse_alu_reg_reg(trimmed_j) {
                     if src_fam == load_reg && dst_fam != load_reg {
                         // Check for intervening store to the same offset
