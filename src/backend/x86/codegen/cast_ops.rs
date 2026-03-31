@@ -129,7 +129,163 @@ impl X86Codegen {
                 return;
             }
         }
+        // Register-direct integer casts: bypass the accumulator when the destination
+        // has a physical register. Instead of load→cast→store through %rax, emit the
+        // cast instruction directly targeting the destination register.
+        if !from_ty.is_float() && !to_ty.is_float()
+            && !is_i128_type(from_ty) && !is_i128_type(to_ty)
+        {
+            if let Some(dest_phys) = self.dest_reg(dest) {
+                if !super::emit::is_xmm_reg(dest_phys) {
+                    if self.try_emit_cast_reg_direct(dest, src, from_ty, to_ty, dest_phys) {
+                        return;
+                    }
+                }
+            }
+        }
+
         // Fall through to default implementation for all other cases
         crate::backend::traits::emit_cast_default(self, dest, src, from_ty, to_ty);
+    }
+
+    /// Try to emit an integer cast directly to the destination register.
+    /// Returns true if the cast was emitted, false if we should fall through.
+    ///
+    /// Key optimization: when the source is a stack slot, fuse the load and cast
+    /// into a single instruction (e.g., `movslq -N(%rsp), %r12`), saving 2 instructions
+    /// vs the accumulator path (`movq -N(%rsp), %rax; cltq; movq %rax, %r12`).
+    fn try_emit_cast_reg_direct(
+        &mut self,
+        _dest: &Value,
+        src: &Operand,
+        from_ty: IrType,
+        to_ty: IrType,
+        dest_phys: crate::backend::regalloc::PhysReg,
+    ) -> bool {
+        use crate::backend::cast::{classify_cast, CastKind};
+        use super::emit::{phys_reg_name, phys_reg_name_32, typed_phys_reg_name};
+
+        let dest_64 = phys_reg_name(dest_phys);
+        let dest_32 = phys_reg_name_32(dest_phys);
+        let kind = classify_cast(from_ty, to_ty);
+
+        // Resolve source: either a physical register or a stack slot offset.
+        let src_phys = self.operand_reg(src);
+        let src_slot = match src {
+            Operand::Value(v) => self.state.get_slot(v.0).map(|s| s.0),
+            _ => None,
+        };
+
+        // For constants, fall through to default path (it's already efficient).
+        if matches!(src, Operand::Const(_)) {
+            return false;
+        }
+
+        // Need either a source register or a stack slot.
+        if src_phys.is_none() && src_slot.is_none() {
+            return false;
+        }
+
+        match kind {
+            CastKind::Noop | CastKind::UnsignedToSignedSameSize { .. } => {
+                // No conversion needed — just move src to dest register.
+                self.operand_to_callee_reg(src, dest_phys);
+                return true;
+            }
+            CastKind::IntWiden { from_ty: ft, .. } => {
+                // Widen: sign or zero extend from smaller to larger type.
+                if let Some(src_reg) = src_phys {
+                    // Source is in a register — emit reg-to-reg extending move.
+                    let src_typed = typed_phys_reg_name(src_reg, ft);
+                    if ft.is_signed() {
+                        match ft.size() {
+                            1 => self.state.emit_fmt(format_args!("    movsbq %{}, %{}", src_typed, dest_64)),
+                            2 => self.state.emit_fmt(format_args!("    movswq %{}, %{}", src_typed, dest_64)),
+                            4 => self.state.emit_fmt(format_args!("    movslq %{}, %{}", phys_reg_name_32(src_reg), dest_64)),
+                            _ => { self.operand_to_callee_reg(src, dest_phys); }
+                        }
+                    } else {
+                        match ft.size() {
+                            1 => self.state.emit_fmt(format_args!("    movzbl %{}, %{}", src_typed, dest_32)),
+                            2 => self.state.emit_fmt(format_args!("    movzwl %{}, %{}", src_typed, dest_32)),
+                            4 => {
+                                let src_32 = phys_reg_name_32(src_reg);
+                                self.state.emit_fmt(format_args!("    movl %{}, %{}", src_32, dest_32));
+                            }
+                            _ => { self.operand_to_callee_reg(src, dest_phys); }
+                        }
+                    }
+                } else if let Some(slot_off) = src_slot {
+                    // Source is a stack slot — emit fused load+extend directly to dest.
+                    // Uses emit_instr_rbp_reg which handles rbp/rsp addressing automatically.
+                    if ft.is_signed() {
+                        match ft.size() {
+                            1 => self.state.out.emit_instr_rbp_reg("    movsbq", slot_off, dest_64),
+                            2 => self.state.out.emit_instr_rbp_reg("    movswq", slot_off, dest_64),
+                            4 => self.state.out.emit_instr_rbp_reg("    movslq", slot_off, dest_64),
+                            _ => self.state.out.emit_instr_rbp_reg("    movq", slot_off, dest_64),
+                        }
+                    } else {
+                        match ft.size() {
+                            1 => self.state.out.emit_instr_rbp_reg("    movzbl", slot_off, dest_32),
+                            2 => self.state.out.emit_instr_rbp_reg("    movzwl", slot_off, dest_32),
+                            4 => self.state.out.emit_instr_rbp_reg("    movl", slot_off, dest_32),
+                            _ => self.state.out.emit_instr_rbp_reg("    movq", slot_off, dest_64),
+                        }
+                    }
+                } else {
+                    return false;
+                }
+                return true;
+            }
+            CastKind::IntNarrow { to_ty: t } => {
+                // Narrow: truncate. Load full value then mask/zero-extend.
+                if let Some(src_reg) = src_phys {
+                    let src_typed = typed_phys_reg_name(src_reg, t);
+                    match t.size() {
+                        4 => self.state.emit_fmt(format_args!("    movl %{}, %{}", phys_reg_name_32(src_reg), dest_32)),
+                        2 => self.state.emit_fmt(format_args!("    movzwl %{}, %{}", src_typed, dest_32)),
+                        1 => self.state.emit_fmt(format_args!("    movzbl %{}, %{}", src_typed, dest_32)),
+                        _ => { self.operand_to_callee_reg(src, dest_phys); }
+                    }
+                } else if let Some(slot_off) = src_slot {
+                    // For narrowing from stack: just load the narrower size.
+                    match t.size() {
+                        4 => self.state.out.emit_instr_rbp_reg("    movl", slot_off, dest_32),
+                        2 => self.state.out.emit_instr_rbp_reg("    movzwl", slot_off, dest_32),
+                        1 => self.state.out.emit_instr_rbp_reg("    movzbl", slot_off, dest_32),
+                        _ => self.state.out.emit_instr_rbp_reg("    movq", slot_off, dest_64),
+                    }
+                } else {
+                    return false;
+                }
+                return true;
+            }
+            CastKind::SignedToUnsignedSameSize { to_ty: t } => {
+                // Same size, just zero-extend to clear sign bits.
+                if let Some(src_reg) = src_phys {
+                    match t.size() {
+                        4 => self.state.emit_fmt(format_args!("    movl %{}, %{}", phys_reg_name_32(src_reg), dest_32)),
+                        2 => self.state.emit_fmt(format_args!("    movzwl %{}, %{}", typed_phys_reg_name(src_reg, t), dest_32)),
+                        1 => self.state.emit_fmt(format_args!("    movzbl %{}, %{}", typed_phys_reg_name(src_reg, t), dest_32)),
+                        _ => { self.operand_to_callee_reg(src, dest_phys); }
+                    }
+                } else if let Some(slot_off) = src_slot {
+                    match t.size() {
+                        4 => self.state.out.emit_instr_rbp_reg("    movl", slot_off, dest_32),
+                        2 => self.state.out.emit_instr_rbp_reg("    movzwl", slot_off, dest_32),
+                        1 => self.state.out.emit_instr_rbp_reg("    movzbl", slot_off, dest_32),
+                        _ => self.state.out.emit_instr_rbp_reg("    movq", slot_off, dest_64),
+                    }
+                } else {
+                    return false;
+                }
+                return true;
+            }
+            _ => {
+                // Float casts, F128, etc. — not handled here.
+                return false;
+            }
+        }
     }
 }
