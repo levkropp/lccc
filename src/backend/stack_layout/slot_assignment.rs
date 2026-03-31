@@ -902,14 +902,20 @@ pub(super) fn finalize_deferred_slots(
 pub(super) fn resolve_copy_aliases(
     state: &mut crate::backend::state::CodegenState,
     copy_alias: &FxHashMap<u32, u32>,
+    phi_web_aliases: &FxHashSet<u32>,
 ) {
     for (&dest_id, &root_id) in copy_alias {
-        // If the alias already has its own slot (allocated because the
-        // classify_value check detected cross-block uses, multi-def, or
-        // other safety concerns), keep the separate slot instead of
-        // overwriting it with the root's potentially block-local slot.
-        if state.value_locations.contains_key(&dest_id) {
-            continue;
+        // For phi-web coalesced values, force-overwrite the existing slot with
+        // the root's slot. These values were checked for interference during
+        // phi-web analysis and are safe to share. Without force-overwrite,
+        // multi-def values (which always get Tier 2 slots) would never be
+        // coalesced because they already have slots assigned.
+        if !phi_web_aliases.contains(&dest_id) {
+            // For non-phi-web aliases, keep the original behavior: skip values
+            // that already have slots to avoid overwriting with block-local slots.
+            if state.value_locations.contains_key(&dest_id) {
+                continue;
+            }
         }
         if let Some(&slot) = state.value_locations.get(&root_id) {
             state.value_locations.insert(dest_id, slot);

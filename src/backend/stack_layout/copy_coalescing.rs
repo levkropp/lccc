@@ -26,6 +26,8 @@ use crate::backend::liveness::{
 /// Safety: only coalesces when the Copy is the SOLE use of the source value,
 /// guaranteeing the source is dead after the Copy (avoids the "lost copy"
 /// problem in phi parallel copy groups).
+/// Returns `(copy_alias, phi_web_aliases)` where phi_web_aliases contains value IDs
+/// that were coalesced via phi-web analysis and need force-overwrite in resolve_copy_aliases.
 pub(super) fn build_copy_alias_map(
     func: &IrFunction,
     def_block: &FxHashMap<u32, usize>,
@@ -33,7 +35,7 @@ pub(super) fn build_copy_alias_map(
     reg_assigned: &FxHashMap<u32, PhysReg>,
     use_blocks_map: &FxHashMap<u32, Vec<usize>>,
     cached_liveness: &Option<crate::backend::liveness::LivenessResult>,
-) -> FxHashMap<u32, u32> {
+) -> (FxHashMap<u32, u32>, FxHashSet<u32>) {
     // Count uses of each value across all instructions.
     let mut use_count: FxHashMap<u32, u32> = FxHashMap::default();
     for block in &func.blocks {
@@ -187,6 +189,71 @@ pub(super) fn build_copy_alias_map(
         }
     }
 
+    // ── Phi-web coalescing ──────────────────────────────────────────────────
+    //
+    // Force phi web members to share the same stack slot. For Copy(dest, src)
+    // where dest is multi-def (phi dest), coalesce src→dest if src is NOT live
+    // in any block where dest is defined by a DIFFERENT Copy.
+    let mut phi_web_aliases: FxHashSet<u32> = FxHashSet::default();
+    if !std::env::var("CCC_NO_PHI_WEB_COALESCE").is_ok() {
+        // Phase 1: Collect all Copy(dest, src) pairs grouped by dest.
+        // Also record which blocks contain definitions of each dest.
+        let mut phi_copies: FxHashMap<u32, Vec<(u32, usize)>> = FxHashMap::default();
+        let mut dest_def_blocks: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
+        for (blk_idx, block) in func.blocks.iter().enumerate() {
+            for inst in &block.instructions {
+                if let Instruction::Copy { dest, src: Operand::Value(src_val) } = inst {
+                    let d = dest.0;
+                    let s = src_val.0;
+                    if !multi_def_values.contains(&d) { continue; }
+                    if reg_assigned.contains_key(&s) { continue; }
+                    // Skip if already coalesced by per-Copy analysis.
+                    if raw_aliases.iter().any(|&(a, _)| a == s) { continue; }
+                    phi_copies.entry(d).or_default().push((s, blk_idx));
+                    dest_def_blocks.entry(d).or_default().push(blk_idx);
+                }
+            }
+        }
+
+        // Phase 2: For each phi web, check interference and coalesce.
+        for (dest_id, sources) in &phi_copies {
+            if sources.len() < 2 { continue; }
+            if reg_assigned.contains_key(dest_id) { continue; }
+
+            // Get all blocks where dest is defined (by different Copies).
+            let def_blks = match dest_def_blocks.get(dest_id) {
+                Some(blks) => blks,
+                None => continue,
+            };
+
+            for &(src_id, src_copy_blk) in sources {
+                // Interference check: is src live in any block where dest is
+                // defined by a DIFFERENT Copy (i.e., in any def block ≠ src_copy_blk)?
+                //
+                // "Live in block B" approximated by: src has uses in block B, OR
+                // src is defined before B and has uses after B.
+                // Simple conservative check: src's use_blocks must not overlap with
+                // any of dest's other definition blocks.
+                let src_use_blks = use_blocks_map.get(&src_id);
+                let interferes = match src_use_blks {
+                    Some(blks) => {
+                        blks.iter().any(|use_blk| {
+                            def_blks.iter().any(|&def_blk| {
+                                def_blk == *use_blk && def_blk != src_copy_blk
+                            })
+                        })
+                    }
+                    None => false, // no uses = dead, no interference
+                };
+
+                if !interferes {
+                    raw_aliases.push((src_id, *dest_id));
+                    phi_web_aliases.insert(src_id);
+                }
+            }
+        }
+    }
+
     // Build alias map with transitive resolution: follow chains to find root.
     // Safety limit on chain depth guards against pathological cycles.
     const MAX_ALIAS_CHAIN_DEPTH: usize = 100;
@@ -233,7 +300,7 @@ pub(super) fn build_copy_alias_map(
         copy_alias.retain(|dest_id, _| !asm_output_ptrs.contains(dest_id));
     }
 
-    copy_alias
+    (copy_alias, phi_web_aliases)
 }
 
 /// Identify values that can skip stack slot allocation because they are
