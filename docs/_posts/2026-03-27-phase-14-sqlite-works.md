@@ -109,6 +109,18 @@ After Phase 14, the peephole optimizer was disabled for SQLite (`CCC_NO_PEEPHOLE
 
 1. **`fuse_signext_and_move`**: rax liveness scan had a 12-line window — too small for SQLite's 10K-line functions. Fixed by scanning to the next barrier.
 2. **`eliminate_dead_reg_moves`**: jmp-following crossed basic block boundaries unsoundly. Fixed by removing cross-block following.
-3. **`fold_base_index_addressing`**: crashes on subquery compilation. Still under investigation.
+3. **`fold_base_index_addressing`**: NOP'd SIB fold without checking if registers were dead after. Fixed with dead-register safety checks.
 
-With these 3 passes disabled, **22 of 25 peephole sub-passes are now active** on SQLite. All 11 stress tests pass.
+All 3 passes were subsequently fixed. **All 25 peephole sub-passes are now active** on SQLite.
+
+## Update: All Optimization Passes Active (Phases 15-19)
+
+After Phase 14, a series of fixes enabled every optimization pass on SQLite:
+
+- **Phase 15**: All 25 peephole passes (signext_move: 3 bugs, dead_regs: window→2, base_index: SIB safety)
+- **Phase 16**: GVN re-enabled (same-block CSE restriction prevents cross-block Copy stale registers)
+- **Phase 17**: Register-direct codegen — store/load/call-arg paths bypass the accumulator (-78KB)
+- **Phase 18**: Vectorizer fixes — 32-byte AVX2 vector slots, exit-block accumulator replacement
+- **Phase 19**: Live range splitting with mem2reg SSA reconstruction
+
+**18/18 compatibility tests pass.** No `CCC_DISABLE_PASSES` or `CCC_PEEPHOLE_SKIP` flags needed.

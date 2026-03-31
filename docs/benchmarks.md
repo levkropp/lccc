@@ -42,7 +42,7 @@ All outputs are byte-identical to GCC's.
 
 ## Real-World: SQLite 3.45
 
-LCCC compiles and fully runs the SQLite amalgamation (260K lines). All core SQL operations work correctly: CREATE TABLE, INSERT, UPDATE, DELETE, SELECT with JOINs, subqueries, GROUP BY, transactions, prepared statements, and aggregate functions. 31 correctness bugs were fixed to reach this milestone. Build flags: `CCC_NO_PEEPHOLE=1 CCC_DISABLE_PASSES=vectorize,gvn`.
+LCCC compiles and fully runs the SQLite amalgamation (260K lines) with **all optimization passes active** — no disabled passes or flags needed. All core SQL operations work correctly. 36+ correctness bugs were fixed across the peephole optimizer, GVN, vectorizer, register allocator, stack layout, and codegen. 18/18 compatibility tests pass.
 
 ## Benchmark Descriptions
 
