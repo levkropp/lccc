@@ -32,6 +32,7 @@ mod callee_saves;
 mod memory_fold;
 mod frame_compact;
 mod tail_call;
+mod identical_blocks;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -227,6 +228,12 @@ pub fn peephole_optimize(asm: String) -> String {
     // Phase 7: Compact stack frames.
     if !skip_phase7 {
         frame_compact::compact_frame(&mut store, &mut infos);
+    }
+
+    // Phase 8: Merge identical basic blocks (phi trampoline deduplication).
+    // Must run after all other transformations to catch final identical patterns.
+    if !sk("identical_blocks") {
+        identical_blocks::merge_identical_blocks(&mut store, &mut infos);
     }
 
     store.build_result(|i| infos[i].is_nop())
