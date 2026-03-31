@@ -260,11 +260,24 @@ impl X86Codegen {
                 }
                 CallArgClass::IntReg { reg_idx } => {
                     let target_reg = X86_ARG_REGS[reg_idx];
-                    // Register-direct for constants; values use accumulator path
-                    // (register-direct for values crashes: peephole pass interaction
-                    // removes param stores when the value is used directly from its
-                    // callee-saved register instead of through rax)
-                    let did_direct = if let Operand::Const(c) = arg {
+                    // Register-direct: callee-saved regs and constants bypass rax.
+                    // Skip when it would create a round-trip (e.g., rdi→rbx→rdi)
+                    // that the peephole would eliminate along with the param store.
+                    let did_direct = if let Operand::Value(v) = arg {
+                        if let Some(&phys) = self.reg_assignments.get(&v.0) {
+                            if phys.0 >= 1 && phys.0 <= 6 {
+                                // Check for round-trip: if this callee-saved reg was
+                                // loaded from the SAME arg reg we're targeting, skip
+                                let is_round_trip = self.param_source_regs.get(&phys.0)
+                                    .map_or(false, |&src| src == target_reg);
+                                if !is_round_trip {
+                                    let src = super::emit::phys_reg_name(phys);
+                                    self.state.out.emit_instr_reg_reg("    movq", src, target_reg);
+                                    true
+                                } else { false }
+                            } else { false }
+                        } else { false }
+                    } else if let Operand::Const(c) = arg {
                         if let Some(imm) = c.to_i64() {
                             if imm == 0 {
                                 let target_32 = match target_reg {

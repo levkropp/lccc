@@ -246,6 +246,11 @@ pub struct X86Codegen {
     pub(super) ivsr_pointers: FxHashMap<u32, IvsrPointerInfo>,
     /// Maps IVSR pointer phi to original loop counter value ID
     pub(super) pointer_to_counter: FxHashMap<u32, u32>,
+    /// Tracks which callee-saved register was loaded from which ABI arg register
+    /// during parameter storage. Used to avoid register-direct round-trips
+    /// (e.g., rdi→rbx→rdi) that the peephole would eliminate.
+    /// Maps PhysReg ID → arg register name (e.g., PhysReg(1) → "rdi").
+    pub(super) param_source_regs: FxHashMap<u8, &'static str>,
     /// Phase 2b: caller-saved registers with call-spanning values.
     /// Maps PhysReg ID → dedicated spill slot for save/restore at call sites.
     pub(super) caller_save_spill_slots: FxHashMap<u8, crate::backend::state::StackSlot>,
@@ -288,6 +293,7 @@ impl X86Codegen {
             current_func: None,
             ivsr_pointers: FxHashMap::default(),
             pointer_to_counter: FxHashMap::default(),
+            param_source_regs: FxHashMap::default(),
             caller_save_spill_slots: FxHashMap::default(),
             caller_save_intervals: FxHashMap::default(),
         }
