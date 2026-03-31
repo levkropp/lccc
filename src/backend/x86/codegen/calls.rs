@@ -260,7 +260,10 @@ impl X86Codegen {
                 }
                 CallArgClass::IntReg { reg_idx } => {
                     let target_reg = X86_ARG_REGS[reg_idx];
-                    // Register-direct for constants: skip rax for zero and small imm
+                    // Register-direct for constants; values use accumulator path
+                    // (register-direct for values crashes: peephole pass interaction
+                    // removes param stores when the value is used directly from its
+                    // callee-saved register instead of through rax)
                     let did_direct = if let Operand::Const(c) = arg {
                         if let Some(imm) = c.to_i64() {
                             if imm == 0 {
