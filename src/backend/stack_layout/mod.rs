@@ -96,6 +96,8 @@ struct StackLayoutContext {
     multi_def_values: FxHashSet<u32>,
     /// Copy alias map: dest_id -> root_id (values sharing the same stack slot).
     copy_alias: FxHashMap<u32, u32>,
+    /// Values aliased via phi-web coalescing (must force-overwrite in resolve_copy_aliases).
+    phi_web_aliases: FxHashSet<u32>,
     /// All value IDs referenced as operands in the function body.
     used_values: FxHashSet<u32>,
     /// Dead parameter allocas (unused params, skip slot allocation).
@@ -283,7 +285,7 @@ pub fn calculate_stack_space_common(
     );
 
     // Phase 6: Resolve copy aliases (propagate slots from root to aliased values).
-    slot_assignment::resolve_copy_aliases(state, &ctx.copy_alias);
+    slot_assignment::resolve_copy_aliases(state, &ctx.copy_alias, &ctx.phi_web_aliases);
 
     // Phase 7: Propagate wide-value status through Copy chains (32-bit targets only).
     slot_assignment::propagate_wide_values(state, func, &ctx.copy_alias);
@@ -343,7 +345,7 @@ fn build_layout_context(
     };
 
     // Copy coalescing analysis.
-    let copy_alias = copy_coalescing::build_copy_alias_map(
+    let (copy_alias, phi_web_aliases) = copy_coalescing::build_copy_alias_map(
         func, &def_block, &multi_def_values, reg_assigned, &use_blocks_map,
         cached_liveness,
     );
@@ -429,6 +431,7 @@ fn build_layout_context(
         def_block,
         multi_def_values,
         copy_alias,
+        phi_web_aliases,
         used_values,
         dead_param_allocas,
         coalescable_allocas,
