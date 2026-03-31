@@ -121,6 +121,10 @@ pub fn peephole_optimize(asm: String) -> String {
     if !sk("dead_stores") { global_changed |= dead_code::eliminate_dead_stores(&store, &mut infos); }
     if !sk("cmp_branch") { global_changed |= compare_branch::fuse_compare_and_branch(&mut store, &mut infos); }
     if !sk("mem_fold") { global_changed |= memory_fold::fold_memory_operands(&mut store, &mut infos); }
+    if !sk("load_relay") { global_changed |= memory_fold::fold_load_relay(&mut store, &mut infos); }
+    if !sk("leaq_relay") { global_changed |= memory_fold::fold_leaq_relay(&mut store, &mut infos); }
+    if !sk("cltq_relay") { global_changed |= memory_fold::fold_cltq_relay(&mut store, &mut infos); }
+    if !sk("ext_relay") { global_changed |= memory_fold::fold_extend_relay(&mut store, &mut infos); }
     global_changed };
 
     // Phase 3: One more local cleanup if global passes made changes.
@@ -139,6 +143,10 @@ pub fn peephole_optimize(asm: String) -> String {
             if !sk("dead_regs") { changed2 |= dead_code::eliminate_dead_reg_moves(&store, &mut infos); }
             if !sk("dead_stores") { changed2 |= dead_code::eliminate_dead_stores(&store, &mut infos); }
             if !sk("mem_fold") { changed2 |= memory_fold::fold_memory_operands(&mut store, &mut infos); }
+            if !sk("load_relay") { changed2 |= memory_fold::fold_load_relay(&mut store, &mut infos); }
+            if !sk("leaq_relay") { changed2 |= memory_fold::fold_leaq_relay(&mut store, &mut infos); }
+            if !sk("cltq_relay") { changed2 |= memory_fold::fold_cltq_relay(&mut store, &mut infos); }
+            if !sk("ext_relay") { changed2 |= memory_fold::fold_extend_relay(&mut store, &mut infos); }
             if !sk("base_index") { changed2 |= local_patterns::fold_base_index_addressing(&mut store, &mut infos); }
             if !sk("phi_coalesce") { changed2 |= local_patterns::coalesce_phi_register_copies(&mut store, &mut infos); }
             if !sk("signext_move") { changed2 |= local_patterns::fuse_signext_and_move(&mut store, &mut infos); }
@@ -171,6 +179,10 @@ pub fn peephole_optimize(asm: String) -> String {
             if !sk("dead_regs") { changed3 |= dead_code::eliminate_dead_reg_moves(&store, &mut infos); }
             if !sk("dead_stores") { changed3 |= dead_code::eliminate_dead_stores(&store, &mut infos); }
             if !sk("mem_fold") { changed3 |= memory_fold::fold_memory_operands(&mut store, &mut infos); }
+            if !sk("load_relay") { changed3 |= memory_fold::fold_load_relay(&mut store, &mut infos); }
+            if !sk("leaq_relay") { changed3 |= memory_fold::fold_leaq_relay(&mut store, &mut infos); }
+            if !sk("cltq_relay") { changed3 |= memory_fold::fold_cltq_relay(&mut store, &mut infos); }
+            if !sk("ext_relay") { changed3 |= memory_fold::fold_extend_relay(&mut store, &mut infos); }
             changed3 |= local_patterns::coalesce_phi_register_copies(&mut store, &mut infos);
             if !sk("signext_move") { changed3 |= local_patterns::fuse_signext_and_move(&mut store, &mut infos); }
             changed3 |= local_patterns::collapse_increment_chain(&mut store, &mut infos);
@@ -1207,7 +1219,9 @@ mod regression_tests {
         // The load must also survive.
         let lines: Vec<&str> = result.lines().map(|l| l.trim()).collect();
         let has_store = lines.iter().any(|l| l.contains("%rsi") && l.contains("(%rbp)"));
-        let has_load = lines.iter().any(|l| l.starts_with("movl") && l.contains("(%rbp)") && l.contains("%eax"));
+        // The load may be folded by relay elimination: movl -4(%rbp),%eax + movq %rax,%r14
+        // becomes movl -4(%rbp),%r14d — so accept either %eax or %r14d as the destination.
+        let has_load = lines.iter().any(|l| l.starts_with("movl") && l.contains("(%rbp)") && (l.contains("%eax") || l.contains("%r14d")));
         assert!(has_store,
             "store of struct param must survive frame compaction (overlapping read exists): {}", result);
         assert!(has_load,
