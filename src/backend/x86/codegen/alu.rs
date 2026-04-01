@@ -120,22 +120,26 @@ impl X86Codegen {
             }
         }
 
-        // Memory-operand optimization: for Add/Sub/Mul, use memory source directly
-        // instead of loading rhs into %rcx first.
+        // Memory-operand optimization: for ALU ops with memory source form,
+        // use memory source directly instead of loading rhs into %rcx first.
         // Pattern: addq -N(%rbp), %rax  (saves one movq load instruction)
         // For Mul: imull -N(%rbp), %eax  (2-operand form, does NOT use rdx)
-        if matches!(op, IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul) {
+        // Extends to And/Or/Xor which have identical instruction forms.
+        let mem_op_mnem = match op {
+            IrBinOp::Add => Some("add"),
+            IrBinOp::Sub => Some("sub"),
+            IrBinOp::Mul => Some("imul"),
+            IrBinOp::And => Some("and"),
+            IrBinOp::Or  => Some("or"),
+            IrBinOp::Xor => Some("xor"),
+            _ => None,
+        };
+        if let Some(mnem) = mem_op_mnem {
             if let Operand::Value(rhs_val) = rhs {
                 // Check if rhs has a stack slot and is NOT register-allocated
                 if self.dest_reg(&rhs_val).is_none() {
                     if let Some(slot) = self.state.get_slot(rhs_val.0) {
                         if use_32bit { self.operand_to_eax(lhs); } else { self.operand_to_rax(lhs); }
-                        let mnem = match op {
-                            IrBinOp::Add => "add",
-                            IrBinOp::Sub => "sub",
-                            IrBinOp::Mul => "imul",
-                            _ => unreachable!(),
-                        };
                         let sref = self.slot_ref(slot.0);
                         if use_32bit {
                             self.state.emit_fmt(format_args!("    {}l {}, %eax", mnem, sref));
@@ -149,17 +153,13 @@ impl X86Codegen {
                 }
             }
             // Also try memory-operand for lhs (swap: rhs to rax, lhs from memory)
-            // for commutative ops: Add and Mul
-            if matches!(op, IrBinOp::Add | IrBinOp::Mul) {
+            // for commutative ops: Add, Mul, And, Or, Xor (NOT Sub — non-commutative)
+            let is_commutative = !matches!(op, IrBinOp::Sub);
+            if is_commutative {
                 if let Operand::Value(lhs_val) = lhs {
                     if self.dest_reg(&lhs_val).is_none() {
                         if let Some(slot) = self.state.get_slot(lhs_val.0) {
                             if use_32bit { self.operand_to_eax(rhs); } else { self.operand_to_rax(rhs); }
-                            let mnem = match op {
-                                IrBinOp::Add => "add",
-                                IrBinOp::Mul => "imul",
-                                _ => unreachable!(),
-                            };
                             let sref = self.slot_ref(slot.0);
                             if use_32bit {
                                 self.state.emit_fmt(format_args!("    {}l {}, %eax", mnem, sref));
