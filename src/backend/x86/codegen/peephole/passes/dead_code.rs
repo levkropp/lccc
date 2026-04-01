@@ -390,8 +390,12 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
             }
         }
 
-        // Phase 1: Collect all "read" byte ranges
-        let mut has_indirect = false;
+        // Phase 1: Collect all "read" byte ranges.
+        // Instead of bailing on ANY indirect memory access, we track which
+        // offsets have their addresses taken (via leaq) and treat those as
+        // "read". This is more precise than the old bail-out approach and
+        // allows dead store elimination in functions with some leaq usage.
+        let mut has_unparseable_indirect = false;
         let mut read_ranges: Vec<(i32, i32)> = Vec::new();
 
         for k in body_start..func_end {
@@ -400,7 +404,9 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
             }
 
             if infos[k].has_indirect_mem {
-                has_indirect = true;
+                // Truly indirect memory access (e.g., (%rax) where rax is unknown).
+                // Mark the whole function as having indirect access.
+                has_unparseable_indirect = true;
                 break;
             }
 
@@ -414,14 +420,16 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                     if rbp_off != RBP_OFFSET_NONE {
                         let line = infos[k].trimmed(store.get(k));
                         if line.starts_with("leaq ") {
-                            has_indirect = true;
-                            break;
+                            // Address taken — conservatively mark 64 bytes as "read"
+                            // to protect this slot and nearby slots.
+                            read_ranges.push((rbp_off, 64));
+                        } else {
+                            read_ranges.push((rbp_off, 32));
                         }
-                        read_ranges.push((rbp_off, 32));
                     } else {
                         let line = infos[k].trimmed(store.get(k));
                         if line.contains("(%rbp)") || line.contains("(%rsp)") {
-                            has_indirect = true;
+                            has_unparseable_indirect = true;
                             break;
                         }
                     }
@@ -435,14 +443,14 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                     if rbp_off != RBP_OFFSET_NONE {
                         read_ranges.push((rbp_off, 8));
                     } else if line.contains("(%rbp)") || line.contains("(%rsp)") {
-                        has_indirect = true;
+                        has_unparseable_indirect = true;
                         break;
                     }
                 }
             }
         }
 
-        if has_indirect {
+        if has_unparseable_indirect {
             i = func_end;
             continue;
         }
