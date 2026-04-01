@@ -78,6 +78,41 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
             }
         }
 
+        // --- Pattern: dead xorl %eax before overwriting load ---
+        // When xorl %eax, %eax is immediately followed by an instruction that
+        // completely overwrites %rax (a load from stack), the xorl is dead.
+        //
+        //   xorl %eax, %eax          # DEAD — overwritten by next instruction
+        //   movq -N(%rbp), %rax      # (or movslq, movzbq, etc.)
+        if let LineKind::Other { dest_reg: 0 } = infos[i].kind {
+            let trimmed = infos[i].trimmed(store.get(i));
+            if trimmed == "xorl %eax, %eax" {
+                // Check if the next non-nop instruction overwrites %rax.
+                let mut j = i + 1;
+                while j < len && infos[j].is_nop() { j += 1; }
+                if j < len {
+                    let overwrites_rax = match infos[j].kind {
+                        LineKind::LoadRbp { reg: 0, .. } => true, // movq/movslq/etc → %rax
+                        LineKind::Other { dest_reg: 0 } => {
+                            // Check if it's a load that writes %rax (not a read-modify-write)
+                            let nj = infos[j].trimmed(store.get(j));
+                            nj.starts_with("movq ") || nj.starts_with("movl ")
+                                || nj.starts_with("movslq ") || nj.starts_with("movzbq ")
+                                || nj.starts_with("movzwq ") || nj.starts_with("movsbq ")
+                                || nj.starts_with("movswq ") || nj.starts_with("leaq ")
+                        }
+                        _ => false,
+                    };
+                    if overwrites_rax {
+                        mark_nop(&mut infos[i]);
+                        changed = true;
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
         // Update rax_is_zero tracking based on current instruction.
         match infos[i].kind {
             LineKind::StoreRbp { .. } => {
