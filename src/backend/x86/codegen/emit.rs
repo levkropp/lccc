@@ -434,6 +434,18 @@ impl X86Codegen {
             }
         } else if let Some(lhs_r) = lhs_phys {
             let lhs_name = if use_32bit { phys_reg_name_32(lhs_r) } else { phys_reg_name(lhs_r) };
+            // Memory-operand: cmpq N(%rsp), %lhs_reg directly
+            if let Operand::Value(rv) = rhs {
+                if self.dest_reg(rv).is_none() {
+                    if let Some(slot) = self.state.get_slot(rv.0) {
+                        if !self.state.is_alloca(rv.0) {
+                            let sref = self.slot_ref(slot.0);
+                            self.state.emit_fmt(format_args!("    {} {}, %{}", cmp_instr, sref, lhs_name));
+                            return;
+                        }
+                    }
+                }
+            }
             self.operand_to_rcx(rhs);
             let rcx = if use_32bit { "ecx" } else { "rcx" };
             self.state.emit_fmt(format_args!("    {} %{}, %{}", cmp_instr, rcx, lhs_name));
@@ -443,10 +455,22 @@ impl X86Codegen {
             let reg = if use_32bit { "eax" } else { "rax" };
             self.state.emit_fmt(format_args!("    {} %{}, %{}", cmp_instr, rhs_name, reg));
         } else {
+            // Neither operand has a register. Load lhs to %rax.
             self.operand_to_rax(lhs);
+            let reg = if use_32bit { "eax" } else { "rax" };
+            // Memory-operand: cmpq N(%rsp), %rax directly for rhs
+            if let Operand::Value(rv) = rhs {
+                if let Some(slot) = self.state.get_slot(rv.0) {
+                    if !self.state.is_alloca(rv.0) {
+                        let sref = self.slot_ref(slot.0);
+                        self.state.emit_fmt(format_args!("    {} {}, %{}", cmp_instr, sref, reg));
+                        return;
+                    }
+                }
+            }
             self.operand_to_rcx(rhs);
-            let (rcx, rax) = if use_32bit { ("ecx", "eax") } else { ("rcx", "rax") };
-            self.state.emit_fmt(format_args!("    {} %{}, %{}", cmp_instr, rcx, rax));
+            let rcx = if use_32bit { "ecx" } else { "rcx" };
+            self.state.emit_fmt(format_args!("    {} %{}, %{}", cmp_instr, rcx, reg));
         }
     }
 
