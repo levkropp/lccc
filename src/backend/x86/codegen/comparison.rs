@@ -2,7 +2,7 @@
 
 use crate::ir::reexports::{BlockId, IrCmpOp, IrConst, Operand, Value};
 use crate::common::types::IrType;
-use super::emit::{X86Codegen, phys_reg_name};
+use super::emit::{X86Codegen, phys_reg_name, phys_reg_name_32, is_xmm_reg};
 
 impl X86Codegen {
     pub(super) fn emit_float_cmp_impl(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
@@ -92,6 +92,18 @@ impl X86Codegen {
             IrCmpOp::Uge => "setae",
         };
         self.state.emit_fmt(format_args!("    {} %al", set_instr));
+
+        // Register-direct: movzbl %al, %dest_reg_32 — skip %rax relay.
+        // Safe because %al is part of %rax, never overlaps callee-saved registers.
+        if let Some(d_reg) = self.dest_reg(dest) {
+            if !is_xmm_reg(d_reg) {
+                let d_name = phys_reg_name_32(d_reg);
+                self.state.emit_fmt(format_args!("    movzbl %al, %{}", d_name));
+                self.state.reg_cache.invalidate_acc();
+                return;
+            }
+        }
+
         self.state.emit("    movzbq %al, %rax");
         self.state.reg_cache.invalidate_acc();
         self.store_rax_to(dest);
@@ -156,6 +168,18 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_cond_branch_blocks_impl(&mut self, cond: &Operand, true_block: BlockId, false_block: BlockId) {
+        // Register-direct: test the condition register directly, skip %rax relay.
+        if let Operand::Value(v) = cond {
+            if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                if !is_xmm_reg(reg) {
+                    let name = phys_reg_name(reg);
+                    self.state.emit_fmt(format_args!("    testq %{}, %{}", name, name));
+                    self.state.out.emit_jcc_block("    jne", true_block.0);
+                    self.state.out.emit_jmp_block(false_block.0);
+                    return;
+                }
+            }
+        }
         self.operand_to_rax(cond);
         self.state.emit("    testq %rax, %rax");
         self.state.out.emit_jcc_block("    jne", true_block.0);
@@ -163,6 +187,51 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_select_impl(&mut self, dest: &Value, cond: &Operand, true_val: &Operand, false_val: &Operand, _ty: IrType) {
+        // Register-direct: when dest has a register, operate directly on it.
+        if let Some(d_reg) = self.dest_reg(dest) {
+            if !is_xmm_reg(d_reg) {
+                let d_name = phys_reg_name(d_reg);
+
+                // Check for register conflicts: if true_val is in dest reg,
+                // we must load it to %rcx BEFORE loading false_val to dest.
+                let true_in_dest = match true_val {
+                    Operand::Value(v) => self.reg_assignments.get(&v.0).copied() == Some(d_reg),
+                    _ => false,
+                };
+
+                if true_in_dest {
+                    // true is in dest, so save it to %rcx first
+                    self.state.emit_fmt(format_args!("    movq %{}, %rcx", d_name));
+                    self.operand_to_callee_reg(false_val, d_reg);
+                } else {
+                    self.operand_to_callee_reg(false_val, d_reg);
+                    self.operand_to_rcx(true_val);
+                }
+
+                // Load and test condition
+                match cond {
+                    Operand::Value(v) if self.reg_assignments.get(&v.0).copied() == Some(d_reg) => {
+                        // Cond is in dest — we already overwrote it. Use %rax as temp.
+                        self.operand_to_rax(cond);
+                        self.state.emit("    testq %rax, %rax");
+                    }
+                    Operand::Value(v) if self.reg_assignments.contains_key(&v.0) => {
+                        let cond_name = phys_reg_name(*self.reg_assignments.get(&v.0).unwrap());
+                        self.state.emit_fmt(format_args!("    testq %{}, %{}", cond_name, cond_name));
+                    }
+                    _ => {
+                        self.operand_to_rax(cond);
+                        self.state.emit("    testq %rax, %rax");
+                    }
+                }
+
+                self.state.emit_fmt(format_args!("    cmovneq %rcx, %{}", d_name));
+                self.state.reg_cache.invalidate_acc();
+                return;
+            }
+        }
+
+        // Accumulator fallback
         self.operand_to_rax(false_val);
         self.operand_to_rcx(true_val);
 
