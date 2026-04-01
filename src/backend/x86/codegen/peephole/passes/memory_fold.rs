@@ -508,6 +508,36 @@ pub(super) fn fold_general_relay(store: &mut LineStore, infos: &mut [LineInfo]) 
                 // movl $imm, %eax → movl $imm, %REGd
                 let imm = &line_i[5..line_i.len() - 6];
                 Some(format!("    movl {}, {}", imm, dest_32))
+            } else if line_i.starts_with("movq ") && line_i.ends_with(", %rax") && line_i.contains('(') {
+                // movq N(%reg), %rax → movq N(%reg), %REG (pointer dereference)
+                // Safe: source is a memory operand, doesn't read %rax as a value.
+                // But check the addressing mode doesn't use %rax as base/index!
+                let src = &line_i[5..line_i.len() - 6]; // between "movq " and ", %rax"
+                if src.contains("%rax") || src.contains("%eax") {
+                    i += 1; continue;
+                }
+                Some(format!("    movq {}, {}", src, dest_64))
+            } else if line_i.starts_with("movl ") && line_i.ends_with(", %eax") && line_i.contains('(') {
+                // movl N(%reg), %eax → movl N(%reg), %REGd (32-bit pointer dereference)
+                let src = &line_i[5..line_i.len() - 6];
+                if src.contains("%rax") || src.contains("%eax") {
+                    i += 1; continue;
+                }
+                Some(format!("    movl {}, {}", src, dest_32))
+            } else if line_i.starts_with("movzbq ") && line_i.ends_with(", %rax") {
+                // movzbq N(%reg), %rax → movzbl N(%reg), %REGd (byte load zero-extend)
+                let src = &line_i[7..line_i.len() - 6];
+                if src.contains("%rax") || src.contains("%eax") {
+                    i += 1; continue;
+                }
+                Some(format!("    movzbl {}, {}", src, dest_32))
+            } else if line_i.starts_with("movzwq ") && line_i.ends_with(", %rax") {
+                // movzwq N(%reg), %rax → movzwl N(%reg), %REGd
+                let src = &line_i[7..line_i.len() - 6];
+                if src.contains("%rax") || src.contains("%eax") {
+                    i += 1; continue;
+                }
+                Some(format!("    movzwl {}, {}", src, dest_32))
             } else {
                 None
             };

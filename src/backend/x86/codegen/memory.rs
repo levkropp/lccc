@@ -3,7 +3,7 @@
 use crate::ir::reexports::{IrConst, IrBinOp, Instruction, Operand, Value};
 use crate::common::types::{AddressSpace, IrType};
 use crate::backend::state::{StackSlot, SlotAddr};
-use super::emit::{X86Codegen, phys_reg_name, typed_phys_reg_name, is_xmm_reg};
+use super::emit::{X86Codegen, phys_reg_name, phys_reg_name_32, typed_phys_reg_name, is_xmm_reg};
 
 impl X86Codegen {
     /// Try to emit a store using x86-64 SIB indexed addressing mode.
@@ -573,13 +573,29 @@ impl X86Codegen {
             return;
         }
 
-        // Register-direct load: when ptr has a register, load directly from
-        // (%ptr_reg) into rax, skipping the rcx intermediate. Saves 1 instruction.
+        // Register-direct load: when ptr has a register, load directly.
+        // If dest ALSO has a register, load directly to dest (bypassing rax entirely).
+        // Otherwise, load to rax and store via accumulator.
         if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128) {
             if let Some(p_reg) = self.reg_assignments.get(&ptr.0).copied() {
                 if !is_xmm_reg(p_reg) && !self.state.is_alloca(ptr.0) {
                     let load_instr = Self::mov_load_for_type(ty);
                     let p_name = phys_reg_name(p_reg);
+
+                    // Check if dest has a register — load directly to it.
+                    if let Some(d_reg) = self.reg_assignments.get(&dest.0).copied() {
+                        if !is_xmm_reg(d_reg) {
+                            let d_name = if matches!(ty, IrType::I32 | IrType::U32) {
+                                phys_reg_name_32(d_reg)
+                            } else {
+                                phys_reg_name(d_reg)
+                            };
+                            self.state.emit_fmt(format_args!("    {} (%{}), %{}", load_instr, p_name, d_name));
+                            return;
+                        }
+                    }
+
+                    // Dest is on stack — load to rax as before.
                     let dest_reg = if matches!(ty, IrType::I32 | IrType::U32) { "%eax" } else { "%rax" };
                     self.state.emit_fmt(format_args!("    {} (%{}), {}", load_instr, p_name, dest_reg));
                     self.state.reg_cache.set_acc(dest.0, false);
@@ -737,6 +753,26 @@ impl X86Codegen {
                 SlotAddr::Indirect(slot) => {
                     if let Some(&reg) = self.reg_assignments.get(&base.0) {
                         let reg_name = phys_reg_name(reg);
+
+                        // Register-direct: if dest also has a register, load directly to it.
+                        if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128) {
+                            if let Some(&d_reg) = self.reg_assignments.get(&dest.0) {
+                                if !is_xmm_reg(d_reg) {
+                                    let d_name = if matches!(ty, IrType::I32 | IrType::U32) {
+                                        phys_reg_name_32(d_reg)
+                                    } else {
+                                        phys_reg_name(d_reg)
+                                    };
+                                    if offset != 0 {
+                                        self.state.emit_fmt(format_args!("    {} {}(%{}), %{}", load_instr, offset, reg_name, d_name));
+                                    } else {
+                                        self.state.emit_fmt(format_args!("    {} (%{}), %{}", load_instr, reg_name, d_name));
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+
                         let dest_reg = Self::load_dest_reg(ty);
                         if offset != 0 {
                             self.state.emit_fmt(format_args!("    {} {}(%{}), {}", load_instr, offset, reg_name, dest_reg));
