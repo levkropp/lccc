@@ -36,6 +36,7 @@
 mod analysis;
 mod alloca_coalescing;
 mod copy_coalescing;
+mod graph_coloring;
 mod slot_assignment;
 mod inline_asm;
 mod regalloc_helpers;

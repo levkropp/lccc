@@ -830,7 +830,7 @@ fn pack_values_into_slots(
 
         if can_reuse {
             if let Some(&Reverse((slot_end, slot_idx))) = heap.peek() {
-                if slot_end < start {
+                if slot_end <= start {
                     heap.pop();
                     let slot_offset = slot_offsets[slot_idx];
                     heap.push(Reverse((end, slot_idx)));
