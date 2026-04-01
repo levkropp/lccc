@@ -605,6 +605,30 @@ impl X86Codegen {
             }
         }
 
+        // Register-direct load from alloca: when ptr is a stack-allocated local
+        // variable and dest has a register, load directly to the register.
+        // This bypasses the accumulator, saving one movq instruction.
+        if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128) {
+            if let Some(d_reg) = self.reg_assignments.get(&dest.0).copied() {
+                if !is_xmm_reg(d_reg) && self.state.is_alloca(ptr.0) {
+                    if let Some(slot) = self.state.get_slot(ptr.0) {
+                        let load_instr = Self::mov_load_for_type(ty);
+                        // Match the dest register width to the load instruction:
+                        // movl → 32-bit dest (implicit zero-extend)
+                        // movslq/movsbq/movswq/movzbq/movzwq/movq → 64-bit dest
+                        let d_name = match ty {
+                            IrType::U32 | IrType::F32 => phys_reg_name_32(d_reg),
+                            _ => phys_reg_name(d_reg),
+                        };
+                        let sr = self.slot_ref(slot.0);
+                        self.state.emit_fmt(format_args!("    {} {}, %{}", load_instr, sr, d_name));
+                        self.state.reg_cache.invalidate_acc();
+                        return;
+                    }
+                }
+            }
+        }
+
         // Fall back to default load logic
         crate::backend::traits::emit_load_default(self, dest, ptr, ty);
     }

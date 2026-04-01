@@ -26,7 +26,7 @@ use crate::ir::module::{IrFunction, IrModule, IrParam};
 const MIN_CASES_FOR_OUTLINING: usize = 20;
 
 /// Minimum number of instructions in a case body to be worth outlining.
-/// Very small cases (1-2 instructions) have more overhead from the call than savings.
+/// Very small cases (1-3 instructions) have more call overhead than savings.
 const MIN_CASE_INSTRUCTIONS: usize = 4;
 
 /// Maximum number of pointer arguments to pass to an outlined function.
