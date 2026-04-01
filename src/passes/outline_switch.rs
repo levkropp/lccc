@@ -30,9 +30,10 @@ const MIN_CASES_FOR_OUTLINING: usize = 20;
 const MIN_CASE_INSTRUCTIONS: usize = 4;
 
 /// Maximum number of pointer arguments to pass to an outlined function.
-/// If a case uses more external allocas than this, skip it (too many args = register pressure).
-/// x86-64 ABI passes first 6 integer args in registers; use that as the limit.
-const MAX_OUTLINE_ARGS: usize = 6;
+/// x86-64 ABI passes first 6 integer args in registers; args 7+ go on the stack.
+/// We allow up to 14 args since even stack-passed args are much cheaper than
+/// the shuffle instructions they eliminate in the parent function.
+const MAX_OUTLINE_ARGS: usize = 14;
 
 /// Run the switch outlining pass on the entire module.
 pub fn run(module: &mut IrModule) -> usize {
