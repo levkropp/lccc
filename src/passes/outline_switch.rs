@@ -94,6 +94,11 @@ struct OutlinableCase {
     external_values: Vec<(Value, IrType)>,
     /// Whether this case contains a Return terminator (needs special handling).
     has_return: bool,
+    /// External blocks (besides end_block) that the case branches to.
+    /// These become additional "exit" targets: the outlined function returns an
+    /// index (0 = end_block, 1..N = exit_blocks[0..N-1]) to tell the caller
+    /// which block to branch to.
+    exit_blocks: Vec<BlockId>,
 }
 
 /// Find the Switch terminators in a function that are worth outlining.
@@ -157,7 +162,7 @@ fn collect_case_blocks(
     all_case_entries: &FxHashSet<BlockId>,
     end_block: BlockId,
     block_map: &FxHashMap<BlockId, usize>,
-) -> Option<Vec<BlockId>> {
+) -> Option<(Vec<BlockId>, Vec<BlockId>)> {
     let entry_idx = *block_map.get(&case_entry)?;
 
     // Collect blocks starting from entry_idx until we hit another case entry.
@@ -208,34 +213,51 @@ fn collect_case_blocks(
     // Rebuild the set after trimming.
     let case_block_set: FxHashSet<BlockId> = case_blocks.iter().copied().collect();
 
-    // Verify: all branch targets must be within the case, to end_block, or returns.
+    // Collect exit blocks: branch targets outside the case that aren't end_block.
+    let mut exit_blocks: Vec<BlockId> = Vec::new();
+    let mut exit_set: FxHashSet<BlockId> = FxHashSet::default();
+
+    let check_target = |target: BlockId, exit_set: &mut FxHashSet<BlockId>, exit_blocks: &mut Vec<BlockId>| -> bool {
+        if target == end_block || case_block_set.contains(&target) {
+            return true;
+        }
+        // Allow branches to external blocks as additional exits.
+        // Limit the number of exits to keep the dispatch manageable.
+        if exit_set.len() < 8 || exit_set.contains(&target) {
+            if exit_set.insert(target) {
+                exit_blocks.push(target);
+            }
+            return true;
+        }
+        false // Too many distinct exit targets
+    };
+
     for &bid in &case_blocks {
         let idx = block_map[&bid];
         let block = &func.blocks[idx];
 
-        let check_target = |target: BlockId| -> bool {
-            target == end_block || case_block_set.contains(&target)
-        };
-
         match &block.terminator {
             Terminator::Branch(target) => {
-                if !check_target(*target) {
-                    return None; // Escaping branch
+                if !check_target(*target, &mut exit_set, &mut exit_blocks) {
+                    return None;
                 }
             }
             Terminator::CondBranch { true_label, false_label, .. } => {
-                if !check_target(*true_label) || !check_target(*false_label) {
-                    return None; // Escaping branch
+                if !check_target(*true_label, &mut exit_set, &mut exit_blocks) {
+                    return None;
+                }
+                if !check_target(*false_label, &mut exit_set, &mut exit_blocks) {
+                    return None;
                 }
             }
             Terminator::Switch { .. } | Terminator::IndirectBranch { .. } => {
-                return None; // Complex control flow, skip
+                return None;
             }
             Terminator::Return(_) | Terminator::Unreachable => {}
         }
     }
 
-    Some(case_blocks)
+    Some((case_blocks, exit_blocks))
 }
 
 /// Find all values used in a set of blocks that are defined outside those blocks.
@@ -478,16 +500,23 @@ fn outline_switch_cases(
         // Analyze each case for outlinability.
         let mut outlinable: Vec<OutlinableCase> = Vec::new();
 
+        let mut skip_block_collect = 0usize;
+        let mut skip_empty = 0usize;
+        let mut skip_small = 0usize;
+        let mut skip_return = 0usize;
+        let mut skip_args = 0usize;
+
         for &(case_value, case_entry) in &switch_info.cases {
             // Collect blocks belonging to this case.
-            let case_blocks = match collect_case_blocks(
+            let (case_blocks, exit_blocks) = match collect_case_blocks(
                 func, case_entry, &all_case_entries, switch_info.end_block, &block_map,
             ) {
-                Some(blocks) => blocks,
-                None => continue, // Complex control flow, skip
+                Some(result) => result,
+                None => { skip_block_collect += 1; continue; }
             };
 
             if case_blocks.is_empty() {
+                skip_empty += 1;
                 continue;
             }
 
@@ -504,28 +533,26 @@ fn outline_switch_cases(
                 .sum();
 
             if instruction_count < MIN_CASE_INSTRUCTIONS {
-                continue; // Too small, not worth the call overhead
+                skip_small += 1;
+                continue;
             }
 
             // Check if any block has a Return terminator.
-            // Skip cases with Return — communicating the return value back
-            // to the parent requires extra infrastructure (pointer arg or matching
-            // return type). Most VdbeExec cases use break/goto, not return.
             let has_return = case_blocks.iter().any(|bid| {
                 block_map.get(bid).map_or(false, |&idx| {
                     matches!(func.blocks[idx].terminator, Terminator::Return(_))
                 })
             });
             if has_return {
+                skip_return += 1;
                 continue;
             }
 
             // Find external values (defined outside the case, used inside).
             let external_values = find_external_values(func, &case_blocks, &block_map);
 
-            // All external values are alloca pointers (Ptr type) — pass them directly.
-            // If there are too many, skip this case.
             if external_values.len() > MAX_OUTLINE_ARGS {
+                skip_args += 1;
                 continue;
             }
 
@@ -535,7 +562,15 @@ fn outline_switch_cases(
                 blocks: case_blocks,
                 external_values,
                 has_return,
+                exit_blocks,
             });
+        }
+
+        if debug {
+            let total = switch_info.cases.len();
+            let outlined = outlinable.len();
+            eprintln!("[OUTLINE]   {} of {} cases outlinable (skip: {} block_collect, {} empty, {} small, {} return, {} args)",
+                outlined, total, skip_block_collect, skip_empty, skip_small, skip_return, skip_args);
         }
 
         if outlinable.is_empty() {
@@ -662,26 +697,43 @@ fn build_outlined_function(
         source_spans: Vec::new(),
     };
 
-    // Build the "return" block (for cases that branch to end_block).
+    // Build return blocks for each exit point.
+    // Return value: 0 = end_block, 1..N = exit_blocks[0..N-1]
+    let has_exits = !case.exit_blocks.is_empty() || case.has_return;
+
+    // Map: exit target → (return value, return block label)
+    let mut exit_label_map: FxHashMap<BlockId, BlockId> = FxHashMap::default();
+
     let ret0_label = BlockId(*global_max_block_id + 1);
     *global_max_block_id += 1;
 
-    let ret_terminator = if case.has_return {
-        // Return 0 = normal break, 1 = parent should return
-        Terminator::Return(Some(Operand::Const(
-            crate::ir::constants::IrConst::I32(0),
-        )))
+    let ret0_terminator = if has_exits {
+        Terminator::Return(Some(Operand::Const(crate::ir::constants::IrConst::I32(0))))
     } else {
-        // Void return — simpler, no return value to check
         Terminator::Return(None)
     };
-
     let ret0_block = BasicBlock {
         label: ret0_label,
         instructions: vec![],
-        terminator: ret_terminator,
+        terminator: ret0_terminator,
         source_spans: Vec::new(),
     };
+
+    // Create return blocks for each exit target.
+    let mut exit_ret_blocks: Vec<BasicBlock> = Vec::new();
+    for (i, &exit_bid) in case.exit_blocks.iter().enumerate() {
+        let ret_label = BlockId(*global_max_block_id + 1);
+        *global_max_block_id += 1;
+        exit_label_map.insert(exit_bid, ret_label);
+        exit_ret_blocks.push(BasicBlock {
+            label: ret_label,
+            instructions: vec![],
+            terminator: Terminator::Return(Some(Operand::Const(
+                crate::ir::constants::IrConst::I32((i + 1) as i32),
+            ))),
+            source_spans: Vec::new(),
+        });
+    }
 
     // Clone and remap case blocks.
     let mut outlined_blocks = vec![entry_block];
@@ -708,6 +760,7 @@ fn build_outlined_function(
             &old_to_new_block,
             end_block,
             ret0_label,
+            &exit_label_map,
         );
 
         outlined_blocks.push(BasicBlock {
@@ -719,6 +772,7 @@ fn build_outlined_function(
     }
 
     outlined_blocks.push(ret0_block);
+    outlined_blocks.extend(exit_ret_blocks);
 
     // Build parameter list.
     let params: Vec<IrParam> = case.external_values.iter()
@@ -733,7 +787,7 @@ fn build_outlined_function(
 
     let next_value_id = param_value_base + num_params as u32 + 2;
 
-    let return_type = if case.has_return { IrType::I32 } else { IrType::Void };
+    let return_type = if has_exits { IrType::I32 } else { IrType::Void };
 
     IrFunction {
         name: name.to_string(),
@@ -980,6 +1034,7 @@ fn remap_terminator(
     old_to_new_block: &FxHashMap<BlockId, BlockId>,
     end_block: BlockId,
     ret0_label: BlockId,
+    exit_label_map: &FxHashMap<BlockId, BlockId>,
 ) -> Terminator {
     let remap_val = |v: Value| -> Value {
         if let Some(&param_idx) = value_to_param.get(&v.0) {
@@ -1001,11 +1056,10 @@ fn remap_terminator(
             ret0_label // Branch to end → return 0
         } else if let Some(&new_bid) = old_to_new_block.get(&bid) {
             new_bid
+        } else if let Some(&exit_ret_label) = exit_label_map.get(&bid) {
+            exit_ret_label // Branch to exit block → return exit index
         } else {
-            // Unmapped block — this case has a branch to a block outside
-            // its collected region. This shouldn't happen if collect_case_blocks
-            // is correct. Fall back to ret0 (treat as break).
-            ret0_label
+            ret0_label // Fallback
         }
     };
 
@@ -1071,9 +1125,11 @@ fn replace_case_with_call(
         .collect();
     let num_args = args.len();
 
-    if case.has_return {
-        // Need to check return value: 0 = break, 1 = return from parent.
-        // Compute fresh value IDs.
+    let has_exits = !case.exit_blocks.is_empty() || case.has_return;
+
+    if has_exits {
+        // The outlined function returns I32: 0 = end_block, 1..N = exit_blocks.
+        // We dispatch on the return value using a Switch terminator.
         let mut max_val: u32 = 0;
         for block in func.blocks.iter() {
             for inst in &block.instructions {
@@ -1085,7 +1141,6 @@ fn replace_case_with_call(
             }
         }
         let call_dest = Value(max_val + 1);
-        let cmp_dest = Value(max_val + 2);
 
         let call_inst = Instruction::Call {
             func: outlined_name.to_string(),
@@ -1106,42 +1161,26 @@ fn replace_case_with_call(
             },
         };
 
-        let ret_check_block = BlockId(*global_max_block_id + 1);
-        *global_max_block_id += 1;
+        // Build Switch cases: 0→end_block, 1..N→exit_blocks
+        let mut switch_cases: Vec<(i64, BlockId)> = Vec::new();
+        for (i, &exit_bid) in case.exit_blocks.iter().enumerate() {
+            switch_cases.push(((i + 1) as i64, exit_bid));
+        }
 
-        let cmp_inst = Instruction::Cmp {
-            dest: cmp_dest,
-            op: crate::ir::reexports::IrCmpOp::Eq,
-            lhs: Operand::Value(call_dest),
-            rhs: Operand::Const(crate::ir::constants::IrConst::I32(0)),
-            ty: IrType::I32,
-        };
-
-        func.blocks[entry_idx].instructions = vec![call_inst, cmp_inst];
-        func.blocks[entry_idx].terminator = Terminator::CondBranch {
-            cond: Operand::Value(cmp_dest),
-            true_label: end_block,
-            false_label: ret_check_block,
-        };
-
-        // Return propagation block — return from parent function.
-        let ret_block = BasicBlock {
-            label: ret_check_block,
-            instructions: vec![],
-            terminator: Terminator::Return(func.blocks.iter()
-                .find_map(|b| {
-                    if let Terminator::Return(Some(op)) = &b.terminator {
-                        Some(Some(op.clone()))
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(None)),
-            source_spans: Vec::new(),
-        };
-        func.blocks.push(ret_block);
+        func.blocks[entry_idx].instructions = vec![call_inst];
+        if switch_cases.is_empty() {
+            // Only has_return, no exit_blocks — just branch to end
+            func.blocks[entry_idx].terminator = Terminator::Branch(end_block);
+        } else {
+            func.blocks[entry_idx].terminator = Terminator::Switch {
+                val: Operand::Value(call_dest),
+                cases: switch_cases,
+                default: end_block, // 0 and any unexpected value → end_block
+                ty: IrType::I32,
+            };
+        }
     } else {
-        // Simple case: void call and branch to end. No return value to check.
+        // Simple case: void call and branch to end.
         let call_inst = Instruction::Call {
             func: outlined_name.to_string(),
             info: CallInfo {
