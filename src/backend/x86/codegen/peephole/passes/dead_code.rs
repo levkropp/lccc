@@ -153,7 +153,7 @@ pub(super) fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]
 pub(super) fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -> bool {
     let mut changed = false;
     let len = store.len();
-    const WINDOW: usize = 16;
+    const WINDOW: usize = 64;
 
     let mut pattern_bytes = [0u8; 24];
 
@@ -269,57 +269,113 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
             i += 1;
             continue;
         }
-        if !matches!(infos[i].kind, LineKind::Push { reg: 5 }) {
-            i += 1;
-            continue;
-        }
 
-        let mut j = next_non_nop(infos, i + 1, len);
-        if j >= len {
-            i = j;
-            continue;
-        }
-        let mov_line = infos[j].trimmed(store.get(j));
-        if mov_line != "movq %rsp, %rbp" {
-            i = j + 1;
-            continue;
-        }
-        j += 1;
+        // Detect function prologue — two forms:
+        // 1. Frame pointer: pushq %rbp + movq %rsp,%rbp + subq $N,%rsp
+        // 2. Frame-pointer-less: subq $N,%rsp (without push %rbp)
+        let body_start;
 
-        j = next_non_nop(infos, j, len);
-        if j >= len {
-            i = j;
-            continue;
-        }
-        let subq_line = infos[j].trimmed(store.get(j));
-        let is_subq = if let Some(rest) = subq_line.strip_prefix("subq $") {
-            rest.strip_suffix(", %rsp").and_then(|v| v.parse::<i64>().ok()).is_some()
-        } else {
-            false
-        };
-        if !is_subq {
-            i = j + 1;
-            continue;
-        }
-        j += 1;
-
-        // Skip callee-saved register saves
-        j = next_non_nop(infos, j, len);
-        let mut callee_save_end = j;
-        while callee_save_end < len {
-            if infos[callee_save_end].is_nop() {
-                callee_save_end += 1;
+        if matches!(infos[i].kind, LineKind::Push { reg: 5 }) {
+            // Form 1: frame pointer prologue
+            let mut j = next_non_nop(infos, i + 1, len);
+            if j >= len {
+                i = j;
                 continue;
             }
-            if let LineKind::StoreRbp { reg, size: MoveSize::Q, .. } = infos[callee_save_end].kind {
-                if is_callee_saved_reg(reg) {
+            let mov_line = infos[j].trimmed(store.get(j));
+            if mov_line != "movq %rsp, %rbp" {
+                i = j + 1;
+                continue;
+            }
+            j += 1;
+
+            j = next_non_nop(infos, j, len);
+            if j >= len {
+                i = j;
+                continue;
+            }
+            let subq_line = infos[j].trimmed(store.get(j));
+            let is_subq = if let Some(rest) = subq_line.strip_prefix("subq $") {
+                rest.strip_suffix(", %rsp").and_then(|v| v.parse::<i64>().ok()).is_some()
+            } else {
+                false
+            };
+            if !is_subq {
+                i = j + 1;
+                continue;
+            }
+            j += 1;
+
+            // Skip callee-saved register saves
+            j = next_non_nop(infos, j, len);
+            let mut callee_save_end = j;
+            while callee_save_end < len {
+                if infos[callee_save_end].is_nop() {
                     callee_save_end += 1;
                     continue;
                 }
+                if let LineKind::StoreRbp { reg, size: MoveSize::Q, .. } = infos[callee_save_end].kind {
+                    if is_callee_saved_reg(reg) {
+                        callee_save_end += 1;
+                        continue;
+                    }
+                }
+                break;
             }
-            break;
+            body_start = callee_save_end;
+        } else {
+            // Form 2: frame-pointer-less prologue (subq $N, %rsp)
+            let line = infos[i].trimmed(store.get(i));
+            let is_subq_rsp = if let Some(rest) = line.strip_prefix("subq $") {
+                rest.strip_suffix(", %rsp").and_then(|v| v.parse::<i64>().ok()).is_some()
+            } else {
+                false
+            };
+            if !is_subq_rsp {
+                i += 1;
+                continue;
+            }
+            // Must be preceded by .cfi_startproc (within 3 lines) to confirm this
+            // is a function prologue and not just a random subq in the middle.
+            let mut found_cfi = false;
+            let check_start = if i >= 3 { i - 3 } else { 0 };
+            for k in check_start..i {
+                if infos[k].is_nop() { continue; }
+                if matches!(infos[k].kind, LineKind::Directive) {
+                    let dl = infos[k].trimmed(store.get(k));
+                    if dl.contains("cfi_startproc") || dl.contains("cfi_def_cfa_offset") {
+                        found_cfi = true;
+                        break;
+                    }
+                }
+            }
+            if !found_cfi {
+                i += 1;
+                continue;
+            }
+
+            // Skip callee-saved register saves after the subq
+            let mut j = next_non_nop(infos, i + 1, len);
+            // Skip .cfi_def_cfa_offset directive if present
+            if j < len && matches!(infos[j].kind, LineKind::Directive) {
+                j = next_non_nop(infos, j + 1, len);
+            }
+            let mut callee_save_end = j;
+            while callee_save_end < len {
+                if infos[callee_save_end].is_nop() {
+                    callee_save_end += 1;
+                    continue;
+                }
+                if let LineKind::StoreRbp { reg, size: MoveSize::Q, .. } = infos[callee_save_end].kind {
+                    if is_callee_saved_reg(reg) {
+                        callee_save_end += 1;
+                        continue;
+                    }
+                }
+                break;
+            }
+            body_start = callee_save_end;
         }
-        let body_start = callee_save_end;
 
         // Find the end of this function
         let mut func_end = len;
