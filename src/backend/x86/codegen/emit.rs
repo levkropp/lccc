@@ -684,28 +684,32 @@ impl X86Codegen {
     /// memory stores for register-allocated values. Values without a register
     /// assignment are stored to their stack slot as before.
     pub(super) fn store_rax_to(&mut self, dest: &Value) {
+        // Use movl (4 bytes) for small-slot values instead of movq (8 bytes).
+        // This saves 1 byte per instruction (no REX prefix) and halves memory bandwidth.
+        // Only safe when all loads of this value also use 32-bit form.
+        let use_small = self.state.is_small_slot(dest.0);
+
         if let Some(&reg) = self.reg_assignments.get(&dest.0) {
             if is_xmm_reg(reg) {
-                // XMM register: movq %rax, %xmmN
                 let reg_name = phys_reg_name(reg);
                 self.state.emit_fmt(format_args!("    movq %rax, %{}", reg_name));
+            } else if use_small {
+                let reg_name = phys_reg_name_32(reg);
+                self.state.emit_fmt(format_args!("    movl %eax, %{}", reg_name));
             } else {
-                // GPR register: movq %rax, %reg
                 let reg_name = phys_reg_name(reg);
                 self.state.out.emit_instr_reg_reg("    movq", "rax", reg_name);
             }
         } else if let Some(slot) = self.state.get_slot(dest.0) {
-            // No register: store to stack slot.
-            self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
+            if use_small {
+                self.state.out.emit_instr_reg_rbp("    movl", "eax", slot.0);
+            } else {
+                self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
+            }
         } else {
-            // Value has neither register nor slot. This can happen when copy
-            // coalescing or immediately-consumed analysis eliminated the slot,
-            // but the accumulator cache gets invalidated before the value is
-            // read. Allocate an emergency spill slot to preserve the value.
             let slot = self.state.allocate_emergency_slot(dest.0);
             self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
         }
-        // After storing to dest, %rax still holds dest's value
         self.state.reg_cache.set_acc(dest.0, false);
     }
 
@@ -1132,6 +1136,16 @@ impl X86Codegen {
             } else if self.state.vector_values.contains(&val.0) {
                 // Vector value: use leaq to get address (vectors are stored directly at slot)
                 self.state.out.emit_instr_rbp_reg("    leaq", slot.0, reg);
+            } else if self.state.is_small_slot(val.0) && (reg == "rax" || reg == "rcx" || reg == "rdx") {
+                // Small-slot value: use movl (4 bytes) — matches store_rax_to's movl.
+                // movl implicitly zero-extends to 64 bits.
+                let reg32 = match reg {
+                    "rax" => "eax",
+                    "rcx" => "ecx",
+                    "rdx" => "edx",
+                    _ => reg,
+                };
+                self.state.out.emit_instr_rbp_reg("    movl", slot.0, reg32);
             } else {
                 self.state.out.emit_instr_rbp_reg("    movq", slot.0, reg);
             }
