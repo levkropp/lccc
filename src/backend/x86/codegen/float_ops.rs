@@ -3,6 +3,7 @@
 use crate::ir::reexports::{IrUnaryOp, Operand, Value};
 use crate::backend::cast::FloatOp;
 use crate::common::types::IrType;
+use super::emit::{phys_reg_name, phys_reg_name_32, is_xmm_reg};
 use super::emit::X86Codegen;
 
 impl X86Codegen {
@@ -85,6 +86,61 @@ impl X86Codegen {
             }
             return;
         }
+        // Register-direct path for integer unary ops when dest has a register.
+        if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128) {
+            if let Some(d_reg) = self.dest_reg(dest) {
+                if !is_xmm_reg(d_reg) {
+                    let use_32bit = matches!(ty, IrType::I32 | IrType::U32);
+                    let d_name = if use_32bit { phys_reg_name_32(d_reg) } else { phys_reg_name(d_reg) };
+                    let suffix = if use_32bit { "l" } else { "q" };
+
+                    match op {
+                        IrUnaryOp::Neg => {
+                            self.operand_to_callee_reg(src, d_reg);
+                            self.state.emit_fmt(format_args!("    neg{} %{}", suffix, d_name));
+                            self.state.reg_cache.invalidate_acc();
+                            return;
+                        }
+                        IrUnaryOp::Not => {
+                            self.operand_to_callee_reg(src, d_reg);
+                            self.state.emit_fmt(format_args!("    not{} %{}", suffix, d_name));
+                            self.state.reg_cache.invalidate_acc();
+                            return;
+                        }
+                        IrUnaryOp::Bswap => {
+                            self.operand_to_callee_reg(src, d_reg);
+                            if matches!(ty, IrType::I16 | IrType::U16) {
+                                // bswap doesn't exist for 16-bit; use rolw
+                                self.state.emit_fmt(format_args!("    rolw $8, %{}", phys_reg_name_32(d_reg)));
+                            } else {
+                                let bswap_name = if use_32bit { phys_reg_name_32(d_reg) } else { phys_reg_name(d_reg) };
+                                let bswap_suffix = if use_32bit { "l" } else { "q" };
+                                self.state.emit_fmt(format_args!("    bswap{} %{}", bswap_suffix, bswap_name));
+                            }
+                            self.state.reg_cache.invalidate_acc();
+                            return;
+                        }
+                        IrUnaryOp::Popcount => {
+                            // popcnt is two-operand: popcnt %src, %dest
+                            if let Some(s_reg) = self.operand_reg(src) {
+                                if !is_xmm_reg(s_reg) {
+                                    let s_name = if use_32bit { phys_reg_name_32(s_reg) } else { phys_reg_name(s_reg) };
+                                    self.state.emit_fmt(format_args!("    popcnt{} %{}, %{}", suffix, s_name, d_name));
+                                    self.state.reg_cache.invalidate_acc();
+                                    return;
+                                }
+                            }
+                            self.operand_to_callee_reg(src, d_reg);
+                            self.state.emit_fmt(format_args!("    popcnt{} %{}, %{}", suffix, d_name, d_name));
+                            self.state.reg_cache.invalidate_acc();
+                            return;
+                        }
+                        _ => {} // Clz, Ctz — complex multi-instruction, fall through to default
+                    }
+                }
+            }
+        }
+
         crate::backend::traits::emit_unaryop_default(self, dest, op, src, ty);
     }
 }

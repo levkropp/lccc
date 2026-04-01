@@ -715,6 +715,41 @@ impl X86Codegen {
             }
         }
 
+        // Register-direct store: when val has a register, store directly to memory
+        // without loading to %rax first. Handles Direct (alloca) and Indirect (ptr) cases.
+        if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128) {
+            if let Operand::Value(v) = val {
+                if let Some(v_reg) = self.reg_assignments.get(&v.0).copied() {
+                    if !is_xmm_reg(v_reg) {
+                        let store_instr = Self::mov_store_for_type(ty);
+                        let v_name = typed_phys_reg_name(v_reg, ty);
+                        let addr = self.state.resolve_slot_addr(base.0);
+                        match addr {
+                            Some(SlotAddr::Direct(slot)) => {
+                                let folded_slot = StackSlot(slot.0 + offset);
+                                let sr = self.slot_ref(folded_slot.0);
+                                self.state.emit_fmt(format_args!("    {} %{}, {}", store_instr, v_name, sr));
+                                return;
+                            }
+                            Some(SlotAddr::Indirect(_slot)) => {
+                                if let Some(&b_reg) = self.reg_assignments.get(&base.0) {
+                                    let b_name = phys_reg_name(b_reg);
+                                    if offset != 0 {
+                                        self.state.emit_fmt(format_args!("    {} %{}, {}(%{})", store_instr, v_name, offset, b_name));
+                                    } else {
+                                        self.state.emit_fmt(format_args!("    {} %{}, (%{})", store_instr, v_name, b_name));
+                                    }
+                                    return;
+                                }
+                                // base not in register — fall through to load base to %rcx
+                            }
+                            _ => {} // fall through
+                        }
+                    }
+                }
+            }
+        }
+
         // Default GEP fold logic.
         self.operand_to_rax(val);
         let addr = self.state.resolve_slot_addr(base.0);
