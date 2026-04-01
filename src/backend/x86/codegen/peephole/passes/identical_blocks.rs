@@ -19,9 +19,19 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
 
     // Phase 1: Find all labels and their block boundaries.
     // A block starts at a label and ends at the next label, ret, or end.
-    let mut blocks: Vec<(usize, usize, String)> = Vec::new(); // (start_line, end_line, label_name)
+    // Each block also records which function it belongs to (index into function_starts)
+    // so that we only merge blocks within the same function.
+    let mut blocks: Vec<(usize, usize, String, u32)> = Vec::new(); // (start_line, end_line, label_name, func_id)
+    let mut current_func_id: u32 = 0;
     let mut i = 0;
     while i < len {
+        // Detect function boundaries: .cfi_startproc marks a new function.
+        if infos[i].kind == LineKind::Directive {
+            let line = infos[i].trimmed(store.get(i));
+            if line == ".cfi_startproc" {
+                current_func_id += 1;
+            }
+        }
         if infos[i].kind == LineKind::Label {
             let label = infos[i].trimmed(store.get(i));
             if let Some(label_name) = label.strip_suffix(':') {
@@ -36,7 +46,7 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
                         if infos[end].kind == LineKind::Directive { break; }
                         end += 1;
                     }
-                    blocks.push((start, end, label_name.to_string()));
+                    blocks.push((start, end, label_name.to_string(), current_func_id));
                     i = end;
                     continue;
                 }
@@ -48,9 +58,11 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
     if blocks.len() < 2 { return false; }
 
     // Phase 2: Hash each block's content (excluding the label itself).
-    // Two blocks are identical if they have the same instruction sequence.
-    let mut block_hashes: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
-    for (idx, &(start, end, _)) in blocks.iter().enumerate() {
+    // Two blocks are identical if they have the same instruction sequence
+    // AND belong to the same function.
+    // Key: (content_hash, func_id) → blocks can only merge within a function.
+    let mut block_hashes: FxHashMap<(u64, u32), Vec<usize>> = FxHashMap::default();
+    for (idx, &(start, end, _, func_id)) in blocks.iter().enumerate() {
         // Build content string for hashing (skip NOPs and the label line itself)
         let mut hasher = 0u64;
         let mut instr_count = 0u32;
@@ -67,7 +79,7 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
         // Only consider blocks with >= 4 instructions (worth merging)
         if instr_count >= 4 {
             hasher ^= instr_count as u64;
-            block_hashes.entry(hasher).or_default().push(idx);
+            block_hashes.entry((hasher, func_id)).or_default().push(idx);
         }
     }
 
@@ -76,13 +88,13 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
     let mut changed = false;
     let mut redirects: FxHashMap<String, String> = FxHashMap::default(); // old_label → canonical_label
 
-    for (_hash, group) in &block_hashes {
+    for ((_hash, _func_id), group) in &block_hashes {
         if group.len() < 2 { continue; }
 
         // Verify all blocks in the group are truly identical.
         // Compare instruction-by-instruction against the first block.
         let canonical_idx = group[0];
-        let (can_start, can_end, _) = &blocks[canonical_idx];
+        let (can_start, can_end, _, _) = &blocks[canonical_idx];
 
         // Collect canonical block's instruction texts
         let canonical_instrs: Vec<String> = ((*can_start + 1)..*can_end)
@@ -91,7 +103,7 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
             .collect();
 
         for &other_idx in &group[1..] {
-            let (other_start, other_end, ref other_label) = blocks[other_idx];
+            let (other_start, other_end, ref other_label, _) = blocks[other_idx];
 
             let other_instrs: Vec<String> = ((other_start + 1)..other_end)
                 .filter(|&j| !infos[j].is_nop())
@@ -100,7 +112,7 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
 
             if canonical_instrs == other_instrs {
                 // Truly identical! Redirect branches to other_label → canonical_label.
-                let (_, _, ref canonical_label) = blocks[canonical_idx];
+                let (_, _, ref canonical_label, _) = blocks[canonical_idx];
                 redirects.insert(other_label.clone(), canonical_label.clone());
 
                 // NOP out the duplicate block

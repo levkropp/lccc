@@ -28,6 +28,7 @@ mod resolve_asm;
 pub(crate) mod simplify;
 pub(crate) mod loop_unroll;
 pub(crate) mod tail_call_elim;
+pub(crate) mod outline_switch;
 pub(crate) mod recursion_to_iter;
 pub(crate) mod vectorize;
 
@@ -280,6 +281,15 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
 
     run_inline_phase(module, &disabled);
     constant_fold::resolve_remaining_is_constant(module);
+
+    // Switch case outlining: extract case bodies from large switch statements
+    // (like SQLite's VdbeExec with 170+ cases) into separate functions.
+    // Runs after inlining so we see the final function sizes, and before all
+    // other passes so the smaller outlined functions benefit from the full
+    // optimization pipeline. Pass name for CCC_DISABLE_PASSES: "outline"
+    if !disabled.contains("outline") {
+        outline_switch::run(module);
+    }
 
     // Tail-call-to-loop transformation.
     // Converts self-recursive tail calls into back-edge branches before the
