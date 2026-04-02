@@ -232,6 +232,11 @@ pub struct CodegenState {
     /// Whether to emit CFI directives (.cfi_startproc, .cfi_endproc, etc.)
     /// for generating .eh_frame unwind tables. Enabled by default (like GCC).
     pub emit_cfi: bool,
+    /// Values that are consumed by the very next instruction and have no other
+    /// uses. These values can stay in the accumulator register cache without
+    /// being stored to a stack slot. Populated during stack layout; used by
+    /// store_rax_to / store_eax_to to skip the store.
+    pub immediately_consumed: FxHashSet<u32>,
 }
 
 impl CodegenState {
@@ -282,6 +287,7 @@ impl CodegenState {
             data_sections: false,
             needs_divdi3_helpers: false,
             emit_cfi: true,
+            immediately_consumed: FxHashSet::default(),
         }
     }
 

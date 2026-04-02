@@ -706,6 +706,9 @@ impl X86Codegen {
             } else {
                 self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
             }
+        } else if self.state.immediately_consumed.contains(&dest.0) {
+            // Value is consumed by the very next instruction — skip the store.
+            // The accumulator cache (set below) ensures the consumer finds it in %rax.
         } else {
             let slot = self.state.allocate_emergency_slot(dest.0);
             self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
@@ -1487,8 +1490,26 @@ impl X86Codegen {
         let rhs_phys = self.operand_reg(rhs);
         let rhs_conflicts = rhs_phys.is_some_and(|r| r.0 == dest_phys.0);
         let (rhs_reg_name, rhs_reg_name_32): (String, String) = if rhs_conflicts {
-            self.operand_to_rax(rhs);
-            self.operand_to_callee_reg(lhs, dest_phys);
+            // rhs is in dest register — we need to save rhs to %rax before loading lhs.
+            // But if lhs is in the accumulator cache, we must save it to dest first,
+            // because operand_to_rax(rhs) would clobber %rax.
+            let lhs_in_acc = match lhs {
+                Operand::Value(v) => {
+                    let is_alloca = self.state.is_alloca(v.0);
+                    self.state.reg_cache.acc_has(v.0, is_alloca)
+                }
+                _ => false,
+            };
+            if lhs_in_acc {
+                // LHS is in %rax — save it to dest first, then copy rhs (from dest) to %rax
+                self.state.out.emit_instr_reg_reg("    movq", "rax", dest_name);
+                let rhs_name = phys_reg_name(rhs_phys.unwrap());
+                self.state.out.emit_instr_reg_reg("    movq", rhs_name, "rax");
+                self.state.reg_cache.invalidate_acc();
+            } else {
+                self.operand_to_rax(rhs);
+                self.operand_to_callee_reg(lhs, dest_phys);
+            }
             ("rax".to_string(), "eax".to_string())
         } else {
             self.operand_to_callee_reg(lhs, dest_phys);
