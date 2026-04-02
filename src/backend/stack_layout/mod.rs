@@ -253,6 +253,10 @@ pub fn calculate_stack_space_common(
     // resolve_slot_addr can return a dummy Indirect slot for them.
     state.reg_assigned_values = reg_assigned.keys().copied().collect();
 
+    // Propagate the immediately-consumed set to CodegenState so that
+    // store_rax_to / store_eax_to can skip the store for these values.
+    state.immediately_consumed = ctx.immediately_consumed.clone();
+
     // Phase 2: Classify all instructions into the three tiers.
     let mut non_local_space = initial_offset;
     let mut deferred_slots: Vec<DeferredSlot> = Vec::new();

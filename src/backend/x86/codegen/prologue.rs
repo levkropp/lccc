@@ -179,7 +179,7 @@ impl X86Codegen {
             let alloc = (alloc_size + 7) & !7;
             let new_space = ((space + alloc + effective_align - 1) / effective_align) * effective_align;
             (-new_space, new_space)
-        }, &reg_assigned, &X86_CALLEE_SAVED, cached_liveness, false);
+        }, &reg_assigned, &X86_CALLEE_SAVED, cached_liveness, true);
 
         // Allocate spill slots for Phase 2b caller-saved-spanning registers.
         self.caller_save_spill_slots.clear();
@@ -234,32 +234,37 @@ impl X86Codegen {
         let used_regs = self.used_callee_saved.clone();
 
         if omit_fp {
-            // Frame-pointer-less prologue: allocate entire frame with subq,
-            // then save callee-saved registers into the frame using movq.
-            // Stack layout (RSP-relative):
-            //   [return addr]  ← old RSP
-            //   [callee saves] ← top of frame
-            //   [local vars]   ← RSP points here after subq
-            if frame_size > 0 {
-                self.state.out.emit_instr_imm_reg("    subq", frame_size, "rsp");
-                if self.state.emit_cfi {
-                    self.state.emit_fmt(format_args!("    .cfi_def_cfa_offset {}", frame_size + 8));
+            // Frame-pointer-less prologue.
+            // Use compact push/pop encoding when all saved registers are true
+            // callee-saved (rbx=1, r12=2, r13=3, r14=4, r15=5, rbp=6).
+            // Functions with caller-saved registers (from Phase 2/2b regalloc)
+            // use the original movq approach to avoid stack layout complications.
+            let all_callee_saved = used_regs.iter().all(|r| r.0 >= 1 && r.0 <= 6);
+            let n_saves = used_regs.len() as i64;
+            let use_push_pop = n_saves > 0 && all_callee_saved;
+
+            if use_push_pop {
+                for &reg in &used_regs {
+                    let reg_name = phys_reg_name(reg);
+                    self.state.emit_fmt(format_args!("    pushq %{}", reg_name));
+                }
+                let local_size = frame_size - n_saves * 8;
+                if local_size > 0 {
+                    self.state.out.emit_instr_imm_reg("    subq", local_size, "rsp");
+                }
+            } else {
+                if frame_size > 0 {
+                    self.state.out.emit_instr_imm_reg("    subq", frame_size, "rsp");
+                }
+                for (i, &reg) in used_regs.iter().enumerate() {
+                    let reg_name = phys_reg_name(reg);
+                    let rsp_offset = frame_size - (i as i64 + 1) * 8;
+                    self.state.emit_fmt(format_args!("    movq %{}, {}(%rsp)", reg_name, rsp_offset));
                 }
             }
-            // Save callee-saved registers at the same offsets the push prologue
-            // would use: -8(%rbp), -16(%rbp), etc. These translate to
-            // (frame_size-8)(%rsp), (frame_size-16)(%rsp), etc.
-            // These offsets overlap with the stack layout's register-allocated
-            // value slots, which is correct — the stack layout assigned those
-            // slots to the callee-saved-register values, so writing the register
-            // value there is the intended initialization.
-            for (i, &reg) in used_regs.iter().enumerate() {
-                let reg_name = phys_reg_name(reg);
-                let rbp_offset = -((i as i64 + 1) * 8);
-                let rsp_offset = frame_size + rbp_offset;
-                self.state.emit_fmt(format_args!("    movq %{}, {}(%rsp)", reg_name, rsp_offset));
+            if self.state.emit_cfi {
+                self.state.emit_fmt(format_args!("    .cfi_def_cfa_offset {}", frame_size + 8));
             }
-            // Set AsmOutput to use RSP-relative addressing
             self.state.out.use_rsp_addressing = true;
             self.state.out.rsp_frame_size = frame_size;
         } else {
@@ -326,14 +331,27 @@ impl X86Codegen {
         let omit_fp = self.state.omit_frame_pointer && !self.state.func_is_variadic;
 
         if omit_fp {
-            // Frame-pointer-less epilogue: restore callee-saved regs from stack, then addq
-            for (i, &reg) in used_regs.iter().enumerate() {
-                let reg_name = phys_reg_name(reg);
-                let offset = frame_size - (i as i64 + 1) * 8;
-                self.state.emit_fmt(format_args!("    movq {}(%rsp), %{}", offset, reg_name));
-            }
-            if frame_size > 0 {
-                self.state.out.emit_instr_imm_reg("    addq", frame_size, "rsp");
+            let all_callee_saved = used_regs.iter().all(|r| r.0 >= 1 && r.0 <= 6);
+            let use_push_pop = num_saved > 0 && all_callee_saved;
+
+            if use_push_pop {
+                let local_size = frame_size - num_saved * 8;
+                if local_size > 0 {
+                    self.state.out.emit_instr_imm_reg("    addq", local_size, "rsp");
+                }
+                for &reg in used_regs.iter().rev() {
+                    let reg_name = phys_reg_name(reg);
+                    self.state.emit_fmt(format_args!("    popq %{}", reg_name));
+                }
+            } else {
+                for (i, &reg) in used_regs.iter().enumerate() {
+                    let reg_name = phys_reg_name(reg);
+                    let offset = frame_size - (i as i64 + 1) * 8;
+                    self.state.emit_fmt(format_args!("    movq {}(%rsp), %{}", offset, reg_name));
+                }
+                if frame_size > 0 {
+                    self.state.out.emit_instr_imm_reg("    addq", frame_size, "rsp");
+                }
             }
         } else {
             // Traditional epilogue: restore from pushes, then popq %rbp

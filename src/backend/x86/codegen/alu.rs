@@ -90,28 +90,46 @@ impl X86Codegen {
             return;
         }
 
-        // Memory-destination add: for in-place updates (a += expr) where dest/lhs share
-        // a stack slot and rhs is in a register. Emits `addl %reg, mem` which does NOT
-        // modify any register — breaks the serial %rax dependency chain for ILP.
-        // This is the key optimization for arith_loop: consecutive updates become
-        // independent since they no longer serialize through %rax.
-        if op == IrBinOp::Add {
+        // Memory-destination ALU: for in-place updates (a op= expr) where dest/lhs share
+        // a stack slot. Emits `op %reg, mem` or `op $imm, mem` which does NOT modify
+        // any register — breaks the serial %rax dependency chain for ILP.
+        // Works for Add, Sub, And, Or, Xor (all have reg/imm-to-memory forms on x86).
+        let mem_dest_mnem = match op {
+            IrBinOp::Add => Some("add"),
+            IrBinOp::Sub => Some("sub"),
+            IrBinOp::And => Some("and"),
+            IrBinOp::Or  => Some("or"),
+            IrBinOp::Xor => Some("xor"),
+            _ => None,
+        };
+        if let Some(mnem) = mem_dest_mnem {
             if let Operand::Value(lhs_val) = lhs {
                 if self.dest_reg(dest).is_none() && self.dest_reg(lhs_val).is_none() {
                     if let (Some(dest_slot), Some(lhs_slot)) =
                         (self.state.get_slot(dest.0), self.state.get_slot(lhs_val.0))
                     {
                         if dest_slot.0 == lhs_slot.0 {
+                            let sref = self.slot_ref(dest_slot.0);
+                            // Try register source: op %reg, mem
                             if let Some(rhs_phys) = self.operand_reg(rhs) {
-                                let sref = self.slot_ref(dest_slot.0);
                                 if use_32bit {
                                     let rhs_32 = super::emit::phys_reg_name_32(rhs_phys);
-                                    self.state.emit_fmt(format_args!("    addl %{}, {}", rhs_32, sref));
+                                    self.state.emit_fmt(format_args!("    {}l %{}, {}", mnem, rhs_32, sref));
                                 } else {
                                     let rhs_64 = super::emit::phys_reg_name(rhs_phys);
-                                    self.state.emit_fmt(format_args!("    addq %{}, {}", rhs_64, sref));
+                                    self.state.emit_fmt(format_args!("    {}q %{}, {}", mnem, rhs_64, sref));
                                 }
-                                // NO cache invalidation — addl %reg,mem doesn't modify any register
+                                // NO cache invalidation — op %reg,mem doesn't modify any register
+                                return;
+                            }
+                            // Try immediate source: op $imm, mem
+                            if let Some(imm) = Self::const_as_imm32(rhs) {
+                                if use_32bit {
+                                    self.state.emit_fmt(format_args!("    {}l ${}, {}", mnem, imm, sref));
+                                } else {
+                                    self.state.emit_fmt(format_args!("    {}q ${}, {}", mnem, imm, sref));
+                                }
+                                // NO cache invalidation — op $imm,mem doesn't modify any register
                                 return;
                             }
                         }
