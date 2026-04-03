@@ -67,6 +67,7 @@ use crate::ir::reexports::{
     AtomicOrdering,
     AtomicRmwOp,
     BlockId,
+    Instruction,
     IntrinsicOp,
     IrBinOp,
     IrCmpOp,
@@ -170,6 +171,18 @@ pub trait ArchCodegen {
             }
         }
     }
+
+    /// Try to lower an IR instruction to the MachInst pipeline (virtual register ISel).
+    /// Returns true if the instruction was handled by MachInst (accumulated in an
+    /// internal buffer). Returns false if the instruction should use the default
+    /// accumulator-based codegen path.
+    /// Default: always false (no MachInst support).
+    fn try_lower_machinst(&mut self, _inst: &Instruction) -> bool { false }
+
+    /// Flush the accumulated MachInst buffer: run register allocation and emit assembly.
+    /// Called at block boundaries and before instructions that can't be lowered to MachInst.
+    /// Default: no-op.
+    fn flush_machinst(&mut self) {}
 
     /// Get the physical register assigned to a value, if any.
     /// Returns None when the value is stack-allocated or not register-assigned.

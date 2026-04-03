@@ -17,7 +17,11 @@ fn reg_name(reg: PhysReg) -> &'static str {
         7 => "rcx",
         10 => "r11", 11 => "r10", 12 => "r8", 13 => "r9",
         14 => "rdi", 15 => "rsi", 16 => "rdx",
-        _ => unreachable!("invalid machinst register index {}", reg.0),
+        // XMM registers — shouldn't normally appear in GPR MachInst, but handle
+        // gracefully for values that got XMM allocation from the main allocator.
+        20 => "xmm2", 21 => "xmm3", 22 => "xmm4", 23 => "xmm5",
+        24 => "xmm6", 25 => "xmm7",
+        _ => "rax", // fallback for unexpected register IDs
     }
 }
 

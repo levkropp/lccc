@@ -1103,9 +1103,23 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
                 }
             }
 
+            // Try MachInst pipeline first (virtual register ISel).
+            // If the instruction is handled, it's accumulated in the MachInst buffer.
+            // When an unhandled instruction is encountered, the buffer is flushed
+            // (allocated and emitted) before falling through to the default codegen.
+            if cg.try_lower_machinst(inst) {
+                cg.state().current_program_point += 1;
+                continue;
+            }
+            // Flush any accumulated MachInst buffer before emitting via default path
+            cg.flush_machinst();
+
             generate_instruction(cg, inst, &gep_fold_map, &global_addr_map, &global_addr_ptr_set, &dead_global_addrs);
             cg.state().current_program_point += 1;
         }
+
+        // Flush MachInst buffer at end of block (before terminator)
+        cg.flush_machinst();
 
         if let Some(fi) = fuse_idx {
             // Emit fused compare-and-branch: cmp + jCC directly
