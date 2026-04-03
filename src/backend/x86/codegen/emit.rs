@@ -258,6 +258,11 @@ pub struct X86Codegen {
     /// Maps PhysReg ID → list of (start, end) program points.
     /// At each call, only save registers with an interval containing the call point.
     pub(super) caller_save_intervals: FxHashMap<u8, Vec<(u32, u32)>>,
+    /// MachInst buffer for virtual register ISel. Instructions are accumulated
+    /// here by try_lower_machinst and flushed (allocated + emitted) by flush_machinst.
+    pub(super) machinst_buf: Vec<super::machinst::MachInst>,
+    /// Whether MachInst ISel is enabled (CCC_USE_MACHINST env var).
+    pub(super) machinst_enabled: bool,
 }
 
 /// Information about an IVSR-transformed pointer induction variable
@@ -296,6 +301,8 @@ impl X86Codegen {
             param_source_regs: FxHashMap::default(),
             caller_save_spill_slots: FxHashMap::default(),
             caller_save_intervals: FxHashMap::default(),
+            machinst_buf: Vec::new(),
+            machinst_enabled: std::env::var("CCC_USE_MACHINST").is_ok(),
         }
     }
 
@@ -1668,6 +1675,40 @@ impl X86Codegen {
 pub(super) const X86_ARG_REGS: [&str; 6] = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
 
 
+/// Check if a MachInst contains any virtual registers that don't have
+/// register assignments (would produce `%vregN` in the output).
+fn has_unresolvable_vreg(inst: &super::machinst::MachInst, ra: &FxHashMap<u32, PhysReg>) -> bool {
+    use super::machinst::{MachInst, MachReg, MachOperand};
+    let check_reg = |r: &MachReg| -> bool {
+        if let MachReg::Vreg(id) = r { !ra.contains_key(id) } else { false }
+    };
+    let check_op = |o: &MachOperand| -> bool {
+        match o {
+            MachOperand::Reg(r) => check_reg(r),
+            MachOperand::Mem { base, .. } => check_reg(base),
+            MachOperand::MemIndex { base, index, .. } => check_reg(base) || check_reg(index),
+            _ => false,
+        }
+    };
+    match inst {
+        MachInst::Mov { src, dst, .. } => check_op(src) || check_op(dst),
+        MachInst::Alu { src, dst, .. } => check_op(src) || check_reg(dst),
+        MachInst::Imul3 { src, dst, .. } => check_reg(src) || check_reg(dst),
+        MachInst::Neg { dst, .. } | MachInst::Not { dst, .. } => check_reg(dst),
+        MachInst::Shift { amount, dst, .. } => check_op(amount) || check_reg(dst),
+        MachInst::Lea { base, index, dst, .. } => {
+            check_reg(base) || index.as_ref().map_or(false, |(r, _)| check_reg(r)) || check_reg(dst)
+        }
+        MachInst::Div { divisor, .. } => check_op(divisor),
+        MachInst::Cmp { lhs, rhs, .. } | MachInst::Test { lhs, rhs, .. } => check_op(lhs) || check_op(rhs),
+        MachInst::SetCC { dst, .. } => check_reg(dst),
+        MachInst::Movzx { src, dst, .. } | MachInst::Movsx { src, dst, .. } => check_reg(src) || check_reg(dst),
+        MachInst::Cmov { src, dst, .. } => check_op(src) || check_reg(dst),
+        MachInst::CallIndirect { reg, .. } => check_reg(reg),
+        _ => false,
+    }
+}
+
 impl ArchCodegen for X86Codegen {
     fn state(&mut self) -> &mut CodegenState { &mut self.state }
     fn state_ref(&self) -> &CodegenState { &self.state }
@@ -1675,6 +1716,70 @@ impl ArchCodegen for X86Codegen {
 
     fn get_phys_reg_for_value(&self, val_id: u32) -> Option<PhysReg> {
         self.reg_assignments.get(&val_id).copied()
+    }
+
+    fn try_lower_machinst(&mut self, inst: &crate::ir::reexports::Instruction) -> bool {
+        if !self.machinst_enabled { return false; }
+        // Only lower instructions where all Value operands have register
+        // assignments. Stack-only values would become unresolvable vregs.
+        use crate::backend::liveness::for_each_operand_in_instruction;
+        let ra = &self.reg_assignments;
+        let state = &self.state;
+        let mut all_regged = true;
+        for_each_operand_in_instruction(inst, |op| {
+            if let crate::ir::reexports::Operand::Value(v) = op {
+                if !ra.contains_key(&v.0) && !state.is_alloca(v.0) {
+                    all_regged = false;
+                }
+            }
+        });
+        // Also check the dest — if it has no register, the result would be an
+        // unresolvable vreg. Only lower instructions where dest IS register-allocated.
+        if let Some(dest) = inst.dest() {
+            if !ra.contains_key(&dest.0) {
+                all_regged = false;
+            }
+        }
+        if !all_regged { return false; }
+        let buf_start = self.machinst_buf.len();
+        let ok = super::isel::lower_instruction(inst, &self.reg_assignments, &mut self.machinst_buf);
+        if !ok { return false; }
+        // Safety check: verify no unresolvable vregs were produced.
+        // If any vreg in the new instructions doesn't have a register assignment,
+        // it would appear as %vregN in the output. Roll back and fall through.
+        let has_bad_vreg = self.machinst_buf[buf_start..].iter().any(|mi| {
+            has_unresolvable_vreg(mi, &self.reg_assignments)
+        });
+        if has_bad_vreg {
+            self.machinst_buf.truncate(buf_start);
+            return false;
+        }
+        true
+    }
+
+    fn flush_machinst(&mut self) {
+        if self.machinst_buf.is_empty() { return; }
+
+        // Allocate registers for the accumulated MachInst buffer
+        let alloc_result = super::machinst_regalloc::allocate_machinsts(
+            &self.machinst_buf,
+            super::machinst::MACHINST_ALLOCATABLE_GPRS,
+        );
+
+        // Rewrite virtual registers to physical registers (with spill insertion)
+        let allocated = super::machinst_regalloc::rewrite_machinsts(
+            &self.machinst_buf,
+            &alloc_result,
+        );
+
+        // Emit allocated instructions as assembly
+        super::machinst_emit::emit_machinsts(&allocated, &mut self.state.out);
+
+        // Clear the buffer for the next sequence
+        self.machinst_buf.clear();
+
+        // Invalidate register cache since MachInst may have changed register contents
+        self.state.reg_cache.invalidate_all();
     }
 
     fn emit_reg_to_reg_move(&mut self, src: PhysReg, dest: PhysReg) {
