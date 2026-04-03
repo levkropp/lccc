@@ -16,3 +16,5 @@ mod returns;
 mod atomics;
 mod i128_ops;
 mod float_ops;
+pub(crate) mod machinst;
+pub(crate) mod isel;
