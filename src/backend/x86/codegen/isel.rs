@@ -109,14 +109,29 @@ fn emit_mov_operand(op: &Operand, dst: MachReg, size: OpSize, out: &mut Vec<Mach
 }
 
 /// Emit an ALU instruction with an IR Operand as source.
+/// For large immediates that don't fit in i32, materialize to rax first.
 fn emit_alu_operand_r(op: AluOp, src: &Operand, dst: MachReg, size: OpSize,
                       ra: &FxHashMap<u32, PhysReg>, out: &mut Vec<MachInst>) {
-    out.push(MachInst::Alu {
-        op,
-        src: lower_operand_with_regs(src, ra),
-        dst,
-        size,
-    });
+    let src_op = lower_operand_with_regs(src, ra);
+    // x86 ALU instructions only support i32 immediates. For larger values,
+    // materialize to the scratch register (rax) first.
+    if let MachOperand::Imm(v) = &src_op {
+        if *v < i32::MIN as i64 || *v > i32::MAX as i64 {
+            out.push(MachInst::Mov {
+                src: MachOperand::Imm(*v),
+                dst: MachOperand::Reg(MachReg::Phys(RAX)),
+                size,
+            });
+            out.push(MachInst::Alu {
+                op,
+                src: MachOperand::Reg(MachReg::Phys(RAX)),
+                dst,
+                size,
+            });
+            return;
+        }
+    }
+    out.push(MachInst::Alu { op, src: src_op, dst, size });
 }
 
 /// Map IrBinOp to AluOp for simple two-address operations.
@@ -535,6 +550,9 @@ pub fn lower_instruction(
     match inst {
         Instruction::BinOp { dest, op, lhs, rhs, ty } => {
             if ty.is_float() || ty.is_128bit() { return false; }
+            // Only handle I32/U32/I64/U64/Ptr — sub-32-bit types have complex
+            // register sub-register interactions that need special handling.
+            if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) { return false; }
             lower_binop(dest, *op, lhs, rhs, *ty, ra, out);
             true
         }
@@ -563,6 +581,7 @@ pub fn lower_instruction(
         }
         Instruction::UnaryOp { dest, op, src, ty } => {
             if ty.is_float() || ty.is_128bit() { return false; }
+            if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) { return false; }
             lower_unaryop(dest, *op, src, *ty, ra, out)
         }
         Instruction::Select { dest, cond, true_val, false_val, ty } => {

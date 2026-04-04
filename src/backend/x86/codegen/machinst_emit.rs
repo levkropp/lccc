@@ -199,6 +199,20 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
                     return;
                 }
             }
+            // Large immediates (>i32): use movabsq for register dest,
+            // or relay through rax for memory dest.
+            if let MachOperand::Imm(v) = src {
+                if *v < i32::MIN as i64 || *v > i32::MAX as i64 {
+                    if let MachOperand::Reg(MachReg::Phys(r)) = dst {
+                        out.emit_fmt(format_args!("    movabsq ${}, %{}", v, reg_name(*r)));
+                    } else {
+                        // movq $large_imm, mem needs rax relay
+                        out.emit_fmt(format_args!("    movabsq ${}, %rax", v));
+                        out.emit_fmt(format_args!("    movq %rax, {}", dst_str));
+                    }
+                    return;
+                }
+            }
             out.emit_fmt(format_args!("    mov{} {}, {}", suffix, src_str, dst_str));
         }
 
