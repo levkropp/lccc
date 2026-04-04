@@ -663,10 +663,16 @@ impl X86Codegen {
                 if self.state.reg_cache.acc_has(v.0, is_alloca) {
                     return;
                 }
+                // Check secondary cache: if value is in %rcx, use movq %rcx, %rax
+                // (3 bytes) instead of loading from stack (7-8 bytes)
+                if self.state.reg_cache.sec_has(v.0, is_alloca) {
+                    self.state.out.emit_instr_reg_reg("    movq", "rcx", "rax");
+                    self.state.reg_cache.set_acc(v.0, is_alloca);
+                    return;
+                }
                 // Check register allocation: load from assigned register
                 if let Some(&reg) = self.reg_assignments.get(&v.0) {
                     if is_xmm_reg(reg) {
-                        // XMM register: movq %xmmN, %rax (move 64-bit value from XMM to GPR)
                         let reg_name = phys_reg_name(reg);
                         self.state.emit_fmt(format_args!("    movq %{}, %rax", reg_name));
                     } else {
@@ -1019,6 +1025,7 @@ impl X86Codegen {
     pub(super) fn operand_to_rcx(&mut self, op: &Operand) {
         match op {
             Operand::Const(c) => {
+                self.state.reg_cache.invalidate_sec();
                 match c {
                     IrConst::I8(v) if *v == 0 => self.state.emit("    xorl %ecx, %ecx"),
                     IrConst::I16(v) if *v == 0 => self.state.emit("    xorl %ecx, %ecx"),
@@ -1072,6 +1079,12 @@ impl X86Codegen {
                 }
             }
             Operand::Value(v) => {
+                let is_alloca = self.state.is_alloca(v.0);
+                // Check if already in %rcx (sec cache hit)
+                if self.state.reg_cache.sec_has(v.0, is_alloca) {
+                    // Already in %rcx — nothing to do
+                    return;
+                }
                 // Check register allocation: load from callee-saved register
                 if let Some(&reg) = self.reg_assignments.get(&v.0) {
                     let reg_name = phys_reg_name(reg);
@@ -1083,6 +1096,8 @@ impl X86Codegen {
                 } else {
                     self.state.emit("    xorl %ecx, %ecx");
                 }
+                // Record what's now in %rcx
+                self.state.reg_cache.set_sec(v.0, is_alloca);
             }
         }
     }

@@ -901,6 +901,7 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_load_ptr_from_slot_impl(&mut self, slot: StackSlot, val_id: u32) {
+        self.state.reg_cache.invalidate_sec(); // clobbers %rcx
         if let Some(&reg) = self.reg_assignments.get(&val_id) {
             let reg_name = phys_reg_name(reg);
             self.state.out.emit_instr_reg_reg("    movq", reg_name, "rcx");
@@ -937,6 +938,7 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_slot_addr_to_secondary_impl(&mut self, slot: StackSlot, is_alloca: bool, val_id: u32) {
+        self.state.reg_cache.invalidate_sec(); // clobbers %rcx
         if is_alloca {
             self.emit_alloca_addr_to("rcx", val_id, slot.0);
         } else if let Some(&reg) = self.reg_assignments.get(&val_id) {

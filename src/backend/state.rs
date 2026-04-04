@@ -44,8 +44,12 @@ pub struct RegCacheEntry {
 /// - RISC-V: acc = t0,    sec = t1
 #[derive(Debug, Default)]
 pub struct RegCache {
-    /// Which value is currently in the primary accumulator register.
+    /// Which value is currently in the primary accumulator register (%rax on x86).
     pub acc: Option<RegCacheEntry>,
+    /// Which value is currently in the secondary register (%rcx on x86).
+    /// Tracked so that operand_to_rax can use `movq %rcx, %rax` instead of
+    /// a stack reload when the value was recently loaded to %rcx.
+    pub sec: Option<RegCacheEntry>,
 }
 
 impl RegCache {
@@ -55,10 +59,22 @@ impl RegCache {
         self.acc = Some(RegCacheEntry { value_id, is_alloca });
     }
 
+    /// Record that the secondary register now holds the given value.
+    #[inline]
+    pub fn set_sec(&mut self, value_id: u32, is_alloca: bool) {
+        self.sec = Some(RegCacheEntry { value_id, is_alloca });
+    }
+
     /// Check if the accumulator holds the given value (with matching alloca status).
     #[inline]
     pub fn acc_has(&self, value_id: u32, is_alloca: bool) -> bool {
         self.acc == Some(RegCacheEntry { value_id, is_alloca })
+    }
+
+    /// Check if the secondary register holds the given value.
+    #[inline]
+    pub fn sec_has(&self, value_id: u32, is_alloca: bool) -> bool {
+        self.sec == Some(RegCacheEntry { value_id, is_alloca })
     }
 
     /// Invalidate the accumulator cache.
@@ -67,11 +83,18 @@ impl RegCache {
         self.acc = None;
     }
 
+    /// Invalidate the secondary register cache.
+    #[inline]
+    pub fn invalidate_sec(&mut self) {
+        self.sec = None;
+    }
+
     /// Invalidate all cached register values. Called on operations that may
     /// clobber any register (calls, inline asm, etc.).
     #[inline]
     pub fn invalidate_all(&mut self) {
         self.acc = None;
+        self.sec = None;
     }
 }
 
