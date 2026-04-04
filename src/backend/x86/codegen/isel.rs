@@ -551,17 +551,15 @@ pub fn lower_instruction(
             lower_copy(dest, src, ra, out);
             true
         }
-        Instruction::Cmp { dest, op, lhs, rhs, ty } => {
-            if ty.is_float() || ty.is_128bit() { return false; }
-            lower_cmp(dest, *op, lhs, rhs, *ty, ra, out);
-            true
+        Instruction::Cmp { .. } => {
+            // Cmp lowering disabled: the existing codegen's SetCC+Movzbl path
+            // has edge cases with register naming. Re-enable after fixing.
+            false
         }
-        Instruction::Cast { dest, src, from_ty, to_ty } => {
-            if from_ty.is_float() || to_ty.is_float() { return false; }
-            if from_ty.is_128bit() || to_ty.is_128bit() { return false; }
-            if from_ty.is_long_double() || to_ty.is_long_double() { return false; }
-            lower_cast(dest, src, *from_ty, *to_ty, ra, out);
-            true
+        Instruction::Cast { .. } => {
+            // Cast lowering disabled: register naming edge cases with
+            // sign/zero extension and 32-bit sub-registers.
+            false
         }
         Instruction::UnaryOp { dest, op, src, ty } => {
             if ty.is_float() || ty.is_128bit() { return false; }
