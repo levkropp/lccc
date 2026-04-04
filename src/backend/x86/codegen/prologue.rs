@@ -235,13 +235,13 @@ impl X86Codegen {
 
         if omit_fp {
             // Frame-pointer-less prologue.
-            // Use compact push/pop encoding when all saved registers are true
-            // callee-saved (rbx=1, r12=2, r13=3, r14=4, r15=5, rbp=6).
-            // Functions with caller-saved registers (from Phase 2/2b regalloc)
-            // use the original movq approach to avoid stack layout complications.
-            let all_callee_saved = used_regs.iter().all(|r| r.0 >= 1 && r.0 <= 6);
+            // Use compact push/pop encoding for ALL saved registers (both callee
+            // and caller-saved from Phase 2/2b). pushq is 1-2 bytes vs movq's
+            // 7-8 bytes. The Phase 2b spill slots (for selective save/restore
+            // at call sites) are in the subq area, not the push area, so they
+            // don't interfere.
             let n_saves = used_regs.len() as i64;
-            let use_push_pop = n_saves > 0 && all_callee_saved;
+            let use_push_pop = n_saves > 0;
 
             if use_push_pop {
                 for &reg in &used_regs {
@@ -331,8 +331,7 @@ impl X86Codegen {
         let omit_fp = self.state.omit_frame_pointer && !self.state.func_is_variadic;
 
         if omit_fp {
-            let all_callee_saved = used_regs.iter().all(|r| r.0 >= 1 && r.0 <= 6);
-            let use_push_pop = num_saved > 0 && all_callee_saved;
+            let use_push_pop = num_saved > 0;
 
             if use_push_pop {
                 let local_size = frame_size - num_saved * 8;
