@@ -93,6 +93,7 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                 if j < len {
                     let overwrites_rax = match infos[j].kind {
                         LineKind::LoadRbp { reg: 0, .. } => true, // movq/movslq/etc → %rax
+                        LineKind::Call => true, // call puts result in %rax
                         LineKind::Other { dest_reg: 0 } => {
                             // Check if it's a load that writes %rax (not a read-modify-write)
                             let nj = infos[j].trimmed(store.get(j));
@@ -100,6 +101,8 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                                 || nj.starts_with("movslq ") || nj.starts_with("movzbq ")
                                 || nj.starts_with("movzwq ") || nj.starts_with("movsbq ")
                                 || nj.starts_with("movswq ") || nj.starts_with("leaq ")
+                                || nj.starts_with("xorl %eax") // duplicate xorl
+                                || nj.starts_with("movabsq ")
                         }
                         _ => false,
                     };
