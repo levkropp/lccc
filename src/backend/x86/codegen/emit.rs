@@ -1675,6 +1675,123 @@ impl X86Codegen {
 pub(super) const X86_ARG_REGS: [&str; 6] = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
 
 
+/// Collect all vreg IDs from a MachInst, separating into all_vregs and def_vregs.
+fn collect_vregs_in_inst(
+    inst: &super::machinst::MachInst,
+    all: &mut crate::common::fx_hash::FxHashSet<u32>,
+    defs: &mut crate::common::fx_hash::FxHashSet<u32>,
+) {
+    use super::machinst::{MachInst, MachReg, MachOperand};
+    let use_reg = |r: &MachReg, all: &mut crate::common::fx_hash::FxHashSet<u32>| {
+        if let MachReg::Vreg(id) = r { all.insert(*id); }
+    };
+    let use_op = |o: &MachOperand, all: &mut crate::common::fx_hash::FxHashSet<u32>| {
+        match o {
+            MachOperand::Reg(r) => { if let MachReg::Vreg(id) = r { all.insert(*id); } }
+            MachOperand::Mem { base, .. } => { if let MachReg::Vreg(id) = base { all.insert(*id); } }
+            MachOperand::MemIndex { base, index, .. } => {
+                if let MachReg::Vreg(id) = base { all.insert(*id); }
+                if let MachReg::Vreg(id) = index { all.insert(*id); }
+            }
+            _ => {}
+        }
+    };
+    let def_reg = |r: &MachReg, all: &mut crate::common::fx_hash::FxHashSet<u32>, defs: &mut crate::common::fx_hash::FxHashSet<u32>| {
+        if let MachReg::Vreg(id) = r { all.insert(*id); defs.insert(*id); }
+    };
+    match inst {
+        MachInst::Mov { src, dst, .. } => {
+            use_op(src, all);
+            if let MachOperand::Reg(r) = dst { def_reg(r, all, defs); }
+            else { use_op(dst, all); }
+        }
+        MachInst::Alu { src, dst, .. } => { use_op(src, all); use_reg(dst, all); def_reg(dst, all, defs); }
+        MachInst::Imul3 { src, dst, .. } => { use_reg(src, all); def_reg(dst, all, defs); }
+        MachInst::Neg { dst, .. } | MachInst::Not { dst, .. } => { use_reg(dst, all); def_reg(dst, all, defs); }
+        MachInst::Shift { amount, dst, .. } => { use_op(amount, all); use_reg(dst, all); def_reg(dst, all, defs); }
+        MachInst::Lea { base, index, dst, .. } => {
+            use_reg(base, all);
+            if let Some((r, _)) = index { use_reg(r, all); }
+            def_reg(dst, all, defs);
+        }
+        MachInst::Div { divisor, .. } => { use_op(divisor, all); }
+        MachInst::Cmp { lhs, rhs, .. } | MachInst::Test { lhs, rhs, .. } => { use_op(lhs, all); use_op(rhs, all); }
+        MachInst::SetCC { dst, .. } => { def_reg(dst, all, defs); }
+        MachInst::Movzx { src, dst, .. } | MachInst::Movsx { src, dst, .. } => { use_reg(src, all); def_reg(dst, all, defs); }
+        MachInst::Cmov { src, dst, .. } => { use_op(src, all); use_reg(dst, all); def_reg(dst, all, defs); }
+        MachInst::CallIndirect { reg, .. } => { use_reg(reg, all); }
+        _ => {}
+    }
+}
+
+/// Resolve stack-only vregs in a MachInst: replace MachReg::Vreg(id) with the
+/// value's stack slot as a memory operand. For instructions where the vreg is a
+/// dst (two-address ALU), we need to use rax as scratch: load→operate→store.
+fn resolve_stack_vregs(
+    inst: &super::machinst::MachInst,
+    ra: &FxHashMap<u32, PhysReg>,
+    state: &CodegenState,
+) -> super::machinst::MachInst {
+    use super::machinst::{MachInst, MachReg, MachOperand, OpSize};
+
+    // Helper: resolve a MachReg. If it's a vreg without a register, keep it as-is
+    // (the has_unresolvable_vreg check will catch it and abandon the buffer).
+    let resolve_reg = |r: &MachReg| -> MachReg { *r };
+
+    // Helper: resolve a MachOperand — replace Vreg with StackSlot if possible
+    let resolve_op = |op: &MachOperand| -> MachOperand {
+        match op {
+            MachOperand::Reg(MachReg::Vreg(id)) if !ra.contains_key(id) => {
+                if let Some(slot) = state.get_slot(*id) {
+                    MachOperand::StackSlot(slot.0)
+                } else {
+                    op.clone()
+                }
+            }
+            MachOperand::Mem { base: MachReg::Vreg(id), offset } if !ra.contains_key(id) => {
+                // Can't have a stack-slot-based-memory operand. Keep as vreg.
+                op.clone()
+            }
+            _ => op.clone(),
+        }
+    };
+
+    match inst {
+        MachInst::Mov { src, dst, size } => MachInst::Mov {
+            src: resolve_op(src), dst: resolve_op(dst), size: *size,
+        },
+        MachInst::Alu { op, src, dst, size } => {
+            if let MachReg::Vreg(id) = dst {
+                if !ra.contains_key(id) {
+                    // dst is on the stack — can't do two-address ALU with stack dest.
+                    // Keep as-is; the has_unresolvable_vreg check will reject
+                    // and fall back to existing accumulator codegen.
+                    return inst.clone();
+                }
+            }
+            MachInst::Alu { op: *op, src: resolve_op(src), dst: *dst, size: *size }
+        },
+        MachInst::Cmp { lhs, rhs, size } => MachInst::Cmp {
+            lhs: resolve_op(lhs), rhs: resolve_op(rhs), size: *size,
+        },
+        MachInst::Test { lhs, rhs, size } => MachInst::Test {
+            lhs: resolve_op(lhs), rhs: resolve_op(rhs), size: *size,
+        },
+        MachInst::Cmov { cc, src, dst, size } => MachInst::Cmov {
+            cc: *cc, src: resolve_op(src), dst: *dst, size: *size,
+        },
+        MachInst::Shift { op, amount, dst, size } => MachInst::Shift {
+            op: *op, amount: resolve_op(amount), dst: *dst, size: *size,
+        },
+        MachInst::Div { divisor, signed, size } => MachInst::Div {
+            divisor: resolve_op(divisor), signed: *signed, size: *size,
+        },
+        // For instructions where the vreg is always a register (dst of SetCC,
+        // Movzx, etc.), we can't replace with stack slot. Keep as-is.
+        _ => inst.clone(),
+    }
+}
+
 /// Check if a MachInst contains any virtual registers that don't have
 /// register assignments (would produce `%vregN` in the output).
 fn has_unresolvable_vreg(inst: &super::machinst::MachInst, ra: &FxHashMap<u32, PhysReg>) -> bool {
@@ -1720,65 +1837,77 @@ impl ArchCodegen for X86Codegen {
 
     fn try_lower_machinst(&mut self, inst: &crate::ir::reexports::Instruction) -> bool {
         if !self.machinst_enabled { return false; }
-        // Only lower instructions where all Value operands have register
-        // assignments. Stack-only values would become unresolvable vregs.
+
+        // Reject instructions involving values we can't handle:
+        // - allocas (need leaq for address computation)
+        // - operands with no register AND no stack slot
+        // - dest with no register (MachInst two-address Alu can't write to stack)
         use crate::backend::liveness::for_each_operand_in_instruction;
         let ra = &self.reg_assignments;
         let state = &self.state;
-        let mut all_regged = true;
+        let mut reject = false;
         for_each_operand_in_instruction(inst, |op| {
             if let crate::ir::reexports::Operand::Value(v) = op {
-                if !ra.contains_key(&v.0) && !state.is_alloca(v.0) {
-                    all_regged = false;
+                if state.is_alloca(v.0) { reject = true; return; }
+                // Reject XMM-allocated values (float values in GPR MachInst)
+                if let Some(r) = ra.get(&v.0) { if r.0 >= 20 { reject = true; return; } }
+                if !ra.contains_key(&v.0) && state.get_slot(v.0).is_none() {
+                    reject = true;
                 }
             }
         });
-        // Also check the dest — if it has no register, the result would be an
-        // unresolvable vreg. Only lower instructions where dest IS register-allocated.
+        // Dest must have a register for ALU/Shift/Neg/Not (two-address instructions).
+        // Cmp/SetCC don't write to a GPR dest in a useful way (flags only).
+        // Copy dest can be a stack slot (resolved to Mov with StackSlot).
         if let Some(dest) = inst.dest() {
+            if state.is_alloca(dest.0) { reject = true; }
+            if let Some(r) = ra.get(&dest.0) { if r.0 >= 20 { reject = true; } }
             if !ra.contains_key(&dest.0) {
-                all_regged = false;
+                // Stack-only dest is only OK for Copy (becomes Mov to stack slot).
+                // For BinOp/UnaryOp/Cast/Select, the dest needs a register for
+                // the two-address instruction form.
+                match inst {
+                    crate::ir::reexports::Instruction::Copy { .. } => {
+                        if state.get_slot(dest.0).is_none() { reject = true; }
+                    }
+                    crate::ir::reexports::Instruction::Cmp { .. } => {
+                        // Cmp result is a boolean — needs register for setCC.
+                        reject = true;
+                    }
+                    _ => { reject = true; }
+                }
             }
         }
-        if !all_regged { return false; }
-        let buf_start = self.machinst_buf.len();
-        let ok = super::isel::lower_instruction(inst, &self.reg_assignments, &mut self.machinst_buf);
-        if !ok { return false; }
-        // Safety check: verify no unresolvable vregs were produced.
-        // If any vreg in the new instructions doesn't have a register assignment,
-        // it would appear as %vregN in the output. Roll back and fall through.
-        let has_bad_vreg = self.machinst_buf[buf_start..].iter().any(|mi| {
-            has_unresolvable_vreg(mi, &self.reg_assignments)
-        });
-        if has_bad_vreg {
-            self.machinst_buf.truncate(buf_start);
-            return false;
-        }
-        true
+        if reject { return false; }
+
+        super::isel::lower_instruction(inst, &self.reg_assignments, &mut self.machinst_buf)
     }
 
     fn flush_machinst(&mut self) {
         if self.machinst_buf.is_empty() { return; }
 
-        // Allocate registers for the accumulated MachInst buffer
-        let alloc_result = super::machinst_regalloc::allocate_machinsts(
-            &self.machinst_buf,
-            super::machinst::MACHINST_ALLOCATABLE_GPRS,
-        );
+        use super::machinst::{MachInst, MachReg, MachOperand, OpSize};
 
-        // Rewrite virtual registers to physical registers (with spill insertion)
-        let allocated = super::machinst_regalloc::rewrite_machinsts(
-            &self.machinst_buf,
-            &alloc_result,
-        );
+        // Resolve all remaining vregs: replace stack-only values with their
+        // stack slot as a memory operand. This avoids the MachInst allocator
+        // needing to manage stack values — they just become memory operands
+        // in x86 instructions (e.g., addq -N(%rsp), %r12).
+        let resolved: Vec<MachInst> = self.machinst_buf.iter().map(|inst| {
+            resolve_stack_vregs(inst, &self.reg_assignments, &self.state)
+        }).collect();
 
-        // Emit allocated instructions as assembly
-        super::machinst_emit::emit_machinsts(&allocated, &mut self.state.out);
+        // Check for any remaining unresolvable vregs after stack resolution
+        let has_bad = resolved.iter().any(|mi| has_unresolvable_vreg(mi, &self.reg_assignments));
+        if has_bad {
+            self.machinst_buf.clear();
+            return;
+        }
 
-        // Clear the buffer for the next sequence
+        // No allocation needed — all vregs are now either Phys (from main
+        // allocator) or replaced with StackSlot memory operands.
+        super::machinst_emit::emit_machinsts(&resolved, &mut self.state.out);
+
         self.machinst_buf.clear();
-
-        // Invalidate register cache since MachInst may have changed register contents
         self.state.reg_cache.invalidate_all();
     }
 
