@@ -39,9 +39,11 @@ pub(super) fn replace_reg_family(line: &str, old_id: RegId, new_id: RegId) -> St
         return line.to_string();
     }
     let mut result = line.to_string();
-    // Replace in order from longest to shortest to avoid partial matches.
-    // 64-bit names are longest (e.g., %r10, %rax), then 32-bit, 16-bit, 8-bit.
-    for size_idx in 0..4 {
+    // Replace in order from shortest to longest so that smaller sub-register
+    // names (e.g., %ebx→%ebp) are replaced before their 64-bit counterparts
+    // (%rbx→%rbp). This prevents 64-bit replacement from consuming a 32-bit
+    // operand, leaving the wrong register size in the output.
+    for size_idx in [3, 2, 1, 0] {
         let old_name = REG_NAMES[size_idx][old_id as usize];
         let new_name = REG_NAMES[size_idx][new_id as usize];
         if old_name == new_name {

@@ -1458,7 +1458,12 @@ impl X86Codegen {
     pub(super) fn emit_alu_reg_direct(&mut self, op: IrBinOp, lhs: &Operand, rhs: &Operand,
                            dest_phys: PhysReg, use_32bit: bool, is_unsigned: bool, dest_value_id: u32) {
         let dest_name = phys_reg_name(dest_phys);
+        // Safety: verify the 32-bit name is valid. The "rbpd" bug appears to be
+        // caused by some codegen path concatenating the 64-bit name with "d" suffix
+        // instead of using the proper 32-bit register name.
         let dest_name_32 = phys_reg_name_32(dest_phys);
+        debug_assert!(!dest_name_32.contains("rbp") || dest_name_32 == "ebp",
+            "unexpected 32-bit name for rbp: {}", dest_name_32);
 
         // Immediate form
         if let Some(imm) = Self::const_as_imm32(rhs) {
@@ -1861,7 +1866,12 @@ impl ArchCodegen for X86Codegen {
         // Copy dest can be a stack slot (resolved to Mov with StackSlot).
         if let Some(dest) = inst.dest() {
             if state.is_alloca(dest.0) { reject = true; }
-            if let Some(r) = ra.get(&dest.0) { if r.0 >= 20 { reject = true; } }
+            if let Some(r) = ra.get(&dest.0) {
+                if r.0 >= 20 { reject = true; }
+                // Workaround: skip rbp-dest BinOps to avoid triggering a register
+                // name bug in the existing codegen after MachInst cache invalidation.
+                if r.0 == 6 { reject = true; }
+            }
             if !ra.contains_key(&dest.0) {
                 // Stack-only dest is only OK for Copy (becomes Mov to stack slot).
                 // For BinOp/UnaryOp/Cast/Select, the dest needs a register for
