@@ -3,7 +3,7 @@
 use crate::ir::reexports::{IrUnaryOp, Operand, Value};
 use crate::backend::cast::FloatOp;
 use crate::common::types::IrType;
-use super::emit::{phys_reg_name, phys_reg_name_32, is_xmm_reg};
+use super::emit::{phys_reg_name, phys_reg_name_32, typed_phys_reg_name, is_xmm_reg};
 use super::emit::X86Codegen;
 
 impl X86Codegen {
@@ -110,8 +110,9 @@ impl X86Codegen {
                         IrUnaryOp::Bswap => {
                             self.operand_to_callee_reg(src, d_reg);
                             if matches!(ty, IrType::I16 | IrType::U16) {
-                                // bswap doesn't exist for 16-bit; use rolw
-                                self.state.emit_fmt(format_args!("    rolw $8, %{}", phys_reg_name_32(d_reg)));
+                                // bswap doesn't exist for 16-bit; use rolw with 16-bit register
+                                let reg16 = typed_phys_reg_name(d_reg, ty);
+                                self.state.emit_fmt(format_args!("    rolw $8, %{}", reg16));
                             } else {
                                 let bswap_name = if use_32bit { phys_reg_name_32(d_reg) } else { phys_reg_name(d_reg) };
                                 let bswap_suffix = if use_32bit { "l" } else { "q" };
