@@ -197,17 +197,71 @@ fn collect_fixed_intervals(insts: &[MachInst]) -> FxHashMap<PhysReg, Vec<(u32, u
     fixed
 }
 
+/// Collect all physical registers that appear pre-colored in the buffer.
+/// These must be excluded from the allocatable pool to avoid conflicts.
+fn collect_precolored_regs(insts: &[MachInst]) -> FxHashSet<PhysReg> {
+    let mut used = FxHashSet::default();
+    for inst in insts {
+        visit_regs_shared(inst, &mut |r: &MachReg| {
+            if let MachReg::Phys(p) = r { used.insert(*p); }
+        });
+    }
+    used
+}
+
+/// Visit all MachReg references in a MachInst (shared-borrow version for internal use).
+fn visit_regs_shared(inst: &MachInst, f: &mut impl FnMut(&MachReg)) {
+    let mut visit_op = |op: &MachOperand, f: &mut dyn FnMut(&MachReg)| {
+        match op {
+            MachOperand::Reg(r) => f(r),
+            MachOperand::Mem { base, .. } => f(base),
+            MachOperand::MemIndex { base, index, .. } => { f(base); f(index); }
+            _ => {}
+        }
+    };
+    match inst {
+        MachInst::Mov { src, dst, .. } => {
+            visit_op(src, f);
+            if let MachOperand::Reg(r) = dst { f(r); } else { visit_op(dst, f); }
+        }
+        MachInst::Alu { src, dst, .. } => { visit_op(src, f); f(dst); }
+        MachInst::Imul3 { src, dst, .. } => { f(src); f(dst); }
+        MachInst::Neg { dst, .. } | MachInst::Not { dst, .. } => { f(dst); }
+        MachInst::Shift { amount, dst, .. } => { visit_op(amount, f); f(dst); }
+        MachInst::Lea { base, index, dst, .. } => {
+            f(base);
+            if let Some((r, _)) = index { f(r); }
+            f(dst);
+        }
+        MachInst::Div { divisor, .. } => { visit_op(divisor, f); }
+        MachInst::Cmp { lhs, rhs, .. } | MachInst::Test { lhs, rhs, .. } => {
+            visit_op(lhs, f); visit_op(rhs, f);
+        }
+        MachInst::SetCC { dst, .. } => { f(dst); }
+        MachInst::Movzx { src, dst, .. } | MachInst::Movsx { src, dst, .. } => {
+            f(src); f(dst);
+        }
+        MachInst::Cmov { src, dst, .. } => { visit_op(src, f); f(dst); }
+        MachInst::CallIndirect { reg, .. } => { f(reg); }
+        _ => {}
+    }
+}
+
 /// Run register allocation on a MachInst buffer.
 ///
-/// Returns the allocation result with assignments and spill slots.
-/// The caller is responsible for rewriting the MachInst buffer using
-/// `rewrite_machinsts()`.
+/// Uses only caller-saved registers that don't appear pre-colored in the
+/// buffer. This is conservative (avoids all conflicts with Phase 1
+/// allocations) but correct and sufficient for block-level allocation.
+///
+/// `existing_slots` maps vreg IDs to their existing stack slot offsets
+/// (from the main codegen's stack layout). Spilled vregs reuse these
+/// instead of creating new spill slots.
 pub fn allocate_machinsts(
     insts: &[MachInst],
     available_regs: &[PhysReg],
+    existing_slots: &FxHashMap<u32, i64>,
 ) -> MachAllocResult {
     let intervals = build_intervals(insts);
-    let fixed_intervals = collect_fixed_intervals(insts);
 
     if intervals.is_empty() {
         return MachAllocResult {
@@ -217,46 +271,51 @@ pub fn allocate_machinsts(
         };
     }
 
-    // Filter available registers: exclude any that have fixed (pre-colored) uses.
-    // A register with fixed uses CAN still be allocated, but the allocator
-    // must respect the fixed intervals. For simplicity, we filter out
-    // registers that are pre-colored (rax, rcx, rdx) from the allocatable pool.
+    // Collect all pre-colored physical registers in the buffer.
+    // Exclude them from the allocatable pool to avoid conflicts.
+    let precolored = collect_precolored_regs(insts);
     let allocatable: Vec<PhysReg> = available_regs
         .iter()
         .copied()
-        .filter(|r| !matches!(r.0, 0 | 7)) // Exclude rax(0) and rcx(7) — scratch regs
+        .filter(|r| !precolored.contains(r))
+        .filter(|r| !matches!(r.0, 0 | 7 | 6)) // Exclude rax, rcx, rbp
         .collect();
+
+    if allocatable.is_empty() {
+        // No registers available — all vregs stay as-is (will be stack-resolved)
+        return MachAllocResult {
+            assignments: FxHashMap::default(),
+            spill_slots: FxHashMap::default(),
+            used_regs: FxHashSet::default(),
+        };
+    }
 
     // Build LiveRange entries for the linear scan
     let ranges: Vec<LiveRange> = intervals
         .iter()
-        .map(|iv| LiveRange::from_interval(*iv, 0)) // depth 0 for now (could refine)
+        .map(|iv| LiveRange::from_interval(*iv, 0))
         .collect();
 
-    let mut allocator = LinearScanAllocator::new(ranges.clone(), allocatable.clone());
+    let mut allocator = LinearScanAllocator::new(ranges.clone(), allocatable);
     allocator.init_registers();
 
-    // Block registers at program points where they're pre-colored
-    // (This is a simplified approach — a full implementation would create
-    // fixed intervals in the linear scan. For now, we just process ranges
-    // and check fixed conflicts during allocation.)
-
-    // Process each range through the allocator
     for range in ranges {
         allocator.allocate_range(range);
     }
 
-    // Collect results
+    // Collect results, mapping spill slots to existing stack slots
     let mut used_regs = FxHashSet::default();
     for &reg in allocator.assignments.values() {
         used_regs.insert(reg);
     }
 
-    let spill_slots: FxHashMap<u32, i64> = allocator
-        .spill_slots
-        .iter()
-        .map(|(&vid, &slot)| (vid, slot as i64))
-        .collect();
+    let mut spill_slots: FxHashMap<u32, i64> = FxHashMap::default();
+    for (&vid, _) in &allocator.spill_slots {
+        if let Some(&slot) = existing_slots.get(&vid) {
+            spill_slots.insert(vid, slot);
+        }
+        // If no existing slot, leave unmapped — resolve_stack_vregs handles it
+    }
 
     MachAllocResult {
         assignments: allocator.assignments,
@@ -307,8 +366,32 @@ fn rewrite_operand(op: &MachOperand, result: &MachAllocResult) -> MachOperand {
     }
 }
 
+/// Check if a MachReg is a spilled vreg and return its stack slot.
+fn spill_slot(reg: &MachReg, result: &MachAllocResult) -> Option<i64> {
+    if let MachReg::Vreg(id) = rewrite_reg(reg, result) {
+        result.spill_slots.get(&id).copied()
+    } else {
+        None
+    }
+}
+
+/// Resolve a MachReg source: if spilled, emit a load to rax and return Phys(RAX).
+/// If not spilled, return the rewritten reg directly.
+fn resolve_src(reg: &MachReg, size: OpSize, result: &MachAllocResult, out: &mut Vec<MachInst>) -> MachReg {
+    if let Some(slot) = spill_slot(reg, result) {
+        out.push(MachInst::Mov {
+            src: MachOperand::StackSlot(slot),
+            dst: MachOperand::Reg(MachReg::Phys(RAX)),
+            size,
+        });
+        MachReg::Phys(RAX)
+    } else {
+        rewrite_reg(reg, result)
+    }
+}
+
 /// Rewrite all virtual registers in a MachInst buffer using allocation results.
-/// Also inserts spill loads for spilled operands that can't be represented
+/// Also inserts spill loads/stores for spilled operands that can't be represented
 /// as StackSlot memory operands (e.g., when the instruction needs a register).
 pub fn rewrite_machinsts(insts: &[MachInst], result: &MachAllocResult) -> Vec<MachInst> {
     let mut out = Vec::with_capacity(insts.len());
@@ -323,54 +406,111 @@ pub fn rewrite_machinsts(insts: &[MachInst], result: &MachAllocResult) -> Vec<Ma
                 });
             }
             MachInst::Alu { op, src, dst, size } => {
-                let new_dst = rewrite_reg(dst, result);
-                if let MachReg::Vreg(id) = new_dst {
-                    // dst is spilled — need to load to scratch, operate, store back
-                    if let Some(&slot) = result.spill_slots.get(&id) {
-                        // Load spilled dst to rax (scratch)
-                        out.push(MachInst::Mov {
-                            src: MachOperand::StackSlot(slot),
-                            dst: MachOperand::Reg(MachReg::Phys(RAX)),
-                            size: *size,
-                        });
-                        // Perform ALU operation on rax
-                        out.push(MachInst::Alu {
-                            op: *op,
-                            src: rewrite_operand(src, result),
-                            dst: MachReg::Phys(RAX),
-                            size: *size,
-                        });
-                        // Store rax back to spill slot
-                        out.push(MachInst::Mov {
-                            src: MachOperand::Reg(MachReg::Phys(RAX)),
-                            dst: MachOperand::StackSlot(slot),
-                            size: *size,
-                        });
-                        continue;
-                    }
+                if let Some(slot) = spill_slot(dst, result) {
+                    out.push(MachInst::Mov {
+                        src: MachOperand::StackSlot(slot),
+                        dst: MachOperand::Reg(MachReg::Phys(RAX)),
+                        size: *size,
+                    });
+                    out.push(MachInst::Alu {
+                        op: *op,
+                        src: rewrite_operand(src, result),
+                        dst: MachReg::Phys(RAX),
+                        size: *size,
+                    });
+                    out.push(MachInst::Mov {
+                        src: MachOperand::Reg(MachReg::Phys(RAX)),
+                        dst: MachOperand::StackSlot(slot),
+                        size: *size,
+                    });
+                    continue;
                 }
                 out.push(MachInst::Alu {
                     op: *op,
                     src: rewrite_operand(src, result),
-                    dst: new_dst,
+                    dst: rewrite_reg(dst, result),
                     size: *size,
                 });
             }
             MachInst::Imul3 { imm, src, dst, size } => {
+                if let Some(dst_slot) = spill_slot(dst, result) {
+                    // Imul3: dst = src * imm. src can be memory, dst must be reg.
+                    let new_src = resolve_src(src, *size, result, &mut out);
+                    out.push(MachInst::Imul3 {
+                        imm: *imm,
+                        src: new_src,
+                        dst: MachReg::Phys(RAX),
+                        size: *size,
+                    });
+                    out.push(MachInst::Mov {
+                        src: MachOperand::Reg(MachReg::Phys(RAX)),
+                        dst: MachOperand::StackSlot(dst_slot),
+                        size: *size,
+                    });
+                    continue;
+                }
+                let new_src = resolve_src(src, *size, result, &mut out);
                 out.push(MachInst::Imul3 {
                     imm: *imm,
-                    src: rewrite_reg(src, result),
+                    src: new_src,
                     dst: rewrite_reg(dst, result),
                     size: *size,
                 });
             }
             MachInst::Neg { dst, size } => {
+                if let Some(slot) = spill_slot(dst, result) {
+                    out.push(MachInst::Mov {
+                        src: MachOperand::StackSlot(slot),
+                        dst: MachOperand::Reg(MachReg::Phys(RAX)),
+                        size: *size,
+                    });
+                    out.push(MachInst::Neg { dst: MachReg::Phys(RAX), size: *size });
+                    out.push(MachInst::Mov {
+                        src: MachOperand::Reg(MachReg::Phys(RAX)),
+                        dst: MachOperand::StackSlot(slot),
+                        size: *size,
+                    });
+                    continue;
+                }
                 out.push(MachInst::Neg { dst: rewrite_reg(dst, result), size: *size });
             }
             MachInst::Not { dst, size } => {
+                if let Some(slot) = spill_slot(dst, result) {
+                    out.push(MachInst::Mov {
+                        src: MachOperand::StackSlot(slot),
+                        dst: MachOperand::Reg(MachReg::Phys(RAX)),
+                        size: *size,
+                    });
+                    out.push(MachInst::Not { dst: MachReg::Phys(RAX), size: *size });
+                    out.push(MachInst::Mov {
+                        src: MachOperand::Reg(MachReg::Phys(RAX)),
+                        dst: MachOperand::StackSlot(slot),
+                        size: *size,
+                    });
+                    continue;
+                }
                 out.push(MachInst::Not { dst: rewrite_reg(dst, result), size: *size });
             }
             MachInst::Shift { op, amount, dst, size } => {
+                if let Some(slot) = spill_slot(dst, result) {
+                    out.push(MachInst::Mov {
+                        src: MachOperand::StackSlot(slot),
+                        dst: MachOperand::Reg(MachReg::Phys(RAX)),
+                        size: *size,
+                    });
+                    out.push(MachInst::Shift {
+                        op: *op,
+                        amount: rewrite_operand(amount, result),
+                        dst: MachReg::Phys(RAX),
+                        size: *size,
+                    });
+                    out.push(MachInst::Mov {
+                        src: MachOperand::Reg(MachReg::Phys(RAX)),
+                        dst: MachOperand::StackSlot(slot),
+                        size: *size,
+                    });
+                    continue;
+                }
                 out.push(MachInst::Shift {
                     op: *op,
                     amount: rewrite_operand(amount, result),
@@ -379,8 +519,27 @@ pub fn rewrite_machinsts(insts: &[MachInst], result: &MachAllocResult) -> Vec<Ma
                 });
             }
             MachInst::Lea { base, index, offset, dst } => {
+                if let Some(dst_slot) = spill_slot(dst, result) {
+                    let new_base = resolve_src(base, OpSize::S64, result, &mut out);
+                    let new_index = index.as_ref().map(|(r, s)| {
+                        // If index is also spilled, we can't load both to rax.
+                        // For now, just rewrite (will fail if spilled).
+                        (rewrite_reg(r, result), *s)
+                    });
+                    out.push(MachInst::Lea {
+                        base: new_base, index: new_index, offset: *offset,
+                        dst: MachReg::Phys(RAX),
+                    });
+                    out.push(MachInst::Mov {
+                        src: MachOperand::Reg(MachReg::Phys(RAX)),
+                        dst: MachOperand::StackSlot(dst_slot),
+                        size: OpSize::S64,
+                    });
+                    continue;
+                }
+                let new_base = resolve_src(base, OpSize::S64, result, &mut out);
                 out.push(MachInst::Lea {
-                    base: rewrite_reg(base, result),
+                    base: new_base,
                     index: index.as_ref().map(|(r, s)| (rewrite_reg(r, result), *s)),
                     offset: *offset,
                     dst: rewrite_reg(dst, result),
@@ -427,6 +586,26 @@ pub fn rewrite_machinsts(insts: &[MachInst], result: &MachAllocResult) -> Vec<Ma
                 });
             }
             MachInst::Cmov { cc, src, dst, size } => {
+                if let Some(slot) = spill_slot(dst, result) {
+                    // Cmov needs register dst. Load from stack, cmov, store back.
+                    out.push(MachInst::Mov {
+                        src: MachOperand::StackSlot(slot),
+                        dst: MachOperand::Reg(MachReg::Phys(RAX)),
+                        size: *size,
+                    });
+                    out.push(MachInst::Cmov {
+                        cc: *cc,
+                        src: rewrite_operand(src, result),
+                        dst: MachReg::Phys(RAX),
+                        size: *size,
+                    });
+                    out.push(MachInst::Mov {
+                        src: MachOperand::Reg(MachReg::Phys(RAX)),
+                        dst: MachOperand::StackSlot(slot),
+                        size: *size,
+                    });
+                    continue;
+                }
                 out.push(MachInst::Cmov {
                     cc: *cc,
                     src: rewrite_operand(src, result),
@@ -447,4 +626,10 @@ pub fn rewrite_machinsts(insts: &[MachInst], result: &MachAllocResult) -> Vec<Ma
     }
 
     out
+}
+
+/// Visit all MachReg references in a MachInst (both defs and uses).
+/// Used to collect vregs that need slot lookup for the allocator.
+pub fn visit_regs(inst: &MachInst, f: &mut impl FnMut(&MachReg)) {
+    visit_regs_shared(inst, f);
 }

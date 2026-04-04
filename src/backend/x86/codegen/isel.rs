@@ -7,7 +7,7 @@
 //! division (rax:rdx) and shifts (rcx/%cl).
 
 use crate::ir::reexports::{IrBinOp, IrCmpOp, IrUnaryOp, Operand, Value, IrConst, Instruction, Terminator, BlockId};
-use crate::common::types::IrType;
+use crate::common::types::{IrType, AddressSpace};
 use crate::backend::regalloc::PhysReg;
 use crate::common::fx_hash::FxHashMap;
 use super::machinst::*;
@@ -557,12 +557,9 @@ pub fn lower_instruction(
             true
         }
         Instruction::Load { .. } => {
-            // Load interactions with alloca/pointer addresses are complex — fall back.
             false
         }
         Instruction::Store { .. } => {
-            // Store interactions with alloca addresses are complex — fall back to
-            // existing codegen for now. Will be migrated in Phase 2f.
             false
         }
         Instruction::Copy { dest, src } => {
@@ -592,7 +589,6 @@ pub fn lower_instruction(
             true
         }
         Instruction::GetElementPtr { .. } => {
-            // GEP involves pointer addresses — fall back for now.
             false
         }
         _ => false,

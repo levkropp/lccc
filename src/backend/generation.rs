@@ -1002,6 +1002,7 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
     // Pre-scan: count uses of each Value across the entire function to identify
     // single-use Cmp results eligible for compare-branch fusion.
     let value_use_counts = count_value_uses(func);
+    cg.state().value_use_counts = value_use_counts.clone();
 
     // Pre-scan: identify GEPs with constant offsets that can be folded into
     // Load/Store addressing modes, eliminating the GEP instruction entirely.
@@ -1052,6 +1053,30 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
         let fuse_idx = detect_cmp_branch_fusion(block, &value_use_counts);
         let mul_add_fusions = detect_mul_add_fusions(block, &value_use_counts);
         let mut skip_fused_add = false;
+        let mi_enabled = cg.is_machinst_enabled();
+
+        // Compute per-block use counts for liveness-aware MachInst store-back.
+        if mi_enabled {
+            cg.state().block_use_counts.clear();
+            for inst in &block.instructions {
+                use crate::backend::liveness::for_each_operand_in_instruction;
+                for_each_operand_in_instruction(inst, |op| {
+                    if let Operand::Value(v) = op {
+                        *cg.state().block_use_counts.entry(v.0).or_insert(0) += 1;
+                    }
+                });
+                // Load ptr and Store ptr not visited by for_each_operand
+                match inst {
+                    Instruction::Load { ptr, .. } | Instruction::Store { ptr, .. } => {
+                        *cg.state().block_use_counts.entry(ptr.0).or_insert(0) += 1;
+                    }
+                    Instruction::GetElementPtr { base, .. } => {
+                        *cg.state().block_use_counts.entry(base.0).or_insert(0) += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
 
         for (idx, inst) in block.instructions.iter().enumerate() {
             if Some(idx) == fuse_idx {
@@ -1069,6 +1094,7 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
             if let Instruction::GetElementPtr { dest, base, .. } = inst {
                 if gep_fold_map.contains_key(&dest.0) &&
                    (cg.state_ref().is_alloca(base.0) || cg.get_phys_reg_for_value(base.0).is_some()) {
+                    cg.state().folded_gep_values.insert(dest.0);
                     cg.state().current_program_point += 1;
                     continue;
                 }

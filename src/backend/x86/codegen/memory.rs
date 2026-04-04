@@ -579,15 +579,15 @@ impl X86Codegen {
         if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128) {
             if let Some(p_reg) = self.reg_assignments.get(&ptr.0).copied() {
                 if !is_xmm_reg(p_reg) && !self.state.is_alloca(ptr.0) {
-                    let load_instr = Self::mov_load_for_type(ty);
+                    let load_instr = self.mov_load_for_value(ty, dest.0);
                     let p_name = phys_reg_name(p_reg);
+                    let use_32bit_dest = matches!(ty, IrType::U32 | IrType::F32)
+                        || (ty == IrType::I32 && load_instr == "movl");
 
                     // Check if dest has a register — load directly to it.
                     if let Some(d_reg) = self.reg_assignments.get(&dest.0).copied() {
                         if !is_xmm_reg(d_reg) {
-                            // movslq/movsbq/movswq need 64-bit dest.
-                            // movl/movzbl/movzwl use 32-bit dest (implicit zero-extend).
-                            let d_name = if matches!(ty, IrType::U32 | IrType::F32) {
+                            let d_name = if use_32bit_dest {
                                 phys_reg_name_32(d_reg)
                             } else {
                                 phys_reg_name(d_reg)
@@ -598,7 +598,7 @@ impl X86Codegen {
                     }
 
                     // Dest is on stack — load to rax as before.
-                    let dest_reg = if matches!(ty, IrType::U32 | IrType::F32) { "%eax" } else { "%rax" };
+                    let dest_reg = if use_32bit_dest { "%eax" } else { "%rax" };
                     self.state.emit_fmt(format_args!("    {} (%{}), {}", load_instr, p_name, dest_reg));
                     self.state.reg_cache.set_acc(dest.0, false);
                     self.store_rax_to(dest);
