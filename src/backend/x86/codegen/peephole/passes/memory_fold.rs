@@ -555,6 +555,73 @@ pub(super) fn fold_general_relay(store: &mut LineStore, infos: &mut [LineInfo]) 
     changed
 }
 
+/// Fold store relay: `movq %reg, %rax; movq %rax, N(%rsp)` → `movq %reg, N(%rsp)`.
+/// Eliminates the intermediate %rax relay for register-to-stack stores.
+pub(super) fn fold_store_relay(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+
+    while i + 1 < len {
+        if infos[i].is_nop() { i += 1; continue; }
+
+        // Step 1: movq %REG, %rax (or movl %REGd, %eax)
+        let (src_reg, is_32bit) = match infos[i].kind {
+            LineKind::Other { dest_reg: 0 } => {
+                let line = infos[i].trimmed(store.get(i));
+                if line.starts_with("movq %") && line.ends_with(", %rax") && !line.contains('(') {
+                    let src = &line[6..line.len() - 6]; // between "movq %" and ", %rax"
+                    if !src.contains('%') { // simple register name
+                        (src.to_string(), false)
+                    } else { i += 1; continue; }
+                } else if line.starts_with("movl %") && line.ends_with(", %eax") && !line.contains('(') {
+                    let src = &line[6..line.len() - 6];
+                    if !src.contains('%') {
+                        (src.to_string(), true)
+                    } else { i += 1; continue; }
+                } else { i += 1; continue; }
+            }
+            _ => { i += 1; continue; }
+        };
+
+        // Step 2: Next must be movq %rax, N(%rsp) or movl %eax, N(%rsp)
+        let mut j = i + 1;
+        while j < len && infos[j].is_nop() { j += 1; }
+        if j >= len { i += 1; continue; }
+
+        let stored = match infos[j].kind {
+            LineKind::StoreRbp { reg: 0, offset, size } => {
+                // movq/movl %rax/%eax → stack
+                Some((offset, size))
+            }
+            _ => None,
+        };
+
+        if let Some((offset, _size)) = stored {
+            // Check rax is dead after the store
+            if is_rax_dead_after(store, infos, j + 1, len) {
+                // Fold: movq %reg, N(%rsp) directly
+                let mnem = if is_32bit { "movl" } else { "movq" };
+                let line = infos[j].trimmed(store.get(j));
+                // Extract the stack operand from the store instruction
+                if let Some(comma) = line.rfind(',') {
+                    let mem_part = line[comma + 1..].trim();
+                    let new_inst = format!("    {} %{}, {}", mnem, src_reg, mem_part);
+                    replace_line(store, &mut infos[j], j, new_inst);
+                    mark_nop(&mut infos[i]);
+                    changed = true;
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+
+        i += 1;
+    }
+
+    changed
+}
+
 /// Check if %rax is dead starting from instruction index `start`.
 /// Returns true if rax is overwritten before being read within a 16-instruction window.
 fn is_rax_dead_after(store: &LineStore, infos: &[LineInfo], start: usize, len: usize) -> bool {

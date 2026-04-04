@@ -128,6 +128,7 @@ pub fn peephole_optimize(asm: String) -> String {
     if !sk("cltq_relay") { global_changed |= memory_fold::fold_cltq_relay(&mut store, &mut infos); }
     if !sk("ext_relay") { global_changed |= memory_fold::fold_extend_relay(&mut store, &mut infos); }
     if !sk("gen_relay") { global_changed |= memory_fold::fold_general_relay(&mut store, &mut infos); }
+    if !sk("store_relay") { global_changed |= memory_fold::fold_store_relay(&mut store, &mut infos); }
     global_changed };
 
     // Phase 3: One more local cleanup if global passes made changes.
@@ -151,6 +152,7 @@ pub fn peephole_optimize(asm: String) -> String {
             if !sk("cltq_relay") { changed2 |= memory_fold::fold_cltq_relay(&mut store, &mut infos); }
             if !sk("ext_relay") { changed2 |= memory_fold::fold_extend_relay(&mut store, &mut infos); }
             if !sk("gen_relay") { changed2 |= memory_fold::fold_general_relay(&mut store, &mut infos); }
+            if !sk("store_relay") { changed2 |= memory_fold::fold_store_relay(&mut store, &mut infos); }
             if !sk("base_index") { changed2 |= local_patterns::fold_base_index_addressing(&mut store, &mut infos); }
             if !sk("phi_coalesce") { changed2 |= local_patterns::coalesce_phi_register_copies(&mut store, &mut infos); }
             if !sk("signext_move") { changed2 |= local_patterns::fuse_signext_and_move(&mut store, &mut infos); }
