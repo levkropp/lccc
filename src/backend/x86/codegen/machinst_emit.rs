@@ -160,6 +160,34 @@ fn cc_suffix(cc: CondCode) -> &'static str {
 pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
     match inst {
         MachInst::Mov { src, dst, size } => {
+            // Skip self-moves (same register or same stack slot)
+            match (src, dst) {
+                (MachOperand::Reg(a), MachOperand::Reg(b)) if a == b => return,
+                (MachOperand::StackSlot(a), MachOperand::StackSlot(b)) if a == b => return,
+                // x86 can't do mem-to-mem moves. Use rax as relay.
+                (MachOperand::StackSlot(_), MachOperand::StackSlot(_)) => {
+                    let src_str = fmt_operand(src, *size, out);
+                    let dst_str = fmt_operand(dst, *size, out);
+                    let suffix = size.suffix();
+                    let rax = if *size == OpSize::S32 { "eax" } else { "rax" };
+                    out.emit_fmt(format_args!("    mov{} {}, %{}", suffix, src_str, rax));
+                    out.emit_fmt(format_args!("    mov{} %{}, {}", suffix, rax, dst_str));
+                    return;
+                }
+                (MachOperand::Mem { .. }, MachOperand::Mem { .. }) |
+                (MachOperand::Mem { .. }, MachOperand::StackSlot(_)) |
+                (MachOperand::StackSlot(_), MachOperand::Mem { .. }) => {
+                    // Also mem-to-mem: use rax relay
+                    let src_str = fmt_operand(src, *size, out);
+                    let dst_str = fmt_operand(dst, *size, out);
+                    let suffix = size.suffix();
+                    let rax = if *size == OpSize::S32 { "eax" } else { "rax" };
+                    out.emit_fmt(format_args!("    mov{} {}, %{}", suffix, src_str, rax));
+                    out.emit_fmt(format_args!("    mov{} %{}, {}", suffix, rax, dst_str));
+                    return;
+                }
+                _ => {}
+            }
             let suffix = size.suffix();
             let src_str = fmt_operand(src, *size, out);
             let dst_str = fmt_operand(dst, *size, out);
@@ -254,17 +282,45 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
 
         MachInst::Cmp { lhs, rhs, size } => {
             let suffix = size.suffix();
-            // AT&T: cmp rhs, lhs (reversed from Intel)
-            let rhs_str = fmt_operand(rhs, *size, out);
-            let lhs_str = fmt_operand(lhs, *size, out);
-            out.emit_fmt(format_args!("    cmp{} {}, {}", suffix, rhs_str, lhs_str));
+            // x86 cmp can't have two memory operands — load rhs to rax
+            let both_mem = matches!((lhs, rhs),
+                (MachOperand::StackSlot(_), MachOperand::StackSlot(_)) |
+                (MachOperand::Mem { .. }, MachOperand::Mem { .. }) |
+                (MachOperand::StackSlot(_), MachOperand::Mem { .. }) |
+                (MachOperand::Mem { .. }, MachOperand::StackSlot(_)));
+            if both_mem {
+                let rhs_str = fmt_operand(rhs, *size, out);
+                let rax = if *size == OpSize::S32 { "eax" } else { "rax" };
+                out.emit_fmt(format_args!("    mov{} {}, %{}", suffix, rhs_str, rax));
+                let lhs_str = fmt_operand(lhs, *size, out);
+                // AT&T: cmp rhs, lhs
+                out.emit_fmt(format_args!("    cmp{} %{}, {}", suffix, rax, lhs_str));
+            } else {
+                let rhs_str = fmt_operand(rhs, *size, out);
+                let lhs_str = fmt_operand(lhs, *size, out);
+                out.emit_fmt(format_args!("    cmp{} {}, {}", suffix, rhs_str, lhs_str));
+            }
         }
 
         MachInst::Test { lhs, rhs, size } => {
             let suffix = size.suffix();
-            let rhs_str = fmt_operand(rhs, *size, out);
-            let lhs_str = fmt_operand(lhs, *size, out);
-            out.emit_fmt(format_args!("    test{} {}, {}", suffix, rhs_str, lhs_str));
+            // x86 test can't have two memory operands — load one to rax
+            let both_mem = matches!((lhs, rhs),
+                (MachOperand::StackSlot(_), MachOperand::StackSlot(_)) |
+                (MachOperand::Mem { .. }, MachOperand::Mem { .. }) |
+                (MachOperand::StackSlot(_), MachOperand::Mem { .. }) |
+                (MachOperand::Mem { .. }, MachOperand::StackSlot(_)));
+            if both_mem {
+                let rhs_str = fmt_operand(rhs, *size, out);
+                let rax = if *size == OpSize::S32 { "eax" } else { "rax" };
+                out.emit_fmt(format_args!("    mov{} {}, %{}", suffix, rhs_str, rax));
+                let lhs_str = fmt_operand(lhs, *size, out);
+                out.emit_fmt(format_args!("    test{} %{}, {}", suffix, rax, lhs_str));
+            } else {
+                let rhs_str = fmt_operand(rhs, *size, out);
+                let lhs_str = fmt_operand(lhs, *size, out);
+                out.emit_fmt(format_args!("    test{} {}, {}", suffix, rhs_str, lhs_str));
+            }
         }
 
         MachInst::SetCC { cc, dst } => {
