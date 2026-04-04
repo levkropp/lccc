@@ -64,7 +64,8 @@ pub fn peephole_optimize(asm: String) -> String {
     let skip_phase1 = std::env::var("CCC_NO_PEEPHOLE_PHASE1").is_ok();
     let skip_phase2 = std::env::var("CCC_NO_PEEPHOLE_PHASE2").is_ok();
     let skip_phase3 = std::env::var("CCC_NO_PEEPHOLE_PHASE3").is_ok();
-    let skip_phase4 = std::env::var("CCC_NO_PEEPHOLE_PHASE4").is_ok();
+    let skip_phase4 = std::env::var("CCC_NO_PEEPHOLE_PHASE4").is_ok()
+        || std::env::var("CCC_USE_MACHINST").is_ok(); // Phase 4 has a register renaming bug triggered by MachInst
     let skip_phase5 = std::env::var("CCC_NO_PEEPHOLE_PHASE5").is_ok();
     let skip_phase6 = std::env::var("CCC_NO_PEEPHOLE_PHASE6").is_ok();
     let skip_phase7 = std::env::var("CCC_NO_PEEPHOLE_PHASE7").is_ok();
