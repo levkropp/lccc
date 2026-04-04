@@ -109,11 +109,11 @@ impl X86Codegen {
             caller_saved_regs.retain(|r| r.0 != 12 && r.0 != 13 && r.0 != 14 && r.0 != 15); // r8, r9, rdi, rsi
         }
         // r8: atomic RMW uses rdi instead of r8 (frees r8 unless i128 excludes it).
-        // rdx (PhysReg 16) is available as caller-saved when no codegen path uses
-        // it as scratch: no div/rem (implicit rdx), no i128 (rax:rdx pair), no GEP
-        // (indirect stores save acc to rdx), no switch (jump tables use rdx), no
-        // select (cmov path zeros rdx).
-        if !has_div_rem && !has_i128_ops && !has_gep && !has_switch && !has_select {
+        // rdx (PhysReg 16) is available as caller-saved when no instruction
+        // implicitly clobbers it: division (rdx:rax), i128 ops (rax:rdx pair),
+        // switch jump tables (rdx as dispatch). GEP indirect stores and Select
+        // cmov paths have been taught to use %r11 when rdx is allocated.
+        if !has_div_rem && !has_i128_ops && !has_switch {
             caller_saved_regs.push(PhysReg(16)); // rdx
         }
 
