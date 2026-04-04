@@ -817,7 +817,9 @@ impl X86Codegen {
                         if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128) {
                             if let Some(&d_reg) = self.reg_assignments.get(&dest.0) {
                                 if !is_xmm_reg(d_reg) {
-                                    let d_name = if matches!(ty, IrType::I32 | IrType::U32) {
+                                    // movslq/movsbq/movswq need 64-bit dest.
+                                    // movl/movzbl/movzwl use 32-bit dest (implicit zero-extend).
+                                    let d_name = if matches!(ty, IrType::U32 | IrType::F32) {
                                         phys_reg_name_32(d_reg)
                                     } else {
                                         phys_reg_name(d_reg)
