@@ -891,7 +891,13 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_save_acc_impl(&mut self) {
-        self.state.emit("    movq %rax, %rdx");
+        // Save %rax to a scratch register before loading a pointer to %rcx.
+        // Use %r11 when %rdx is allocated to a value (rdx is in the caller-saved pool).
+        if self.reg_assignments.values().any(|r| r.0 == 16) {
+            self.state.emit("    movq %rax, %r11");
+        } else {
+            self.state.emit("    movq %rax, %rdx");
+        }
     }
 
     pub(super) fn emit_load_ptr_from_slot_impl(&mut self, slot: StackSlot, val_id: u32) {
@@ -904,7 +910,9 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_typed_store_indirect_impl(&mut self, instr: &'static str, ty: IrType) {
-        let store_reg = Self::reg_for_type("rdx", ty);
+        // Use %r11 when rdx is allocated, matching emit_save_acc_impl.
+        let base_name = if self.reg_assignments.values().any(|r| r.0 == 16) { "r11" } else { "rdx" };
+        let store_reg = Self::reg_for_type(base_name, ty);
         self.state.emit_fmt(format_args!("    {} %{}, (%rcx)", instr, store_reg));
     }
 

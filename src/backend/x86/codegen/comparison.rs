@@ -235,6 +235,10 @@ impl X86Codegen {
         self.operand_to_rax(false_val);
         self.operand_to_rcx(true_val);
 
+        // Use %r11 for the condition when %rdx is allocated to a value.
+        let cond_reg = if self.reg_assignments.values().any(|r| r.0 == 16) { "r11" } else { "rdx" };
+        let cond_reg_32 = if cond_reg == "r11" { "r11d" } else { "edx" };
+
         match cond {
             Operand::Const(c) => {
                 let val = match c {
@@ -246,25 +250,25 @@ impl X86Codegen {
                     _ => 0,
                 };
                 if val == 0 {
-                    self.state.emit("    xorl %edx, %edx");
+                    self.state.emit_fmt(format_args!("    xorl %{0}, %{0}", cond_reg_32));
                 } else if val >= i32::MIN as i64 && val <= i32::MAX as i64 {
-                    self.state.out.emit_instr_imm_reg("    movq", val, "rdx");
+                    self.state.out.emit_instr_imm_reg("    movq", val, cond_reg);
                 } else {
-                    self.state.out.emit_instr_imm_reg("    movabsq", val, "rdx");
+                    self.state.out.emit_instr_imm_reg("    movabsq", val, cond_reg);
                 }
             }
             Operand::Value(v) => {
                 if let Some(&reg) = self.reg_assignments.get(&v.0) {
                     let reg_name = phys_reg_name(reg);
-                    self.state.out.emit_instr_reg_reg("    movq", reg_name, "rdx");
+                    self.state.out.emit_instr_reg_reg("    movq", reg_name, cond_reg);
                 } else if self.state.get_slot(v.0).is_some() {
-                    self.value_to_reg(v, "rdx");
+                    self.value_to_reg(v, cond_reg);
                 } else {
-                    self.state.emit("    xorl %edx, %edx");
+                    self.state.emit_fmt(format_args!("    xorl %{0}, %{0}", cond_reg_32));
                 }
             }
         }
-        self.state.emit("    testq %rdx, %rdx");
+        self.state.emit_fmt(format_args!("    testq %{0}, %{0}", cond_reg));
         self.state.emit("    cmovneq %rcx, %rax");
         self.state.reg_cache.invalidate_acc();
         self.store_rax_to(dest);
