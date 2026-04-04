@@ -1292,6 +1292,29 @@ impl X86Codegen {
         }
     }
 
+    /// Load instruction for a value, using movl instead of movslq for I32 when
+    /// the value doesn't need sign extension (not in needs_sext_values).
+    pub(super) fn mov_load_for_value(&self, ty: IrType, dest_id: u32) -> &'static str {
+        if ty == IrType::I32
+            && !self.needs_sext_values.is_empty()
+            && !self.needs_sext_values.contains(&dest_id) {
+            return "movl";
+        }
+        if ty == IrType::I32 && self.skip_i32_sext {
+            return "movl";
+        }
+        Self::mov_load_for_type(ty)
+    }
+
+    /// Destination register for a value load. When using movl (I32 without sext),
+    /// uses the 32-bit register name (eax) for implicit zero-extension.
+    pub(super) fn load_dest_reg_for_value(&self, ty: IrType, dest_id: u32) -> &'static str {
+        if ty == IrType::I32 && self.mov_load_for_value(ty, dest_id) == "movl" {
+            return "eax";
+        }
+        Self::load_dest_reg(ty)
+    }
+
     /// Destination register for loads. U32/F32 use movl which needs %eax.
     pub(super) fn load_dest_reg(ty: IrType) -> &'static str {
         match ty {
@@ -1569,7 +1592,7 @@ impl X86Codegen {
 
     /// Register-direct path for shift operations.
     pub(super) fn emit_shift_reg_direct(&mut self, op: IrBinOp, lhs: &Operand, rhs: &Operand,
-                             dest_phys: PhysReg, use_32bit: bool, is_unsigned: bool) {
+                             dest_phys: PhysReg, use_32bit: bool, is_unsigned: bool, dest_value_id: u32) {
         let dest_name = phys_reg_name(dest_phys);
         let dest_name_32 = phys_reg_name_32(dest_phys);
         let (mnem32, mnem64) = shift_mnemonic(op);
@@ -1580,7 +1603,7 @@ impl X86Codegen {
                 let shift_amount = (imm as u32) & 31;
                 self.state.emit_fmt(format_args!("    {} ${}, %{}", mnem32, shift_amount, dest_name_32));
                 if !is_unsigned && matches!(op, IrBinOp::Shl | IrBinOp::AShr) {
-                    self.state.out.emit_instr_reg_reg("    movslq", dest_name_32, dest_name);
+                    self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
                 }
             } else {
                 let shift_amount = (imm as u64) & 63;
@@ -1598,7 +1621,7 @@ impl X86Codegen {
             if use_32bit {
                 self.state.emit_fmt(format_args!("    {} %cl, %{}", mnem32, dest_name_32));
                 if !is_unsigned && matches!(op, IrBinOp::Shl | IrBinOp::AShr) {
-                    self.state.out.emit_instr_reg_reg("    movslq", dest_name_32, dest_name);
+                    self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
                 }
             } else {
                 self.state.emit_fmt(format_args!("    {} %cl, %{}", mnem64, dest_name));
@@ -1744,6 +1767,41 @@ fn collect_vregs_in_inst(
     }
 }
 
+/// Peephole: fold store followed by immediate reload when the slot is re-written later.
+fn fold_spill_relays(insts: &mut Vec<super::machinst::MachInst>) {
+    use super::machinst::{MachInst, MachOperand};
+    let mut last_write: crate::common::fx_hash::FxHashMap<i64, usize> = crate::common::fx_hash::FxHashMap::default();
+    for (idx, inst) in insts.iter().enumerate() {
+        if let MachInst::Mov { dst: MachOperand::StackSlot(s), .. } = inst {
+            last_write.insert(*s, idx);
+        }
+    }
+    let mut i = 0;
+    while i + 1 < insts.len() {
+        if let MachInst::Mov { src: src1, dst: MachOperand::StackSlot(s1), size: sz1 } = &insts[i] {
+            if let MachInst::Mov { src: MachOperand::StackSlot(s2), dst: dst2, size: sz2 } = &insts[i + 1] {
+                if s1 == s2 && sz1 == sz2 && matches!(dst2, MachOperand::Reg(_)) {
+                    if let Some(&last_idx) = last_write.get(s1) {
+                        if last_idx > i {
+                            let folded = MachInst::Mov { src: src1.clone(), dst: dst2.clone(), size: *sz1 };
+                            insts[i] = folded;
+                            insts.remove(i + 1);
+                            last_write.clear();
+                            for (idx, inst) in insts.iter().enumerate() {
+                                if let MachInst::Mov { dst: MachOperand::StackSlot(s), .. } = inst {
+                                    last_write.insert(*s, idx);
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+}
+
 /// Resolve stack-only vregs in a MachInst: replace MachReg::Vreg(id) with the
 /// value's stack slot as a memory operand. For instructions where the vreg is a
 /// dst (two-address ALU), we need to use rax as scratch: load→operate→store.
@@ -1855,6 +1913,8 @@ impl ArchCodegen for X86Codegen {
         self.reg_assignments.get(&val_id).copied()
     }
 
+    fn is_machinst_enabled(&self) -> bool { self.machinst_enabled }
+
     fn try_lower_machinst(&mut self, inst: &crate::ir::reexports::Instruction) -> bool {
         if !self.machinst_enabled { return false; }
 
@@ -1876,6 +1936,23 @@ impl ArchCodegen for X86Codegen {
                 }
             }
         });
+        // Load/Store ptr and GEP base: check separately (for_each_operand_in_instruction
+        // doesn't visit these from the liveness version).
+        match inst {
+            crate::ir::reexports::Instruction::Load { ptr, .. } |
+            crate::ir::reexports::Instruction::Store { ptr, .. } => {
+                if state.is_alloca(ptr.0) { reject = true; }
+                if let Some(r) = ra.get(&ptr.0) { if r.0 >= 20 { reject = true; } }
+                if !ra.contains_key(&ptr.0) && state.get_slot(ptr.0).is_none() { reject = true; }
+                if state.folded_gep_values.contains(&ptr.0) { reject = true; }
+            }
+            crate::ir::reexports::Instruction::GetElementPtr { base, .. } => {
+                if state.is_alloca(base.0) { reject = true; }
+                if let Some(r) = ra.get(&base.0) { if r.0 >= 20 { reject = true; } }
+                if !ra.contains_key(&base.0) && state.get_slot(base.0).is_none() { reject = true; }
+            }
+            _ => {}
+        }
         // Dest must have a register for ALU/Shift/Neg/Not (two-address instructions).
         // Cmp/SetCC don't write to a GPR dest in a useful way (flags only).
         // Copy dest can be a stack slot (resolved to Mov with StackSlot).
@@ -1888,16 +1965,9 @@ impl ArchCodegen for X86Codegen {
                 if r.0 == 6 { reject = true; }
             }
             if !ra.contains_key(&dest.0) {
-                // Stack-only dest is only OK for Copy (becomes Mov to stack slot).
-                // For BinOp/UnaryOp/Cast/Select, the dest needs a register for
-                // the two-address instruction form.
                 match inst {
                     crate::ir::reexports::Instruction::Copy { .. } => {
                         if state.get_slot(dest.0).is_none() { reject = true; }
-                    }
-                    crate::ir::reexports::Instruction::Cmp { .. } => {
-                        // Cmp result is a boolean — needs register for setCC.
-                        reject = true;
                     }
                     _ => { reject = true; }
                 }
@@ -1913,23 +1983,16 @@ impl ArchCodegen for X86Codegen {
 
         use super::machinst::{MachInst, MachReg, MachOperand, OpSize};
 
-        // Resolve all remaining vregs: replace stack-only values with their
-        // stack slot as a memory operand. This avoids the MachInst allocator
-        // needing to manage stack values — they just become memory operands
-        // in x86 instructions (e.g., addq -N(%rsp), %r12).
         let resolved: Vec<MachInst> = self.machinst_buf.iter().map(|inst| {
             resolve_stack_vregs(inst, &self.reg_assignments, &self.state)
         }).collect();
 
-        // Check for any remaining unresolvable vregs after stack resolution
         let has_bad = resolved.iter().any(|mi| has_unresolvable_vreg(mi, &self.reg_assignments));
         if has_bad {
             self.machinst_buf.clear();
             return;
         }
 
-        // No allocation needed — all vregs are now either Phys (from main
-        // allocator) or replaced with StackSlot memory operands.
         super::machinst_emit::emit_machinsts(&resolved, &mut self.state.out);
 
         self.machinst_buf.clear();

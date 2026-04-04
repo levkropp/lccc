@@ -151,6 +151,16 @@ pub struct CodegenState {
     /// Populated during instruction generation for GEPs with variable offsets.
     /// Used by the FMA intrinsic codegen to detect SIB addressing opportunities.
     pub gep_base_offset: FxHashMap<u32, (u32, u32)>,
+    /// Set of GEP result value IDs whose instructions were folded into Load/Store
+    /// and skipped during codegen. These values are never emitted — their registers
+    /// are uninitialized. MachInst must not use these as pointers.
+    pub folded_gep_values: FxHashSet<u32>,
+    /// Total use count for each value ID across the entire function.
+    /// Used by MachInst flush to determine if a buffer-defined vreg is live-out.
+    pub value_use_counts: Vec<u32>,
+    /// Use counts within the current block (set before block codegen).
+    /// Compared with value_use_counts to detect live-out values.
+    pub block_use_counts: FxHashMap<u32, u32>,
     /// Whether to replace `ret` with `jmp __x86_return_thunk` (-mfunction-return=thunk-extern).
     /// Used by the Linux kernel for Spectre v2 (retbleed) mitigation.
     pub function_return_thunk: bool,
@@ -284,6 +294,9 @@ impl CodegenState {
             frame_size: 0,
             reg_cache: RegCache::default(),
             gep_base_offset: FxHashMap::default(),
+            folded_gep_values: FxHashSet::default(),
+            value_use_counts: Vec::new(),
+            block_use_counts: FxHashMap::default(),
             function_return_thunk: false,
             indirect_branch_thunk: false,
             patchable_function_entry: None,

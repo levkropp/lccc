@@ -179,6 +179,10 @@ pub trait ArchCodegen {
     /// Default: always false (no MachInst support).
     fn try_lower_machinst(&mut self, _inst: &Instruction) -> bool { false }
 
+    /// Whether MachInst ISel is enabled. When true, GEP folding is skipped
+    /// so that GEPs and Load/Store go through the MachInst path for longer chains.
+    fn is_machinst_enabled(&self) -> bool { false }
+
     /// Flush the accumulated MachInst buffer: run register allocation and emit assembly.
     /// Called at block boundaries and before instructions that can't be lowered to MachInst.
     /// Default: no-op.
