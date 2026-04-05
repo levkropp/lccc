@@ -40,8 +40,11 @@ sign-extend chains), increment chain collapse, cascaded shift folding, loop rota
 with redundant sign-extend elimination, and loop-invariant GPR load hoisting. These
 peephole passes target SSA phi-resolution overhead, reducing the sieve marking loop
 from 11 to 6 instructions and bringing it to within 1.1× of GCC -O2.
-Together these bring LCCC to within 1.1–1.6× of GCC -O2 across all benchmarks, while keeping
-all 528 tests green.
+Together these bring LCCC to within 1.1–1.6× of GCC -O2 across all benchmarks.
+Phase 18 expands the MachInst virtual-register ISel to handle Cmp, Cast, Load/Store (with alloca
+support), GEP, and Alloca instructions, along with encoding fixes (movzbl/movzwl for shorter
+zero-extensions, per-value sign-extension elimination). These reduce SQLite .text by 41.7 KB and
+bring the binary size ratio from 1.73× to **1.69× GCC**.
 
 ```
 C source
@@ -56,6 +59,7 @@ Optimized IR
   │    pass 2: caller-saved  ↔ non-call-spanning unallocated values
   ▼
 Machine code  (x86-64 · AArch64 · RISC-V 64 · i686)
+  │  MachInst ISel: virtual-register lowering for BinOp · Cmp · Cast · Load · Store · GEP · Select
   │  peephole: FP round-trip elim · memory fold · SIB fold · accum ALU fold · phi-copy coalesce · loop rotate
   │  standalone assembler + linker (no external toolchain)
   ▼
@@ -159,12 +163,12 @@ All optimization passes active. 18/18 compatibility tests pass. Key improvements
 
 ### Compatibility Test Suite
 
-14/14 tests pass (without peephole, vectorize disabled):
+18/18 tests pass with all optimizations and peephole passes active:
 ```
 Level 1: hello world ✅  arithmetic ✅  string ops ✅  for loop ✅  while+break ✅
 Level 2: recursion ✅  function pointers ✅  pointer arithmetic ✅  malloc/free ✅
 Level 3: basic struct ✅  struct array ✅  struct with fptr ✅  linked list ✅
-Level 4: switch ✅  qsort ✅  varargs ✅  floating point ✅
+Level 4: switch ✅  qsort ✅  varargs ✅  setjmp/longjmp ✅  floating point ✅
 ```
 
 ### Comparison with CCC Benchmark Report
@@ -177,9 +181,13 @@ An [independent benchmark](https://github.com/harshavmb/compare-claude-compiler)
 | No optimization tiers (-O2 = -O0) | Full SSA optimization pipeline at -O2 |
 | No function inlining | 1,821-line inlining pass with heuristics |
 | No vectorization | AVX2 FMA + reduction vectorization |
-| 2.78x code bloat | Register allocation eliminates most stack traffic |
+| 2.78x code bloat | **1.69× GCC** on SQLite (down from 4.59×) |
 | 737x slower runtime | arith_loop/matmul at GCC parity, sieve 1.17x |
 | Corrupted frame pointers | CFI directives, frame pointer omission |
+
+**Binary size (SQLite .text):** LCCC 2,118 KB vs GCC -O2 1,251 KB = **1.69×** (867 KB gap).
+MachInst virtual-register ISel handles ~70% of non-call instructions directly, bypassing the
+accumulator for Cmp, Cast, Load, Store, GEP, BinOp, UnaryOp, Copy, and Select.
 
 ---
 

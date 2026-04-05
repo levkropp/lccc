@@ -12,7 +12,7 @@ next_page:
 
 # Roadmap
 {:.doc-subtitle}
-LCCC improves CCC in sixteen phases. Phases 1–14f are complete.
+LCCC improves CCC in twenty phases. Phases 1–20 are complete.
 
 ## Status Overview
 
@@ -40,7 +40,9 @@ LCCC improves CCC in sixteen phases. Phases 1–14f are complete.
 | 17 | Register-direct codegen | ✅ Complete | **-78KB: store/load/call-arg bypass accumulator** |
 | 18 | Vectorizer fixes | ✅ Complete | **32-byte AVX2 slots, 18/18 compat tests** |
 | 19 | Live range splitting | ✅ Complete | **IR-level with mem2reg SSA reconstruction** |
+| 20 | MachInst ISel expansion + encoding fixes | ✅ Complete | **-41.7KB: Cmp/Cast/Load/Store/GEP ISel, movzbl/movzwl, sext elim** |
 | — | Better function inlining | 🔲 Planned | ~1.5× on call-heavy code |
+| — | Full block-level MachInst codegen | 🔲 Planned | Replace accumulator model (~270KB potential) |
 | — | Profile-guided optimization (PGO) | 🔲 Planned | ~1.2–1.5× general |
 
 ---
