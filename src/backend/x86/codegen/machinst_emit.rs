@@ -113,6 +113,11 @@ fn fmt_operand(op: &MachOperand, size: OpSize, out: &AsmOutput) -> String {
             }
         }
         MachOperand::RipRel(sym) => format!("{}(%rip)", sym),
+        MachOperand::AllocaAddr(_) => {
+            // AllocaAddr should have been resolved before emission.
+            // If we reach here, emit a placeholder that will cause an assembler error.
+            "%ALLOCA_ADDR_UNRESOLVED".to_string()
+        }
     }
 }
 

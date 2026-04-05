@@ -1918,33 +1918,34 @@ impl ArchCodegen for X86Codegen {
     fn try_lower_machinst(&mut self, inst: &crate::ir::reexports::Instruction) -> bool {
         if !self.machinst_enabled { return false; }
 
-        // Reject instructions involving values we can't handle:
-        // - allocas (need leaq for address computation)
-        // - operands with no register AND no stack slot
-        // - dest with no register (MachInst two-address Alu can't write to stack)
+        // Reject instructions involving values we can't handle.
+        // Allocas are allowed for Load/Store ptr (ISel handles via StackSlot).
         use crate::backend::liveness::for_each_operand_in_instruction;
         let ra = &self.reg_assignments;
         let state = &self.state;
         let mut reject = false;
+        let is_load_store = matches!(inst,
+            crate::ir::reexports::Instruction::Load { .. } |
+            crate::ir::reexports::Instruction::Store { .. });
         for_each_operand_in_instruction(inst, |op| {
             if let crate::ir::reexports::Operand::Value(v) = op {
+                // Alloca operand VALUES (not ptrs) are still rejected
                 if state.is_alloca(v.0) { reject = true; return; }
-                // Reject XMM-allocated values (float values in GPR MachInst)
                 if let Some(r) = ra.get(&v.0) { if r.0 >= 20 { reject = true; return; } }
                 if !ra.contains_key(&v.0) && state.get_slot(v.0).is_none() {
                     reject = true;
                 }
             }
         });
-        // Load/Store ptr and GEP base: check separately (for_each_operand_in_instruction
-        // doesn't visit these from the liveness version).
+        // Load/Store ptr: allow allocas (ISel handles via StackSlot) and register ptrs.
+        // Reject folded GEP ptrs, XMM ptrs, and ptrs with no register and no alloca.
         match inst {
             crate::ir::reexports::Instruction::Load { ptr, .. } |
             crate::ir::reexports::Instruction::Store { ptr, .. } => {
-                if state.is_alloca(ptr.0) { reject = true; }
-                if let Some(r) = ra.get(&ptr.0) { if r.0 >= 20 { reject = true; } }
-                if !ra.contains_key(&ptr.0) && state.get_slot(ptr.0).is_none() { reject = true; }
                 if state.folded_gep_values.contains(&ptr.0) { reject = true; }
+                if let Some(r) = ra.get(&ptr.0) { if r.0 >= 20 { reject = true; } }
+                // Ptr must be: alloca, or have a register
+                if !state.is_alloca(ptr.0) && !ra.contains_key(&ptr.0) { reject = true; }
             }
             crate::ir::reexports::Instruction::GetElementPtr { base, .. } => {
                 if state.is_alloca(base.0) { reject = true; }
@@ -1975,7 +1976,21 @@ impl ArchCodegen for X86Codegen {
         }
         if reject { return false; }
 
-        super::isel::lower_instruction(inst, &self.reg_assignments, &mut self.machinst_buf)
+        // Build alloca slot map for Load/Store ISel
+        let mut alloca_slots = crate::common::fx_hash::FxHashMap::default();
+        match inst {
+            crate::ir::reexports::Instruction::Load { ptr, .. } |
+            crate::ir::reexports::Instruction::Store { ptr, .. } => {
+                if self.state.is_alloca(ptr.0) {
+                    if let Some(slot) = self.state.get_slot(ptr.0) {
+                        alloca_slots.insert(ptr.0, slot.0);
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        super::isel::lower_instruction_ctx(inst, &self.reg_assignments, &alloca_slots, &mut self.machinst_buf)
     }
 
     fn flush_machinst(&mut self) {

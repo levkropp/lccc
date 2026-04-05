@@ -535,11 +535,29 @@ pub fn can_lower(inst: &Instruction) -> bool {
     }
 }
 
+/// Context for ISel: provides slot information for alloca-aware lowering.
+pub struct ISelContext<'a> {
+    pub reg_assignments: &'a FxHashMap<u32, PhysReg>,
+    /// Maps alloca value IDs to their stack slot offsets.
+    /// Used for Load/Store from allocas (direct slot access).
+    pub alloca_slots: &'a FxHashMap<u32, i64>,
+}
+
 /// Lower a single IR instruction to MachInst.
 /// Returns true if lowered, false if it should use Raw passthrough.
 pub fn lower_instruction(
     inst: &Instruction,
     reg_assignments: &FxHashMap<u32, PhysReg>,
+    out: &mut Vec<MachInst>,
+) -> bool {
+    lower_instruction_ctx(inst, reg_assignments, &FxHashMap::default(), out)
+}
+
+/// Lower with full context (alloca slots for Load/Store).
+pub fn lower_instruction_ctx(
+    inst: &Instruction,
+    reg_assignments: &FxHashMap<u32, PhysReg>,
+    alloca_slots: &FxHashMap<u32, i64>,
     out: &mut Vec<MachInst>,
 ) -> bool {
     // For values that already have register allocations from the existing
@@ -556,10 +574,56 @@ pub fn lower_instruction(
             lower_binop(dest, *op, lhs, rhs, *ty, ra, out);
             true
         }
-        Instruction::Load { .. } => {
+        Instruction::Load { dest, ptr, ty, seg_override } => {
+            if ty.is_float() || ty.is_128bit() || ty.is_long_double() { return false; }
+            if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) { return false; }
+            if *seg_override != AddressSpace::Default { return false; }
+            let size = OpSize::from_ir_type(*ty);
+            let dst = value_to_reg(dest, ra);
+            // Alloca: load directly from stack slot
+            if let Some(&slot) = alloca_slots.get(&ptr.0) {
+                out.push(MachInst::Mov {
+                    src: MachOperand::StackSlot(slot),
+                    dst: MachOperand::Reg(dst),
+                    size,
+                });
+                return true;
+            }
+            // Pointer in register: load via memory operand
+            if let Some(&phys) = ra.get(&ptr.0) {
+                out.push(MachInst::Mov {
+                    src: MachOperand::Mem { base: MachReg::Phys(phys), offset: 0 },
+                    dst: MachOperand::Reg(dst),
+                    size,
+                });
+                return true;
+            }
             false
         }
-        Instruction::Store { .. } => {
+        Instruction::Store { val, ptr, ty, seg_override } => {
+            if ty.is_float() || ty.is_128bit() || ty.is_long_double() { return false; }
+            if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) { return false; }
+            if *seg_override != AddressSpace::Default { return false; }
+            let size = OpSize::from_ir_type(*ty);
+            let src = lower_operand_with_regs(val, ra);
+            // Alloca: store directly to stack slot
+            if let Some(&slot) = alloca_slots.get(&ptr.0) {
+                out.push(MachInst::Mov {
+                    src,
+                    dst: MachOperand::StackSlot(slot),
+                    size,
+                });
+                return true;
+            }
+            // Pointer in register: store via memory operand
+            if let Some(&phys) = ra.get(&ptr.0) {
+                out.push(MachInst::Mov {
+                    src,
+                    dst: MachOperand::Mem { base: MachReg::Phys(phys), offset: 0 },
+                    size,
+                });
+                return true;
+            }
             false
         }
         Instruction::Copy { dest, src } => {
