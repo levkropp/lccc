@@ -201,7 +201,7 @@ impl X86Codegen {
         } else {
             self.state.emit("    sete %al");
         }
-        self.state.emit("    movzbq %al, %rax");
+        self.state.emit("    movzbl %al, %eax");
     }
 
     pub(super) fn emit_i128_cmp_ordered_impl(&mut self, op: IrCmpOp) {
@@ -225,7 +225,7 @@ impl X86Codegen {
         };
         self.state.emit_fmt(format_args!("    {} %r8b", set_lo));
         self.state.emit("1:");
-        self.state.emit("    movzbq %r8b, %rax");
+        self.state.emit("    movzbl %r8b, %eax");
     }
 
     pub(super) fn emit_i128_cmp_store_result_impl(&mut self, dest: &Value) {

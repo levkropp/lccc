@@ -228,7 +228,7 @@ impl X86Codegen {
             self.state.emit("    movq (%rsp), %rax");
             self.state.emit("    addq $8, %rsp");
             match to_ty {
-                IrType::U8 => self.state.emit("    movzbq %al, %rax"),
+                IrType::U8 => self.state.emit("    movzbl %al, %eax"),
                 IrType::U16 => self.state.emit("    movzwq %ax, %rax"),
                 IrType::U32 => self.state.emit("    movl %eax, %eax"),
                 _ => {}
@@ -391,7 +391,7 @@ impl X86Codegen {
 
     fn emit_zero_extend_to_rax(&mut self, ty: IrType) {
         match ty {
-            IrType::U8 => self.state.emit("    movzbq %al, %rax"),
+            IrType::U8 => self.state.emit("    movzbl %al, %eax"),
             IrType::U16 => self.state.emit("    movzwq %ax, %rax"),
             IrType::U32 => self.state.emit("    movl %eax, %eax"),
             _ => {}

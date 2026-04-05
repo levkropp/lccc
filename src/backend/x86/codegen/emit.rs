@@ -1283,9 +1283,9 @@ impl X86Codegen {
     pub(super) fn mov_load_for_type(ty: IrType) -> &'static str {
         match ty {
             IrType::I8 => "movsbq",
-            IrType::U8 => "movzbq",
+            IrType::U8 => "movzbl",    // movzbl zero-extends to 64-bit implicitly (saves REX vs movzbq)
             IrType::I16 => "movswq",
-            IrType::U16 => "movzwq",
+            IrType::U16 => "movzwl",   // movzwl zero-extends to 64-bit implicitly (saves REX vs movzwq)
             IrType::I32 => "movslq",
             IrType::U32 | IrType::F32 => "movl",     // movl zero-extends to 64-bit implicitly
             _ => "movq",
@@ -1315,10 +1315,10 @@ impl X86Codegen {
         Self::load_dest_reg(ty)
     }
 
-    /// Destination register for loads. U32/F32 use movl which needs %eax.
+    /// Destination register for loads. movzbl/movzwl/movl use 32-bit %eax.
     pub(super) fn load_dest_reg(ty: IrType) -> &'static str {
         match ty {
-            IrType::U32 | IrType::F32 => "%eax",
+            IrType::U8 | IrType::U16 | IrType::U32 | IrType::F32 => "%eax",
             _ => "%rax",
         }
     }

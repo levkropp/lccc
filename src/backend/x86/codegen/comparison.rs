@@ -40,7 +40,7 @@ impl X86Codegen {
                 self.state.emit("    setae %al");
             }
         }
-        self.state.emit("    movzbq %al, %rax");
+        self.state.emit("    movzbl %al, %eax");
         self.state.reg_cache.invalidate_acc();
         self.store_rax_to(dest);
     }
@@ -70,7 +70,7 @@ impl X86Codegen {
                 self.state.emit("    setae %al");
             }
         }
-        self.state.emit("    movzbq %al, %rax");
+        self.state.emit("    movzbl %al, %eax");
         self.state.reg_cache.invalidate_acc();
         self.store_rax_to(dest);
     }
@@ -104,7 +104,7 @@ impl X86Codegen {
             }
         }
 
-        self.state.emit("    movzbq %al, %rax");
+        self.state.emit("    movzbl %al, %eax");
         self.state.reg_cache.invalidate_acc();
         self.store_rax_to(dest);
     }
