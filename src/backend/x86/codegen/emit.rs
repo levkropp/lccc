@@ -1835,6 +1835,29 @@ fn resolve_stack_vregs(
     };
 
     match inst {
+        MachInst::Mov { src: MachOperand::AllocaAddr(id), dst, size } => {
+            // AllocaAddr: resolve to StackSlot but keep AllocaAddr tag so
+            // the emitter knows to use leaq instead of movq.
+            if let Some(slot) = state.get_slot(*id) {
+                // Emit as: Mov { src: AllocaAddr but with resolved slot, dst }
+                // We encode the slot in a special way the emitter recognizes.
+                // Actually, just resolve to a Lea with StackSlot-based addressing.
+                // The emitter handles StackSlot with use_rsp_addressing.
+                // Produce: Raw("    leaq slot(%rbp), %reg") with correct addressing.
+                if let MachOperand::Reg(r) = dst {
+                    let dst_name = super::machinst_emit::reg_name_pub(*r);
+                    if state.out.use_rsp_addressing {
+                        let rsp_off = state.out.rsp_frame_size + slot.0;
+                        return MachInst::Raw(format!("    leaq {}(%rsp), %{}", rsp_off, dst_name));
+                    } else {
+                        return MachInst::Raw(format!("    leaq {}(%rbp), %{}", slot.0, dst_name));
+                    }
+                }
+                MachInst::Mov { src: MachOperand::StackSlot(slot.0), dst: resolve_op(dst), size: *size }
+            } else {
+                inst.clone()
+            }
+        }
         MachInst::Mov { src, dst, size } => MachInst::Mov {
             src: resolve_op(src), dst: resolve_op(dst), size: *size,
         },
@@ -1948,9 +1971,11 @@ impl ArchCodegen for X86Codegen {
                 if !state.is_alloca(ptr.0) && !ra.contains_key(&ptr.0) { reject = true; }
             }
             crate::ir::reexports::Instruction::GetElementPtr { base, .. } => {
-                if state.is_alloca(base.0) { reject = true; }
-                if let Some(r) = ra.get(&base.0) { if r.0 >= 20 { reject = true; } }
-                if !ra.contains_key(&base.0) && state.get_slot(base.0).is_none() { reject = true; }
+                // Allow alloca bases (ISel handles via AllocaAddr + leaq)
+                if !state.is_alloca(base.0) {
+                    if let Some(r) = ra.get(&base.0) { if r.0 >= 20 { reject = true; } }
+                    if !ra.contains_key(&base.0) && state.get_slot(base.0).is_none() { reject = true; }
+                }
             }
             _ => {}
         }
@@ -1976,7 +2001,7 @@ impl ArchCodegen for X86Codegen {
         }
         if reject { return false; }
 
-        // Build alloca slot map for Load/Store ISel
+        // Build alloca slot map for Load/Store/GEP ISel
         let mut alloca_slots = crate::common::fx_hash::FxHashMap::default();
         match inst {
             crate::ir::reexports::Instruction::Load { ptr, .. } |
@@ -1984,6 +2009,13 @@ impl ArchCodegen for X86Codegen {
                 if self.state.is_alloca(ptr.0) {
                     if let Some(slot) = self.state.get_slot(ptr.0) {
                         alloca_slots.insert(ptr.0, slot.0);
+                    }
+                }
+            }
+            crate::ir::reexports::Instruction::GetElementPtr { base, .. } => {
+                if self.state.is_alloca(base.0) {
+                    if let Some(slot) = self.state.get_slot(base.0) {
+                        alloca_slots.insert(base.0, slot.0);
                     }
                 }
             }
