@@ -630,15 +630,22 @@ pub fn lower_instruction_ctx(
             lower_copy(dest, src, ra, out);
             true
         }
-        Instruction::Cmp { .. } => {
-            // Cmp lowering disabled: the existing codegen's SetCC+Movzbl path
-            // has edge cases with register naming. Re-enable after fixing.
-            false
+        Instruction::Cmp { dest, op, lhs, rhs, ty } => {
+            if ty.is_float() || ty.is_128bit() { return false; }
+            // Dest must have a register for SetCC (writes to 8-bit register).
+            // Stack-only dests are rejected by try_lower_machinst.
+            if !ra.contains_key(&dest.0) { return false; }
+            lower_cmp(dest, *op, lhs, rhs, *ty, ra, out);
+            true
         }
-        Instruction::Cast { .. } => {
-            // Cast lowering disabled: register naming edge cases with
-            // sign/zero extension and 32-bit sub-registers.
-            false
+        Instruction::Cast { dest, src, from_ty, to_ty } => {
+            if from_ty.is_float() || to_ty.is_float() { return false; }
+            if from_ty.is_128bit() || to_ty.is_128bit() { return false; }
+            if from_ty.is_long_double() || to_ty.is_long_double() { return false; }
+            // Dest must have a register for Movsx/Movzx.
+            if !ra.contains_key(&dest.0) { return false; }
+            lower_cast(dest, src, *from_ty, *to_ty, ra, out);
+            true
         }
         Instruction::UnaryOp { dest, op, src, ty } => {
             if ty.is_float() || ty.is_128bit() { return false; }
