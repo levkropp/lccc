@@ -82,6 +82,10 @@ pub enum MachOperand {
     /// Stack slot (assigned after register allocation for spills).
     /// The i64 is the offset from the frame pointer (%rbp or %rsp-relative).
     StackSlot(i64),
+    /// Address of a stack slot (leaq). The u32 is the IR value ID of the alloca.
+    /// During resolve, this becomes `leaq slot(%rbp), %dst` — producing the
+    /// address of the alloca, not its contents.
+    AllocaAddr(u32),
     /// RIP-relative symbol reference: symbol(%rip).
     RipRel(String),
 }
