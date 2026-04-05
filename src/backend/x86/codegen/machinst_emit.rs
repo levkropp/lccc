@@ -367,14 +367,13 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
 
         MachInst::Movzx { src, dst, from_size, to_size } => {
             let src_str = fmt_reg(src, *from_size);
-            let dst_str = fmt_reg(dst, *to_size);
-            // movzbl, movzwl, movzbq, movzwq
+            // movzbl/movzwl always use 32-bit dest (implicit zero-extend to 64-bit)
+            let actual_dst_size = if *to_size == OpSize::S64 { OpSize::S32 } else { *to_size };
+            let dst_str = fmt_reg(dst, actual_dst_size);
             let mnem = match (from_size, to_size) {
-                (OpSize::S8, OpSize::S32) => "movzbl",
-                (OpSize::S16, OpSize::S32) => "movzwl",
-                (OpSize::S8, OpSize::S64) => "movzbq",
-                (OpSize::S16, OpSize::S64) => "movzwq",
-                _ => "movzbl", // fallback
+                (OpSize::S8, _) => "movzbl",
+                (OpSize::S16, _) => "movzwl",
+                _ => "movzbl",
             };
             out.emit_fmt(format_args!("    {} {}, {}", mnem, src_str, dst_str));
         }
