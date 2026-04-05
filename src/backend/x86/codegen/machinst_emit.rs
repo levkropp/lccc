@@ -7,6 +7,14 @@ use crate::backend::regalloc::PhysReg;
 use crate::backend::common::AsmOutput;
 use super::machinst::*;
 
+/// Public accessor for register name (used by resolve_stack_vregs for AllocaAddr).
+pub fn reg_name_pub(r: MachReg) -> &'static str {
+    match r {
+        MachReg::Phys(p) => reg_name(p),
+        MachReg::Vreg(id) => "VREG_UNRESOLVED", // shouldn't happen
+    }
+}
+
 /// Map a PhysReg to its 64-bit register name.
 /// Extends the existing phys_reg_name to also handle rax(0) and rcx(7).
 fn reg_name(reg: PhysReg) -> &'static str {
@@ -166,6 +174,15 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
     match inst {
         MachInst::Mov { src, dst, size } => {
             // Skip self-moves (same register or same stack slot)
+            // AllocaAddr → Reg: emit leaq instead of mov
+            if let MachOperand::AllocaAddr(id) = src {
+                if let MachOperand::Reg(r) = dst {
+                    // This should have been resolved to a StackSlot-based leaq.
+                    // If we reach here, the alloca wasn't resolved — emit placeholder.
+                    out.emit_fmt(format_args!("    # ERROR: unresolved AllocaAddr({})", id));
+                    return;
+                }
+            }
             match (src, dst) {
                 (MachOperand::Reg(a), MachOperand::Reg(b)) if a == b => return,
                 (MachOperand::StackSlot(a), MachOperand::StackSlot(b)) if a == b => return,
