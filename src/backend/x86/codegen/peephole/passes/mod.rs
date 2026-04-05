@@ -98,6 +98,7 @@ pub fn peephole_optimize(asm: String) -> String {
         if !sk("fuse_copy_op") { changed |= local_patterns::fuse_copy_and_operation(&mut store, &mut infos); }
         if !sk("fp_hoist") { changed |= local_patterns::promote_loop_invariant_fp_load(&mut store, &mut infos); }
         if !sk("dead_signext") { changed |= local_patterns::eliminate_dead_sign_extensions(&mut store, &mut infos); }
+        if !sk("dead_leaq") { changed |= local_patterns::eliminate_redundant_leaq(&store, &mut infos); }
         if !sk("base_index") { changed |= local_patterns::fold_base_index_addressing(&mut store, &mut infos); }
         if !sk("acc_alu") { changed |= local_patterns::fold_accumulator_alu_store(&mut store, &mut infos); }
         if !sk("phi_coalesce") { changed |= local_patterns::coalesce_phi_register_copies(&mut store, &mut infos); }

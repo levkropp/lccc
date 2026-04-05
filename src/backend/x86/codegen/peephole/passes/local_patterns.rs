@@ -3242,3 +3242,63 @@ pub(super) fn rotate_loops(
     }
     changed
 }
+
+/// Eliminate redundant `leaq src, %rax` when %rax already holds `src` from
+/// a previous leaq in the same basic block.
+///
+/// Pattern: `leaq X, %rax` ... `leaq X, %rax` where %rax wasn't clobbered.
+/// The second leaq is eliminated (marked NOP).
+///
+/// This handles the common accumulator pattern where alloca addresses are
+/// recomputed multiple times for successive Load/Store operations.
+pub(super) fn eliminate_redundant_leaq(store: &LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    // Track: the last leaq source that produced %rax, and its position
+    let mut rax_leaq_src: Option<String> = None;
+
+    for i in 0..len {
+        if infos[i].is_nop() { continue; }
+        let line = infos[i].trimmed(store.get(i));
+
+        // Block boundary resets tracking
+        if line.ends_with(':') || line.starts_with(".LBB") || line == "ret"
+            || line.starts_with("jmp ") || line.starts_with("call ") {
+            rax_leaq_src = None;
+            continue;
+        }
+
+        // Check if this is `leaq X, %rax`
+        if line.starts_with("leaq ") && line.ends_with(", %rax") {
+            let src = &line[5..line.len() - 6]; // between "leaq " and ", %rax"
+            if let Some(ref prev_src) = rax_leaq_src {
+                if src == prev_src.as_str() {
+                    // Redundant — rax already holds this address
+                    super::super::types::mark_nop(&mut infos[i]);
+                    changed = true;
+                    continue;
+                }
+            }
+            rax_leaq_src = Some(src.to_string());
+            continue;
+        }
+
+        // Check if %rax is written (clobbered). Conservative: any instruction
+        // that writes to rax/eax as destination invalidates the leaq cache.
+        // Reads of rax (movq %rax, X / cmpq %rax / testq %rax) are OK.
+        let writes_rax = line.ends_with(", %rax") || line.ends_with(", %eax")
+            || line.starts_with("call ") || line.starts_with("xorl %eax, %eax")
+            || line == "cltq" || line == "cqto"
+            || line.starts_with("popq %rax")
+            || (line.starts_with("addq ") && line.ends_with(", %rax"))
+            || (line.starts_with("subq ") && line.ends_with(", %rax"))
+            || (line.starts_with("imulq ") && line.ends_with(", %rax"))
+            || (line.starts_with("andq ") && line.ends_with(", %rax"))
+            || (line.starts_with("orq ") && line.ends_with(", %rax"))
+            || (line.starts_with("xorq ") && line.ends_with(", %rax"));
+        if writes_rax {
+            rax_leaq_src = None;
+        }
+    }
+    changed
+}
