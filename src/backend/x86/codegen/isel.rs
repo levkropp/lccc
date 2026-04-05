@@ -689,6 +689,17 @@ pub fn lower_instruction_ctx(
             lower_gep(dest, base, offset, ra, out);
             true
         }
+        Instruction::GlobalAddr { .. } => {
+            // GlobalAddr needs leaq symbol(%rip) which isn't directly
+            // expressible in MachInst Mov (would produce movq, not leaq).
+            // Handled by the default codegen path for now.
+            false
+        }
+        Instruction::Alloca { .. } => {
+            // Alloca produces no code (stack allocated in prologue).
+            // Return true to avoid flushing the MachInst buffer.
+            true
+        }
         _ => false,
     }
 }
