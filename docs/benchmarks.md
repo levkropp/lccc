@@ -19,12 +19,12 @@ Six micro-benchmarks targeting different bottlenecks. All measured with best-of-
 | Item | Value |
 |------|-------|
 | **Host** | Linux x86-64 |
-| **LCCC** | Phase 16g complete — linear scan + TCE + phi-copy coalescing + FP opts + AVX2 vectorization + reduction vectorization + rec-to-iter + SIB fold + accumulator fold + sign-ext fusion + loop rotation + phi register coalescing + 3-channel multiply ILP + byte-offset IV + leaq GEP + FMA register elimination + broadcast hoisting + peephole XMM fixes |
+| **LCCC** | Phase 18 — linear scan + TCE + phi-copy coalescing + FP opts + AVX2 vectorization + reduction vectorization + rec-to-iter + SIB fold + accumulator fold + sign-ext fusion + loop rotation + phi register coalescing + MachInst ISel (Cmp/Cast/Load/Store/GEP) + movzbl/movzwl encoding |
 | **CCC** | upstream, three-phase greedy allocator |
 | **GCC** | 15.2.1 (Arch Linux) |
 | **Flags** | `-O2` for all compilers (GCC `-O3 -march=native` for reduction comparison) |
 | **Timing** | `time.perf_counter()` wall clock, 7 reps, best taken |
-| **Date** | 2026-03-25 |
+| **Date** | 2026-04-05 |
 
 ## Results
 
