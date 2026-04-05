@@ -598,7 +598,19 @@ pub fn lower_instruction_ctx(
                 });
                 return true;
             }
-            false
+            // Pointer on stack: load ptr to rcx, then dereference
+            let ptr_vreg = value_to_reg(ptr, ra);
+            out.push(MachInst::Mov {
+                src: MachOperand::Reg(ptr_vreg),
+                dst: MachOperand::Reg(MachReg::Phys(RCX)),
+                size: OpSize::S64,
+            });
+            out.push(MachInst::Mov {
+                src: MachOperand::Mem { base: MachReg::Phys(RCX), offset: 0 },
+                dst: MachOperand::Reg(dst),
+                size,
+            });
+            true
         }
         Instruction::Store { val, ptr, ty, seg_override } => {
             if ty.is_float() || ty.is_128bit() || ty.is_long_double() { return false; }
@@ -624,7 +636,19 @@ pub fn lower_instruction_ctx(
                 });
                 return true;
             }
-            false
+            // Pointer on stack: load ptr to rcx, then store through it
+            let ptr_vreg = value_to_reg(ptr, ra);
+            out.push(MachInst::Mov {
+                src: MachOperand::Reg(ptr_vreg),
+                dst: MachOperand::Reg(MachReg::Phys(RCX)),
+                size: OpSize::S64,
+            });
+            out.push(MachInst::Mov {
+                src,
+                dst: MachOperand::Mem { base: MachReg::Phys(RCX), offset: 0 },
+                size,
+            });
+            true
         }
         Instruction::Copy { dest, src } => {
             lower_copy(dest, src, ra, out);
@@ -659,8 +683,11 @@ pub fn lower_instruction_ctx(
             lower_select(dest, cond, true_val, false_val, *ty, ra, out);
             true
         }
-        Instruction::GetElementPtr { .. } => {
-            false
+        Instruction::GetElementPtr { dest, base, offset, .. } => {
+            // Only non-alloca base with register (alloca GEP needs leaq)
+            if !ra.contains_key(&base.0) { return false; }
+            lower_gep(dest, base, offset, ra, out);
+            true
         }
         _ => false,
     }

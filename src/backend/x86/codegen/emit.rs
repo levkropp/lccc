@@ -1967,8 +1967,9 @@ impl ArchCodegen for X86Codegen {
             crate::ir::reexports::Instruction::Store { ptr, .. } => {
                 if state.folded_gep_values.contains(&ptr.0) { reject = true; }
                 if let Some(r) = ra.get(&ptr.0) { if r.0 >= 20 { reject = true; } }
-                // Ptr must be: alloca, or have a register
-                if !state.is_alloca(ptr.0) && !ra.contains_key(&ptr.0) { reject = true; }
+                // Ptr must be: alloca, register, or stack slot (ISel loads to rcx)
+                if !state.is_alloca(ptr.0) && !ra.contains_key(&ptr.0)
+                    && state.get_slot(ptr.0).is_none() { reject = true; }
             }
             crate::ir::reexports::Instruction::GetElementPtr { base, .. } => {
                 // Allow alloca bases (ISel handles via AllocaAddr + leaq)
