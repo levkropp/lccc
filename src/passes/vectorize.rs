@@ -813,6 +813,30 @@ fn analyze_reduction_pattern(
     }
     let accumulator_phi = accumulator_phi?;
 
+    // Reject loops with multiple reduction phis (e.g., `vBv += ... ; vv += ...`).
+    // The vectorizer only handles one reduction; transforming the loop structure
+    // (splitting into vector + remainder) corrupts any additional reductions.
+    let other_zero_phis = header.instructions.iter().filter(|inst| {
+        if let Instruction::Phi { dest, incoming, .. } = inst {
+            if *dest != iv && *dest != accumulator_phi && incoming.len() == 2 {
+                return incoming.iter().any(|(val, _)| {
+                    if let Operand::Const(c) = val {
+                        c.to_i64() == Some(0) || c.to_f64().map(|f| f == 0.0).unwrap_or(false)
+                    } else {
+                        false
+                    }
+                });
+            }
+        }
+        false
+    }).count();
+    if other_zero_phis > 0 {
+        if debug {
+            eprintln!("[VEC-RED]   Rejecting: {} other zero-init phis in header (multi-reduction)", other_zero_phis);
+        }
+        return None;
+    }
+
     // Build a set of accumulator-derived values (accumulator + casts of accumulator)
     let mut accumulator_derived = FxHashSet::default();
     accumulator_derived.insert(accumulator_phi);
