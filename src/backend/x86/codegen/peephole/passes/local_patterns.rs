@@ -192,6 +192,10 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
         // eliminates the second mov (since %regA still holds the original value).
         //
         // Safety: We only skip NOPs and StoreRbp between the two instructions.
+        // IMPORTANT: Don't eliminate reverse-moves where regA is caller-saved
+        // and the reverse-move is needed to reload a param after a call.
+        // The `pinned` check in mark_nop handles some cases, but we also skip
+        // this pattern entirely when a Call appears between the two moves.
         // StoreRbp reads registers but never modifies any GP register value.
         // Any other instruction type causes the search to stop via `break`.
         if let LineKind::Other { dest_reg: dest_a } = infos[i].kind {

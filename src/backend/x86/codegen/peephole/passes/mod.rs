@@ -75,24 +75,24 @@ pub fn peephole_optimize(asm: String) -> String {
     let mut infos: Vec<LineInfo> = (0..line_count).map(|i| classify_line(store.get(i))).collect();
 
     // Pin parameter pre-store instructions: `movq %arg_reg, %callee_saved_reg`
-    // that appear before the first function call. These save function parameters
-    // to callee-saved registers and must never be removed by any peephole pass.
+    // that appear in the prologue area (before the first function call).
+    // These save function parameters to callee-saved registers and must never
+    // be removed by any peephole pass, since the ABI arg registers get
+    // clobbered by subsequent calls.
     {
         let mut in_prologue = false;
         for idx in 0..line_count {
             let trimmed = infos[idx].trimmed(store.get(idx));
-            // Start tracking after .cfi_startproc or function labels
             if trimmed.starts_with(".cfi_startproc") {
                 in_prologue = true;
                 continue;
             }
             if !in_prologue { continue; }
-            // Stop at first call instruction
             if matches!(infos[idx].kind, LineKind::Call) {
                 in_prologue = false;
                 continue;
             }
-            // Pin movq from arg regs to callee-saved regs in the prologue area
+            // Pin movq from arg regs to callee-saved regs
             if trimmed.starts_with("movq %") {
                 let is_param_prestore = (trimmed.contains("%rdi") || trimmed.contains("%rsi")
                     || trimmed.contains("%rdx") || trimmed.contains("%rcx")
