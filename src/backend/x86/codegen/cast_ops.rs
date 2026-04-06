@@ -271,10 +271,14 @@ impl X86Codegen {
                 return true;
             }
             CastKind::SignedToUnsignedSameSize { to_ty: t } => {
-                // Same size, just zero-extend to clear sign bits.
+                // Same size conversion. Use movq for 32-bit reg-to-reg to avoid
+                // zero-extension corrupting callee-saved register upper bits.
                 if let Some(src_reg) = src_phys {
                     match t.size() {
-                        4 => self.state.emit_fmt(format_args!("    movl %{}, %{}", phys_reg_name_32(src_reg), dest_32)),
+                        4 => {
+                            let src_name = phys_reg_name(src_reg);
+                            self.state.out.emit_instr_reg_reg("    movq", src_name, dest_64);
+                        }
                         2 => self.state.emit_fmt(format_args!("    movzwl %{}, %{}", typed_phys_reg_name(src_reg, t), dest_32)),
                         1 => self.state.emit_fmt(format_args!("    movzbl %{}, %{}", typed_phys_reg_name(src_reg, t), dest_32)),
                         _ => { self.operand_to_callee_reg(src, dest_phys); }
