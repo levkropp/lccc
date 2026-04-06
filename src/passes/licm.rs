@@ -385,10 +385,35 @@ fn build_value_to_base_alloca(func: &IrFunction, alloca_info: &AllocaAnalysis) -
 /// Build a mapping from GEP/Copy result values to their ultimate base GlobalAddr.
 /// Follows chains like `gep(gep(GlobalAddr, off1), off2)` → GlobalAddr.
 fn build_value_to_base_global(func: &IrFunction, global_addr_values: &FxHashSet<u32>) -> FxHashMap<u32, u32> {
+    // Build canonical mapping: multiple GlobalAddr instructions for the same
+    // symbol should map to the same canonical ID. Without this, stores through
+    // one GlobalAddr for "perm" won't block loads through another GlobalAddr
+    // for "perm", causing incorrect hoisting.
+    let mut symbol_canonical: FxHashMap<String, u32> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::GlobalAddr { dest, name } = inst {
+                symbol_canonical.entry(name.clone()).or_insert(dest.0);
+            }
+        }
+    }
+    let mut canonical_for: FxHashMap<u32, u32> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::GlobalAddr { dest, name } = inst {
+                let canonical = symbol_canonical[name];
+                if canonical != dest.0 {
+                    canonical_for.insert(dest.0, canonical);
+                }
+            }
+        }
+    }
+
     let mut map: FxHashMap<u32, u32> = FxHashMap::default();
-    // Seed: every GlobalAddr maps to itself
+    // Seed: every GlobalAddr maps to its canonical ID
     for &gid in global_addr_values {
-        map.insert(gid, gid);
+        let canonical = canonical_for.get(&gid).copied().unwrap_or(gid);
+        map.insert(gid, canonical);
     }
     // Propagate through GEP and Copy chains (fixpoint)
     let mut changed = true;
@@ -671,6 +696,10 @@ fn hoist_loop_invariants(
     // pointer from a GlobalAddr (transitively). Stores through any of these
     // pointers can modify global variables, so they must be tracked to prevent
     // incorrect hoisting of global loads.
+    //
+    // IMPORTANT: Multiple GlobalAddr instructions for the same symbol get different
+    // Value IDs. We canonicalize them so that stores through one GlobalAddr for "perm"
+    // correctly block loads through a different GlobalAddr for "perm".
     let mut global_addr_values: FxHashSet<u32> = FxHashSet::default();
     let mut root_global_addr_values: FxHashSet<u32> = FxHashSet::default();
     for block in func.blocks.iter() {
