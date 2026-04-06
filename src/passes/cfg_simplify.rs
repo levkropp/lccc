@@ -470,6 +470,42 @@ fn collect_thread_redirections(
     resolved: &FxHashMap<BlockId, (BlockId, BlockId)>,
     label_to_idx: &FxHashMap<BlockId, usize>,
 ) -> Vec<(usize, Vec<(BlockId, BlockId, BlockId)>)> {
+    // Build a set of intermediate blocks that are referenced in phi nodes of
+    // their successors. Threading through these blocks would make them dead,
+    // and dead block removal would corrupt the phi entries.
+    // We must NOT thread through a block if it's the only predecessor
+    // contributing a particular value to a successor's phi node.
+    let (pred_counts, _) = build_pred_info(func);
+    let mut unsafe_to_thread: FxHashSet<BlockId> = FxHashSet::default();
+    for block in &func.blocks {
+        // Check if this block is referenced in any phi of its successors
+        for_each_terminator_target(&block.terminator, |succ| {
+            if let Some(&succ_idx) = label_to_idx.get(&succ) {
+                for inst in &func.blocks[succ_idx].instructions {
+                    if let Instruction::Phi { incoming, .. } = inst {
+                        // If this block contributes to a phi in a successor, and
+                        // it has multiple predecessors (i.e., the edge from this
+                        // block isn't the only one), then threading a predecessor
+                        // through this block is fine. But if this block IS in the
+                        // forwarding set (empty+branch) AND its successor has phis
+                        // from other predecessors, threading could be unsafe.
+                        if incoming.iter().any(|(_, l)| *l == block.label) {
+                            // This block feeds a phi in its successor. If it becomes
+                            // dead after threading, that phi entry disappears.
+                            // Only safe if the predecessor count > 1 (other blocks
+                            // also feed this block, so it won't become fully dead).
+                            let pc = pred_counts.get(&block.label).copied().unwrap_or(0);
+                            if pc <= 1 {
+                                // Threading the sole predecessor away makes this block dead
+                                unsafe_to_thread.insert(block.label);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     let mut redirections = Vec::new();
 
     for block_idx in 0..func.blocks.len() {
@@ -479,7 +515,9 @@ fn collect_thread_redirections(
         match &func.blocks[block_idx].terminator {
             Terminator::Branch(target) => {
                 if let Some(&(resolved_target, phi_block)) = resolved.get(target) {
-                    edge_changes.push((*target, resolved_target, phi_block));
+                    if !unsafe_to_thread.contains(target) {
+                        edge_changes.push((*target, resolved_target, phi_block));
+                    }
                 }
             }
             Terminator::CondBranch { true_label, false_label, .. } => {
@@ -498,11 +536,15 @@ fn collect_thread_redirections(
                 }
                 // Safe to thread (different final targets, or no phi conflict).
                 if let Some((rt, rt_phi)) = true_resolved {
-                    edge_changes.push((*true_label, rt, rt_phi));
+                    if !unsafe_to_thread.contains(true_label) {
+                        edge_changes.push((*true_label, rt, rt_phi));
+                    }
                 }
                 if let Some((rf, rf_phi)) = false_resolved {
-                    if !edge_changes.iter().any(|(old, new, _)| *old == *false_label && *new == rf) {
-                        edge_changes.push((*false_label, rf, rf_phi));
+                    if !unsafe_to_thread.contains(false_label) {
+                        if !edge_changes.iter().any(|(old, new, _)| *old == *false_label && *new == rf) {
+                            edge_changes.push((*false_label, rf, rf_phi));
+                        }
                     }
                 }
             }
@@ -547,23 +589,50 @@ fn apply_thread_redirections(
         count += 1;
 
         // Update phi nodes in new target blocks.
-        let debug_thread = std::env::var("CCC_DEBUG_THREAD").is_ok();
         for (_old, new_target, phi_lookup_block) in edge_changes {
-            if debug_thread {
-                eprintln!("[THREAD] block {} edge: old={} new={} phi_lookup={}",
-                    block_label, _old, new_target, phi_lookup_block);
-            }
             if let Some(&target_idx) = label_to_idx.get(new_target) {
+                // Safety check: if the target block has ANY phi that doesn't have
+                // an entry for the intermediate block (phi_lookup_block or _old),
+                // we can't safely thread — the phi would get a missing predecessor.
+                // This happens when the target is a loop header with phi nodes from
+                // an outer loop that don't pass through the intermediate block.
+                let all_phis_covered = func.blocks[target_idx].instructions.iter().all(|inst| {
+                    if let Instruction::Phi { incoming, .. } = inst {
+                        incoming.iter().any(|(_, label)| *label == block_label)
+                        || incoming.iter().any(|(_, label)| *label == *phi_lookup_block)
+                        || incoming.iter().any(|(_, label)| *label == *_old)
+                    } else {
+                        true
+                    }
+                });
+                if !all_phis_covered {
+                    // Revert the terminator change for this edge.
+                    match &mut func.blocks[*block_idx].terminator {
+                        Terminator::Branch(target) => {
+                            if *target == *new_target { *target = *_old; }
+                        }
+                        Terminator::CondBranch { true_label, false_label, .. } => {
+                            if *true_label == *new_target { *true_label = *_old; }
+                            if *false_label == *new_target { *false_label = *_old; }
+                        }
+                        _ => {}
+                    }
+                    count -= 1;
+                    continue;
+                }
+
                 let block = &mut func.blocks[target_idx];
                 for inst in &mut block.instructions {
                     if let Instruction::Phi { incoming, .. } = inst {
+                        if incoming.iter().any(|(_, label)| *label == block_label) {
+                            continue;
+                        }
                         let value_from_chain = incoming.iter()
                             .find(|(_, label)| *label == *phi_lookup_block)
+                            .or_else(|| incoming.iter().find(|(_, label)| *label == *_old))
                             .map(|(val, _)| *val);
                         if let Some(val) = value_from_chain {
-                            if !incoming.iter().any(|(_, label)| *label == block_label) {
-                                incoming.push((val, block_label));
-                            }
+                            incoming.push((val, block_label));
                         }
                     }
                 }
