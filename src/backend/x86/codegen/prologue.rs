@@ -181,6 +181,12 @@ impl X86Codegen {
             (-new_space, new_space)
         }, &reg_assigned, &X86_CALLEE_SAVED, cached_liveness, true);
 
+        // Initialize emergency spill offset below the allocated frame space.
+        // Without this, emergency spills start at offset 0 from the frame base
+        // and grow upward into the callee-saved register push area, corrupting
+        // saved registers (e.g., writing to -8(%rbp) where %rbx was pushed).
+        self.state.emergency_spill_offset = -space;
+
         // Allocate spill slots for Phase 2b caller-saved-spanning registers.
         self.caller_save_spill_slots.clear();
         self.caller_save_intervals.clear();
