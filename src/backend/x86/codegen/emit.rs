@@ -576,8 +576,11 @@ impl X86Codegen {
                             let xmm_name = phys_reg_name(reg);
                             self.state.emit_fmt(format_args!("    movq %{}, %{}", xmm_name, target_name));
                         } else {
-                            let src_32 = phys_reg_name_32(reg);
-                            self.state.emit_fmt(format_args!("    movl %{}, %{}", src_32, target_32));
+                            // Use movq for register-to-register to preserve sign bits.
+                            // movl zero-extends upper 32 bits, losing sign information
+                            // for I32 values that later flow into 64-bit operations.
+                            let src_name = phys_reg_name(reg);
+                            self.state.out.emit_instr_reg_reg("    movq", src_name, target_name);
                         }
                     }
                 } else if let Some(slot) = self.state.get_slot(v.0) {
@@ -589,7 +592,7 @@ impl X86Codegen {
                         self.state.out.emit_instr_rbp_reg("    movl", slot.0, target_32);
                     }
                 } else if self.state.reg_cache.acc_has(v.0, false) || self.state.reg_cache.acc_has(v.0, true) {
-                    self.state.emit_fmt(format_args!("    movl %eax, %{}", target_32));
+                    self.state.out.emit_instr_reg_reg("    movq", "rax", target_name);
                 } else {
                     self.state.emit_fmt(format_args!("    xorl %{0}, %{0}", target_32));
                 }
@@ -706,10 +709,11 @@ impl X86Codegen {
             if is_xmm_reg(reg) {
                 let reg_name = phys_reg_name(reg);
                 self.state.emit_fmt(format_args!("    movq %rax, %{}", reg_name));
-            } else if use_small {
-                let reg_name = phys_reg_name_32(reg);
-                self.state.emit_fmt(format_args!("    movl %eax, %{}", reg_name));
             } else {
+                // Always use movq for register stores, even for I32/U32 values.
+                // movl zero-extends the upper 32 bits, which corrupts negative I32
+                // values that later flow into 64-bit operations (pointer arithmetic,
+                // imul) through callee-saved registers.
                 let reg_name = phys_reg_name(reg);
                 self.state.out.emit_instr_reg_reg("    movq", "rax", reg_name);
             }
@@ -739,9 +743,12 @@ impl X86Codegen {
                 let reg_name = phys_reg_name(reg);
                 self.state.emit_fmt(format_args!("    movq %rax, %{}", reg_name));
             } else {
-                // GPR register: movl %eax, %regd (zero-extends upper 32 bits)
-                let reg_name_32 = phys_reg_name_32(reg);
-                self.state.emit_fmt(format_args!("    movl %eax, %{}", reg_name_32));
+                // GPR register: use movq to preserve all 64 bits of the accumulator.
+                // movl would zero-extend the upper 32 bits, which loses sign
+                // information for negative I32 values that later flow into 64-bit
+                // operations (pointer arithmetic, imul) through callee-saved regs.
+                let reg_name = phys_reg_name(reg);
+                self.state.out.emit_instr_reg_reg("    movq", "rax", reg_name);
             }
         } else if let Some(slot) = self.state.get_slot(dest.0) {
             // No register: store 32 bits to stack slot.

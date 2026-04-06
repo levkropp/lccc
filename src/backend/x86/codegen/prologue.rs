@@ -150,8 +150,12 @@ impl X86Codegen {
                 }
             }
         }
-        self.skip_i32_sext = !has_gep && needs_sext_set.is_empty();
-        self.needs_sext_values = needs_sext_set;
+        // Always sign-extend I32 values after 32-bit ALU ops. The needs_sext_set
+        // optimization was unsound: it only tracked Cast and GEP uses, missing cases
+        // where I32 values flow into 64-bit pointer arithmetic through intermediate
+        // registers (e.g., `(yysize + 1) * sizeof(yyStackEntry)` in SQLite's parser).
+        self.skip_i32_sext = false;
+        self.needs_sext_values = FxHashSet::default();
 
         let (reg_assigned, cached_liveness, caller_save_spans) = crate::backend::generation::run_regalloc_and_merge_clobbers(
             func, available_regs, caller_saved_regs, &asm_clobbered_regs,
