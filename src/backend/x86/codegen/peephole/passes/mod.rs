@@ -74,6 +74,39 @@ pub fn peephole_optimize(asm: String) -> String {
     let line_count = store.len();
     let mut infos: Vec<LineInfo> = (0..line_count).map(|i| classify_line(store.get(i))).collect();
 
+    // Pin parameter pre-store instructions: `movq %arg_reg, %callee_saved_reg`
+    // that appear before the first function call. These save function parameters
+    // to callee-saved registers and must never be removed by any peephole pass.
+    {
+        let mut in_prologue = false;
+        for idx in 0..line_count {
+            let trimmed = infos[idx].trimmed(store.get(idx));
+            // Start tracking after .cfi_startproc or function labels
+            if trimmed.starts_with(".cfi_startproc") {
+                in_prologue = true;
+                continue;
+            }
+            if !in_prologue { continue; }
+            // Stop at first call instruction
+            if matches!(infos[idx].kind, LineKind::Call) {
+                in_prologue = false;
+                continue;
+            }
+            // Pin movq from arg regs to callee-saved regs in the prologue area
+            if trimmed.starts_with("movq %") {
+                let is_param_prestore = (trimmed.contains("%rdi") || trimmed.contains("%rsi")
+                    || trimmed.contains("%rdx") || trimmed.contains("%rcx")
+                    || trimmed.contains("%r8") || trimmed.contains("%r9"))
+                    && (trimmed.ends_with("%rbx") || trimmed.ends_with("%r12")
+                        || trimmed.ends_with("%r13") || trimmed.ends_with("%r14")
+                        || trimmed.ends_with("%r15"));
+                if is_param_prestore {
+                    infos[idx].pinned = true;
+                }
+            }
+        }
+    }
+
     // CCC_PEEPHOLE_SKIP=pass1,pass2,... to disable specific sub-passes
     let skip_set: std::collections::HashSet<String> = std::env::var("CCC_PEEPHOLE_SKIP")
         .unwrap_or_default()

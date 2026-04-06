@@ -46,6 +46,10 @@ pub(super) struct LineInfo {
     /// somewhere in the line text. Pre-computed during classify_line to eliminate
     /// O(n * patterns) `str::contains` calls in `eliminate_unused_callee_saves`.
     pub(super) reg_refs: u16,
+    /// When true, this instruction must not be removed or modified by any
+    /// peephole pass. Used for parameter pre-stores (movq %arg_reg, %callee_saved)
+    /// that must survive across function calls.
+    pub(super) pinned: bool,
 }
 
 /// What kind of assembly line this is, with pre-extracted fields for the
@@ -188,19 +192,19 @@ impl LineInfo {
 /// Helper to construct a LineInfo with default ext_kind and has_indirect_mem.
 #[inline]
 pub(super) fn line_info(kind: LineKind, ts: u16) -> LineInfo {
-    LineInfo { kind, ext_kind: ExtKind::None, trim_start: ts, has_indirect_mem: false, rbp_offset: RBP_OFFSET_NONE, reg_refs: 0 }
+    LineInfo { kind, ext_kind: ExtKind::None, trim_start: ts, has_indirect_mem: false, rbp_offset: RBP_OFFSET_NONE, reg_refs: 0, pinned: false }
 }
 
 /// Helper to construct a LineInfo with default ext_kind but pre-scanned reg_refs.
 #[inline]
 pub(super) fn line_info_with_regs(kind: LineKind, ts: u16, reg_refs: u16) -> LineInfo {
-    LineInfo { kind, ext_kind: ExtKind::None, trim_start: ts, has_indirect_mem: false, rbp_offset: RBP_OFFSET_NONE, reg_refs }
+    LineInfo { kind, ext_kind: ExtKind::None, trim_start: ts, has_indirect_mem: false, rbp_offset: RBP_OFFSET_NONE, reg_refs, pinned: false }
 }
 
 /// Helper to construct a LineInfo with a specific ext_kind.
 #[inline]
 pub(super) fn line_info_ext(kind: LineKind, ext: ExtKind, ts: u16) -> LineInfo {
-    LineInfo { kind, ext_kind: ext, trim_start: ts, has_indirect_mem: false, rbp_offset: RBP_OFFSET_NONE, reg_refs: 0 }
+    LineInfo { kind, ext_kind: ext, trim_start: ts, has_indirect_mem: false, rbp_offset: RBP_OFFSET_NONE, reg_refs: 0, pinned: false }
 }
 
 /// Parse one assembly line into a `LineInfo`.
@@ -284,6 +288,7 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
                 has_indirect_mem: has_indirect,
                 rbp_offset: rbp_off,
                 reg_refs,
+                pinned: false,
             };
         }
     }
@@ -379,7 +384,7 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
     let rbp_off = if has_indirect { RBP_OFFSET_NONE } else { parse_rbp_offset(s) };
     // Pre-scan register references for O(1) checks in eliminate_unused_callee_saves
     let reg_refs = scan_register_refs(sb);
-    LineInfo { kind: LineKind::Other { dest_reg }, ext_kind: ext, trim_start: ts, has_indirect_mem: has_indirect, rbp_offset: rbp_off, reg_refs }
+    LineInfo { kind: LineKind::Other { dest_reg }, ext_kind: ext, trim_start: ts, has_indirect_mem: has_indirect, rbp_offset: rbp_off, reg_refs, pinned: false }
 }
 
 /// Fast check for self-move: `movq %REG, %REG` where both register names match.
@@ -690,7 +695,8 @@ pub(super) use crate::backend::peephole_common::LineStore;
 
 #[inline]
 pub(super) fn mark_nop(info: &mut LineInfo) {
-    *info = LineInfo { kind: LineKind::Nop, ext_kind: ExtKind::None, trim_start: 0, has_indirect_mem: false, rbp_offset: RBP_OFFSET_NONE, reg_refs: 0 };
+    if info.pinned { return; } // Never remove pinned instructions
+    *info = LineInfo { kind: LineKind::Nop, ext_kind: ExtKind::None, trim_start: 0, has_indirect_mem: false, rbp_offset: RBP_OFFSET_NONE, reg_refs: 0, pinned: false };
 }
 
 /// Replace a line's text and re-classify it.
