@@ -6,17 +6,14 @@ use super::emit::{X86Codegen, phys_reg_name, phys_reg_name_32, is_xmm_reg};
 
 impl X86Codegen {
     pub(super) fn emit_float_cmp_impl(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
-        let (mov_to_xmm0, mov_to_xmm1_from_rcx) = if ty == IrType::F32 {
-            ("movd %eax, %xmm0", "movd %ecx, %xmm1")
-        } else {
-            ("movq %rax, %xmm0", "movq %rcx, %xmm1")
-        };
         let swap_operands = matches!(op, IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sle | IrCmpOp::Ule);
         let (first, second) = if swap_operands { (rhs, lhs) } else { (lhs, rhs) };
-        self.operand_to_rax(first);
-        self.state.emit_fmt(format_args!("    {}", mov_to_xmm0));
-        self.operand_to_rcx(second);
-        self.state.emit_fmt(format_args!("    {}", mov_to_xmm1_from_rcx));
+
+        // Load first operand → %xmm0 (use constant pool for FP constants)
+        self.emit_fp_operand_to_xmm(first, ty, "xmm0");
+        // Load second operand → %xmm1
+        self.emit_fp_operand_to_xmm(second, ty, "xmm1");
+
         if ty == IrType::F64 {
             self.state.emit("    ucomisd %xmm1, %xmm0");
         } else {

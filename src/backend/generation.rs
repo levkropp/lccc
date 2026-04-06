@@ -591,6 +591,9 @@ pub fn generate_module(cg: &mut dyn ArchCodegen, module: &IrModule, source_mgr: 
     // Emit architecture-specific runtime helper stubs (e.g., i686 __divdi3)
     cg.emit_runtime_stubs();
 
+    // Emit floating-point constant pool (.rodata)
+    cg.state().emit_fp_const_pool();
+
     // Emit .note.GNU-stack section to indicate non-executable stack
     cg.state().emit("");
     cg.state().emit(".section .note.GNU-stack,\"\",@progbits");
