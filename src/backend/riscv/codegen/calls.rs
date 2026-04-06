@@ -455,6 +455,9 @@ impl RiscvCodegen {
     }
 
     pub(super) fn emit_call_store_result_impl(&mut self, dest: &Value, return_type: IrType) {
+        if return_type == IrType::Void {
+            return;
+        }
         if is_i128_type(return_type) {
             if let Some(slot) = self.state.get_slot(dest.0) {
                 self.emit_store_to_s0("a0", slot.0, "sd");
