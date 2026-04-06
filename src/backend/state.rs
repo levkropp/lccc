@@ -270,6 +270,10 @@ pub struct CodegenState {
     /// being stored to a stack slot. Populated during stack layout; used by
     /// store_rax_to / store_eax_to to skip the store.
     pub immediately_consumed: FxHashSet<u32>,
+    /// Floating-point constant pool: maps bit pattern → label name.
+    /// FP constants are emitted as .rodata entries and loaded via
+    /// `movsd .LCFPxx(%rip), %xmm` instead of `movabsq + movq`.
+    pub fp_const_pool: FxHashMap<u64, String>,
 }
 
 impl CodegenState {
@@ -324,6 +328,7 @@ impl CodegenState {
             needs_divdi3_helpers: false,
             emit_cfi: true,
             immediately_consumed: FxHashSet::default(),
+            fp_const_pool: FxHashMap::default(),
         }
     }
 
@@ -341,6 +346,36 @@ impl CodegenState {
 
     pub fn emit(&mut self, s: &str) {
         self.out.emit(s);
+    }
+
+    /// Get or create a .rodata label for a floating-point constant.
+    /// Returns the label name (e.g., ".LCFP_3"). Constants are deduped
+    /// so the same bit pattern always returns the same label.
+    pub fn get_fp_const_label(&mut self, bits: u64) -> String {
+        if let Some(label) = self.fp_const_pool.get(&bits) {
+            return label.clone();
+        }
+        let label = format!(".LCFP_{}", self.label_counter);
+        self.label_counter += 1;
+        self.fp_const_pool.insert(bits, label.clone());
+        label
+    }
+
+    /// Emit all accumulated FP constants as a .rodata section.
+    /// Called once at the end of module codegen.
+    pub fn emit_fp_const_pool(&mut self) {
+        if self.fp_const_pool.is_empty() {
+            return;
+        }
+        self.out.emit(".section .rodata");
+        // Sort by label name for deterministic output
+        let mut entries: Vec<_> = self.fp_const_pool.iter().collect();
+        entries.sort_by_key(|(_, label)| (*label).clone());
+        for (bits, label) in entries {
+            self.out.emit(".align 8");
+            self.out.emit_fmt(format_args!("{}:", label));
+            self.out.emit_fmt(format_args!("    .quad {}", *bits as i64));
+        }
     }
 
     /// Emit formatted assembly directly (no temporary String allocation).

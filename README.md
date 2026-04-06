@@ -108,9 +108,29 @@ All outputs are byte-identical to GCC.
   (RSP-relative addressing), cross-block store forwarding, copy propagation through conditional
   jumps, memory-operand codegen for Add/Sub, push/pop callee-saved registers.
 
-Run the suite yourself:
+### Comprehensive Suite (18 benchmarks)
+
+The extended benchmark suite covers FP-heavy, memory-bound, and integer-heavy workloads:
+
+| Category | Benchmarks | LCCC / GCC range |
+|----------|-----------|-----------------|
+| Near parity | arith_loop, qsort, hash_table, sieve, matmul, strlen | 1.1–1.4× |
+| FP-heavy | spectral_norm, mandelbrot, nbody | 6–25× (FP LICM needed) |
+| Struct ABI | struct_copy | 32× (needs SRoA) |
+| LCCC wins | fib (320×), binary_trees (9×), fannkuch (3×) | recursion→iteration |
+
+**Compile time:** LCCC is **2–5× faster** than GCC across all benchmarks.
+
+Run the suites:
 
 ```bash
+# Full 18-benchmark suite (performance + correctness + size)
+python3 tests/benchmark/run_benchmarks.py --reps 5
+
+# 50-test correctness suite
+python3 tests/correctness/run_correctness.py -v
+
+# Original micro-benchmark suite
 python3 lccc-improvements/benchmarks/bench.py --reps 5 --md results.md
 ```
 

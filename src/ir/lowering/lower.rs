@@ -88,6 +88,10 @@ pub struct Lowerer {
     pub(super) func_meta: FunctionMeta,
     /// Set of emitted global variable names (O(1) dedup)
     pub(super) emitted_global_names: FxHashSet<String>,
+    /// String literal deduplication: maps string content → label.
+    /// Identical string literals share the same .rodata entry so that
+    /// pointer equality (`"hello" == "hello"`) holds, matching GCC behavior.
+    pub(super) string_dedup: FxHashMap<String, String>,
     /// Function signatures from semantic analysis.
     /// Used as authoritative source for function return types and parameter types,
     /// reducing the lowerer's need to re-derive type information from the raw AST.
@@ -205,6 +209,7 @@ impl Lowerer {
             types: type_context,
             func_meta: FunctionMeta::default(),
             emitted_global_names: FxHashSet::default(),
+            string_dedup: FxHashMap::default(),
             sema_functions,
             sema_expr_types,
             sema_const_values,
@@ -1058,11 +1063,16 @@ impl Lowerer {
     }
 
     /// Intern a string literal: add it to the module's .rodata string table and
-    /// return its unique label.
+    /// return its unique label. Identical strings are deduplicated so that
+    /// pointer equality holds (matching GCC behavior).
     pub(super) fn intern_string_literal(&mut self, s: &str) -> String {
+        if let Some(existing) = self.string_dedup.get(s) {
+            return existing.clone();
+        }
         let label = format!(".Lstr{}", self.next_string);
         self.next_string += 1;
         self.module.string_literals.push((label.clone(), s.to_string()));
+        self.string_dedup.insert(s.to_string(), label.clone());
         label
     }
 
