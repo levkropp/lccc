@@ -434,6 +434,10 @@ impl X86Codegen {
                 let has_slot = find_param_alloca(func, i)
                     .and_then(|(dest, _)| self.state.get_slot(dest.0))
                     .is_some();
+                if std::env::var("CCC_DEBUG_PARAM_STORE").is_ok() {
+                    let reg = self.reg_assignments.get(&paramref_dest.0);
+                    eprintln!("[PRE-STORE] param {} paramref_dest={} has_slot={} reg={:?}", i, paramref_dest.0, has_slot, reg);
+                }
                 if !has_slot {
                     if let Some(&phys_reg) = self.reg_assignments.get(&paramref_dest.0) {
                         // Only pre-store to callee-saved registers (PhysReg 1-5).
@@ -441,9 +445,11 @@ impl X86Codegen {
                         // because they overlap with ABI argument registers that
                         // haven't been saved yet.
                         let is_callee_saved = phys_reg.0 >= 1 && phys_reg.0 <= 5;
+                        if std::env::var("CCC_DEBUG_PARAM_STORE").is_ok() {
+                            let shared = reg_to_params.get(&phys_reg.0).is_some_and(|u| u.len() > 1);
+                            eprintln!("[PRE-STORE]   callee={} shared={} class={:?}", is_callee_saved, shared, class);
+                        }
                         if is_callee_saved {
-                            // Safety check: if another param's dest is also assigned
-                            // to this register, skip pre-store to avoid conflicts.
                             let shared = reg_to_params.get(&phys_reg.0)
                                 .is_some_and(|users| users.len() > 1);
                             if !shared {
@@ -452,10 +458,102 @@ impl X86Codegen {
                                     self.state.out.emit_instr_reg_reg(
                                         "    movq", X86_ARG_REGS[reg_idx], dest_reg);
                                     self.state.param_pre_stored.insert(i);
-                                    // Track the source arg register for this callee-saved reg
-                                    // so register-direct call arg loading can avoid round-trips
                                     self.param_source_regs.insert(phys_reg.0, X86_ARG_REGS[reg_idx]);
                                 } // TODO: handle StackSlot/SSE params
+                            }
+                        }
+                    }
+                    continue;
+                }
+            } else {
+                // DEBUG: dump entry block instructions for this param
+                if std::env::var("CCC_DEBUG_PARAM_STORE").is_ok() {
+                    if let Some((alloca_dest, _)) = find_param_alloca(func, i) {
+                        eprintln!("[PARAM-STORE] param {} has alloca dest={}, no ParamRef", i, alloca_dest.0);
+                        eprintln!("[PARAM-STORE] has_slot={}", self.state.get_slot(alloca_dest.0).is_some());
+                        for (bi, block) in func.blocks.iter().enumerate() {
+                            for inst in &block.instructions {
+                                match inst {
+                                    Instruction::Store { ptr, val, .. } if ptr.0 == alloca_dest.0 =>
+                                        eprintln!("[PARAM-STORE]   block[{}] Store to alloca: val={:?}", bi, val),
+                                    Instruction::Load { ptr, dest, .. } if ptr.0 == alloca_dest.0 =>
+                                        eprintln!("[PARAM-STORE]   block[{}] Load from alloca: dest={}", bi, dest.0),
+                                    Instruction::Copy { dest, src } =>
+                                        eprintln!("[PARAM-STORE]   block[{}] Copy dest={} src={:?}", bi, dest.0, src),
+                                    Instruction::ParamRef { dest, param_idx, .. } =>
+                                        eprintln!("[PARAM-STORE]   block[{}] ParamRef dest={} idx={}", bi, dest.0, param_idx),
+                                    _ => {}
+                                }
+                            }
+                        }
+                        for (&vid, &reg) in self.reg_assignments.iter() {
+                            eprintln!("[PARAM-STORE]   reg_assign: val={} -> PhysReg({})", vid, reg.0);
+                        }
+                    }
+                }
+                // No ParamRef for this param. The alloca may have been promoted
+                // by mem2reg, converting Store/Load chains to direct SSA references.
+                // After promotion, the param value flows through Copy/Cast chains.
+                //
+                // The register allocator may have assigned a promoted value to a
+                // callee-saved register. We must copy the ABI arg register to it
+                // in the prologue, because ABI registers get clobbered by calls.
+                //
+                // Strategy: find the alloca for this param, then search for Store
+                // instructions that write TO that alloca. The Store's source value
+                // (which may be a Copy from the original param) tells us which SSA
+                // value represents the parameter after store-to-load forwarding.
+                let has_slot = find_param_alloca(func, i)
+                    .and_then(|(dest, _)| self.state.get_slot(dest.0))
+                    .is_some();
+                if !has_slot {
+                    if let Some((alloca_dest, _)) = find_param_alloca(func, i) {
+                        let alloca_id = alloca_dest.0;
+                        // Collect all SSA values stored to this alloca, then
+                        // propagate through Copy chains to find all derived values.
+                        // Any of these that are register-assigned need the ABI arg
+                        // saved in the prologue.
+                        let mut param_vals: Vec<u32> = Vec::new();
+                        for block in &func.blocks {
+                            for inst in &block.instructions {
+                                if let Instruction::Store { ptr, val, .. } = inst {
+                                    if ptr.0 == alloca_id {
+                                        if let crate::ir::instruction::Operand::Value(v) = val {
+                                            param_vals.push(v.0);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Propagate through Copy chains
+                        let mut all_vals: crate::common::fx_hash::FxHashSet<u32> = param_vals.iter().copied().collect();
+                        let mut changed_prop = true;
+                        while changed_prop {
+                            changed_prop = false;
+                            for block in &func.blocks {
+                                for inst in &block.instructions {
+                                    if let Instruction::Copy { dest, src: crate::ir::instruction::Operand::Value(v) } = inst {
+                                        if all_vals.contains(&v.0) && all_vals.insert(dest.0) {
+                                            changed_prop = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Check if any derived value is callee-saved register-assigned
+                        for &vid in &all_vals {
+                            if let Some(&phys_reg) = self.reg_assignments.get(&vid) {
+                                let is_callee_saved = phys_reg.0 >= 1 && phys_reg.0 <= 5;
+                                if is_callee_saved {
+                                    let dest_reg = phys_reg_name(phys_reg);
+                                    if let ParamClass::IntReg { reg_idx } = class {
+                                        self.state.out.emit_instr_reg_reg(
+                                            "    movq", X86_ARG_REGS[reg_idx], dest_reg);
+                                        self.state.param_pre_stored.insert(i);
+                                        self.param_source_regs.insert(phys_reg.0, X86_ARG_REGS[reg_idx]);
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }

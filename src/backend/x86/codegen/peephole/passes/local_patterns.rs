@@ -2111,6 +2111,14 @@ pub(super) fn coalesce_phi_register_copies(
             // Don't coalesce rax(0) or rcx(1) as SRC — they're accumulator regs
             // with heavy implicit use
             if src_family <= 1 || tmp_family <= 1 { i += 1; continue; }
+            // Don't coalesce when SRC is a caller-saved register and TMP is callee-saved.
+            // Caller-saved registers (rax=0, rcx=1, rdx=2, rsi=6, rdi=7, r8-r11=8-11)
+            // get clobbered by function calls. Coalescing away the copy to a callee-saved
+            // register loses the value across calls. This is critical for parameter
+            // pre-stores (movq %rdi, %r12) that save params before calls.
+            let src_is_caller_saved = matches!(src_family, 0 | 1 | 2 | 6 | 7 | 8 | 9 | 10 | 11);
+            let tmp_is_callee_saved = matches!(tmp_family, 3 | 5 | 12 | 13 | 14 | 15);
+            if src_is_caller_saved && tmp_is_callee_saved { i += 1; continue; }
 
             let src_bit = 1u16 << src_family;
             let tmp_bit = 1u16 << tmp_family;

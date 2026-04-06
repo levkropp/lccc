@@ -57,6 +57,36 @@ pub(super) fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]
             i += 1;
             continue;
         }
+        // Don't eliminate moves to callee-saved registers in the prologue area.
+        // The register allocator assigns param values to callee-saved regs (rbx,
+        // r12-r15), and the pre-store in emit_store_params copies ABI arg regs
+        // to them. The dead-move analysis can't see past function calls (which
+        // are barriers), so it incorrectly considers these writes dead when the
+        // next visible use is after a call. Callee-saved regs survive calls,
+        // so their pre-call writes are never truly dead.
+        // Register encoding: rbx=1 (encoded differently in peephole)
+        // We check: if the instruction is in the first few lines (prologue area)
+        // and writes to a callee-saved register, skip elimination.
+        // A simpler and more robust check: if the destination is a callee-saved
+        // register (rbx/r12/r13/r14/r15) AND source is an arg register (rdi/rsi/
+        // rdx/rcx/r8/r9), this is likely a param pre-store — don't eliminate.
+        // Protect param pre-stores: movq from ABI arg regs to callee-saved regs.
+        // These save function parameters before calls clobber the arg registers.
+        // The dead-move scanner can't see past calls (barriers), so it incorrectly
+        // considers these writes dead. Callee-saved regs survive calls.
+        // Arg regs: rdi=7, rsi=6, rdx=2, rcx=1, r8=8, r9=9
+        // Callee-saved: rbx=3, r12=12, r13=13, r14=14, r15=15
+        {
+            let trimmed = infos[i].trimmed(store.get(i));
+            if let Some((src_id, _dst_id)) = parse_reg_to_reg_movq(&infos[i], trimmed) {
+                let src_is_arg = matches!(src_id, 1 | 2 | 6 | 7 | 8 | 9);
+                let dst_is_callee = matches!(dst_reg, 3 | 12 | 13 | 14 | 15);
+                if src_is_arg && dst_is_callee {
+                    i += 1;
+                    continue;
+                }
+            }
+        }
 
         let dst_mask = 1u16 << dst_reg;
         let mut dead = false;
