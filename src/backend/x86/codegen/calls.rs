@@ -351,6 +351,12 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_call_store_result_impl(&mut self, dest: &Value, return_type: IrType) {
+        // Void functions have no meaningful return value — skip the store.
+        // Without this, store_rax_to writes garbage %rax to a stack slot that
+        // may overlap with callee-saved register save area, corrupting them.
+        if return_type == IrType::Void {
+            return;
+        }
         if is_i128_type(return_type) {
             use crate::common::types::EightbyteClass;
             if self.call_ret_classes.len() == 2 {

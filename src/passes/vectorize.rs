@@ -1006,8 +1006,17 @@ fn analyze_reduction_pattern(
                     eprintln!("[VEC-RED]   Simple sum pattern with cast detected: {:?} += ({:?})load(arr[iv])", element_type, from_ty);
                 }
 
-                // Use the LOAD type as the element type for vectorization
-                // The accumulator type might be wider, but we vectorize based on array element type
+                // When the accumulator is wider than the array element (e.g., long += int),
+                // we cannot simply use packed narrow adds — the results would overflow/truncate.
+                // Reject this pattern; proper widening vectorization would require
+                // vpmovsx + vpaddq which is much more complex.
+                if element_type.size() > from_ty.size() {
+                    if debug {
+                        eprintln!("[VEC-RED]   Rejecting: accumulator {:?} wider than element {:?}", element_type, from_ty);
+                    }
+                    return None;
+                }
+
                 Some(ReductionPattern {
                     kind: ReductionKind::Sum,
                     element_type: *from_ty,  // Use the actual array element type
