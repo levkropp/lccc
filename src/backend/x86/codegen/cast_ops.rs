@@ -239,11 +239,20 @@ impl X86Codegen {
                 return true;
             }
             CastKind::IntNarrow { to_ty: t } => {
-                // Narrow: truncate. Load full value then mask/zero-extend.
+                // Narrow: truncate. For register-to-register 32-bit narrows,
+                // use movq to preserve the full 64-bit value. movl would zero-extend
+                // the upper 32 bits, corrupting negative values that later flow
+                // into 64-bit operations through callee-saved registers.
                 if let Some(src_reg) = src_phys {
                     let src_typed = typed_phys_reg_name(src_reg, t);
                     match t.size() {
-                        4 => self.state.emit_fmt(format_args!("    movl %{}, %{}", phys_reg_name_32(src_reg), dest_32)),
+                        4 => {
+                            // Use movq for reg-to-reg to avoid zero-extension.
+                            // The lower 32 bits contain the truncated value;
+                            // the upper bits are don't-care but must preserve sign.
+                            let src_name = phys_reg_name(src_reg);
+                            self.state.out.emit_instr_reg_reg("    movq", src_name, dest_64);
+                        }
                         2 => self.state.emit_fmt(format_args!("    movzwl %{}, %{}", src_typed, dest_32)),
                         1 => self.state.emit_fmt(format_args!("    movzbl %{}, %{}", src_typed, dest_32)),
                         _ => { self.operand_to_callee_reg(src, dest_phys); }
