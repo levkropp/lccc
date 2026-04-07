@@ -1562,22 +1562,32 @@ pub fn emit_store_default(cg: &mut (impl ArchCodegen + ?Sized), val: &Operand, p
         }
         return;
     }
-    cg.emit_load_operand(val);
     if let Some(addr) = addr {
         let store_instr = cg.store_instr_for_type(ty);
         match addr {
             SlotAddr::OverAligned(slot, id) => {
-                cg.emit_save_acc();
+                // Load ptr address first, then value, to avoid save_acc clobbering.
                 cg.emit_alloca_aligned_addr(slot, id);
+                // rcx now holds the target address
+                cg.emit_load_operand(val);
                 cg.emit_typed_store_indirect(store_instr, ty);
             }
-            SlotAddr::Direct(slot) => cg.emit_typed_store_to_slot(store_instr, ty, slot),
+            SlotAddr::Direct(slot) => {
+                cg.emit_load_operand(val);
+                cg.emit_typed_store_to_slot(store_instr, ty, slot);
+            }
             SlotAddr::Indirect(slot) => {
-                cg.emit_save_acc();
+                // Load pointer to %rcx FIRST, then load value to accumulator.
+                // This avoids emit_save_acc which uses %r11/%rdx as scratch —
+                // these can be clobbered by the value loading (operand_to_rax)
+                // if the value computation uses %r11 as an intermediate.
                 cg.emit_load_ptr_from_slot(slot, ptr.0);
+                cg.emit_load_operand(val);
                 cg.emit_typed_store_indirect(store_instr, ty);
             }
         }
+    } else {
+        cg.emit_load_operand(val);
     }
 }
 
