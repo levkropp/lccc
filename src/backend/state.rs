@@ -470,8 +470,12 @@ impl CodegenState {
     /// Currently infrastructure-only: backends don't use this yet because
     /// store/load paths aren't fully type-safe (some always use 8-byte ops).
     #[allow(dead_code)]
-    pub fn is_small_slot(&self, v: u32) -> bool {
-        self.small_slot_values.contains(&v)
+    pub fn is_small_slot(&self, _v: u32) -> bool {
+        // Disabled: small-slot optimization uses movl (32-bit) for loads/stores,
+        // which zero-extends the upper 32 bits. This corrupts signed I32 values
+        // that flow into 64-bit operations through callee-saved registers.
+        // TODO: re-enable with proper signed/unsigned type tracking.
+        false
     }
 
     /// Check if a value is a "wide" type on 32-bit targets (F64, I64, U64).
