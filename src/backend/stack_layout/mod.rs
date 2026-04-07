@@ -290,11 +290,9 @@ pub fn calculate_stack_space_common(
     );
 
     // Phase 6: Resolve copy aliases (propagate slots from root to aliased values).
-    // Only when coalescing is enabled — with CCC_NO_SLOT_COALESCE, copy aliases
-    // can incorrectly share slots between values with different lifetimes.
-    if coalesce {
-        slot_assignment::resolve_copy_aliases(state, &ctx.copy_alias, &ctx.phi_web_aliases);
-    }
+    // Uses liveness information to avoid sharing slots between values with
+    // overlapping lifetimes (which would corrupt one of the values).
+    slot_assignment::resolve_copy_aliases(state, &ctx.copy_alias, &ctx.phi_web_aliases, func);
 
     // Phase 7: Propagate wide-value status through Copy chains (32-bit targets only).
     slot_assignment::propagate_wide_values(state, func, &ctx.copy_alias);

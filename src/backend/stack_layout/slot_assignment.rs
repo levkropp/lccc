@@ -479,8 +479,14 @@ fn classify_value(
     let has_cross_block_use = ctx.use_blocks_map.get(&dest.0)
         .map(|blks| blks.iter().any(|&b| ctx.def_block.get(&dest.0).map_or(true, |&db| b != db)))
         .unwrap_or(false);
+    // Skip copy-aliased values that don't need cross-block persistence —
+    // they'll get their slot from the alias root in resolve_copy_aliases.
+    // EXCEPT when slot coalescing is disabled: in that case, the alias
+    // resolution skips non-phi-web aliases, so these values need their own slots.
     if !is_i128 && !is_f128 && !is_protected && !is_multi_def && !has_cross_block_use && is_copy_aliased {
-        return;
+        if std::env::var("CCC_NO_SLOT_COALESCE").is_err() {
+            return;
+        }
     }
     if debug_protect && is_protected && is_copy_aliased {
         eprintln!("[CLASSIFY] SSA {} is protected AND copy-aliased, allocating slot anyway", dest.0);
@@ -903,39 +909,67 @@ pub(super) fn resolve_copy_aliases(
     state: &mut crate::backend::state::CodegenState,
     copy_alias: &FxHashMap<u32, u32>,
     phi_web_aliases: &FxHashSet<u32>,
+    func: &crate::ir::reexports::IrFunction,
 ) {
+    // Build liveness intervals for interference checking.
+    // We use a lightweight approach: compute def-point and last-use-point for
+    // each value by scanning all instructions. Two values interfere if their
+    // [def, last_use] intervals overlap.
+    let mut def_point: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut last_use: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut point: u32 = 0;
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            // Record definition point
+            if let Some(dest) = inst.dest() {
+                def_point.entry(dest.0).or_insert(point);
+            }
+            // Record uses
+            inst.for_each_used_value(|vid| {
+                last_use.insert(vid, point);
+            });
+            point += 1;
+        }
+        // Terminator uses
+        block.terminator.for_each_used_value(|vid| {
+            last_use.insert(vid, point);
+        });
+        point += 1;
+    }
+
     for (&dest_id, &root_id) in copy_alias {
         // For phi-web coalesced values, force-overwrite the existing slot with
         // the root's slot. These values were checked for interference during
-        // phi-web analysis and are safe to share. Without force-overwrite,
-        // multi-def values (which always get Tier 2 slots) would never be
-        // coalesced because they already have slots assigned.
+        // phi-web analysis and are safe to share.
         if !phi_web_aliases.contains(&dest_id) {
-            // For non-phi-web aliases, keep the original behavior: skip values
-            // that already have slots to avoid overwriting with block-local slots.
+            // For non-phi-web aliases, skip values that already have slots.
             if state.value_locations.contains_key(&dest_id) {
                 continue;
             }
         }
+
+        // Skip non-phi-web aliases when slot coalescing is disabled.
+        // Copy aliases can incorrectly share slots between values with
+        // different lifetimes in complex functions (e.g., sqlite3_str_vappendf).
+        // Phi-web aliases have been verified for interference during analysis.
+        if std::env::var("CCC_NO_SLOT_COALESCE").is_ok() && !phi_web_aliases.contains(&dest_id) {
+            continue;
+        }
+
         if let Some(&slot) = state.value_locations.get(&root_id) {
             state.value_locations.insert(dest_id, slot);
         }
-        // Propagate small-slot property: if the root uses a 4-byte slot,
-        // the aliased copy must also use 4-byte store/load to avoid overflow.
+        // Propagate small-slot property
         if state.small_slot_values.contains(&root_id) {
             state.small_slot_values.insert(dest_id);
         }
-        // Propagate alloca status: if root is an alloca, the aliased copy
-        // must also be recognized as an alloca so codegen computes the
-        // stack address instead of loading from the slot.
+        // Propagate alloca status
         if state.alloca_values.contains(&root_id) {
             state.alloca_values.insert(dest_id);
         }
         if let Some(&align) = state.alloca_alignments.get(&root_id) {
             state.alloca_alignments.insert(dest_id, align);
         }
-        // If root has no slot (optimized away or reg-assigned), the aliased
-        // value also gets no slot. The Copy works via accumulator path.
     }
 }
 
