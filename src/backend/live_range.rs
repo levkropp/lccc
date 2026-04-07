@@ -301,31 +301,12 @@ impl LinearScanAllocator {
                 range,
                 next_use: None,
             });
-        } else if let Some(spill_idx) = self.find_spill_candidate() {
-            // Step 3: Evict the lowest-priority active interval — but only if it is less
-            // important than the incoming range. If the incoming range has lower spill weight,
-            // spill it instead (keep the better interval in the register).
-            let active_weight = self.active[spill_idx].range.spill_weight;
-            if active_weight < range.spill_weight {
-                // Active interval is less important — evict it, give register to incoming.
-                let spilled = self.active.remove(spill_idx);
-                if let Some(freed_reg) = self.assignments.remove(&spilled.range.value_id) {
-                    self.assignments.insert(range.value_id, freed_reg);
-                    self.occupy_register(freed_reg, range.end + 1);
-                    self.active.push(ActiveInterval {
-                        range,
-                        next_use: None,
-                    });
-                    self.allocate_spill_slot(spilled.range.value_id);
-                } else {
-                    self.allocate_spill_slot(range.value_id);
-                }
-            } else {
-                // Incoming range is less important — spill it, keep active intervals.
-                self.allocate_spill_slot(range.value_id);
-            }
         } else {
-            // No registers available and nothing to spill — assign to stack.
+            // No free register — spill the incoming range to stack.
+            // We do NOT evict active intervals because the codegen has no
+            // mechanism to reload evicted values. Eviction would leave the
+            // evicted value's register holding a different value while the
+            // codegen still expects the original value in that register.
             self.allocate_spill_slot(range.value_id);
         }
     }
