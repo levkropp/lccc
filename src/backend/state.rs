@@ -457,6 +457,15 @@ impl CodegenState {
     pub fn allocate_emergency_slot(&mut self, val_id: u32) -> StackSlot {
         self.emergency_spill_offset -= 8;
         let slot = StackSlot(self.stack_offset + self.emergency_spill_offset);
+        // Check for collision with existing slots
+        if std::env::var("CCC_DEBUG_SLOTS").is_ok() {
+            for (&existing_id, &existing_slot) in &self.value_locations {
+                if existing_slot.0 == slot.0 && existing_id != val_id {
+                    eprintln!("[SLOT-COLLISION] Emergency slot for val{} at offset {} collides with val{}",
+                        val_id, slot.0, existing_id);
+                }
+            }
+        }
         self.value_locations.insert(val_id, slot);
         slot
     }
