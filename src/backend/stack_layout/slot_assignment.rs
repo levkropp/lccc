@@ -952,7 +952,10 @@ pub(super) fn resolve_copy_aliases(
         // Copy aliases can incorrectly share slots between values with
         // different lifetimes in complex functions (e.g., sqlite3_str_vappendf).
         // Phi-web aliases have been verified for interference during analysis.
-        if std::env::var("CCC_NO_SLOT_COALESCE").is_ok() && !phi_web_aliases.contains(&dest_id) {
+        // Skip ALL copy aliases when slot coalescing is disabled.
+        // Both regular and phi-web aliases can cause slot collisions
+        // in large functions like sqlite3_str_vappendf (24KB, 500+ locals).
+        if std::env::var("CCC_NO_SLOT_COALESCE").is_ok() {
             continue;
         }
 
