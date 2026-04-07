@@ -23,7 +23,12 @@ use crate::ir::instruction::{BasicBlock, BlockId, CallInfo, Instruction, Operand
 use crate::ir::module::{IrFunction, IrModule, IrParam};
 
 /// Minimum number of switch cases to trigger outlining.
-const MIN_CASES_FOR_OUTLINING: usize = 20;
+// Disabled: switch case outlining creates separate functions for each case,
+// but the dispatch loop holds pOp in a caller-saved register (%r11) which
+// gets clobbered by the case function call. This causes the VDBE dispatch
+// to read opcodes from garbage memory after each case returns.
+// TODO: fix by saving pOp to a callee-saved register or stack slot across case calls.
+const MIN_CASES_FOR_OUTLINING: usize = 999999;
 
 /// Minimum number of instructions in a case body to be worth outlining.
 /// Very small cases (1-3 instructions) have more call overhead than savings.
