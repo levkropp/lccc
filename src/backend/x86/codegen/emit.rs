@@ -560,9 +560,9 @@ impl X86Codegen {
                 match c {
                     IrConst::I8(0) | IrConst::I16(0) | IrConst::I32(0) | IrConst::I64(0) | IrConst::Zero =>
                         self.state.emit_fmt(format_args!("    xorl %{0}, %{0}", target_32)),
-                    IrConst::I8(v) => self.state.emit_fmt(format_args!("    movl ${}, %{}", *v as i32, target_32)),
-                    IrConst::I16(v) => self.state.emit_fmt(format_args!("    movl ${}, %{}", *v as i32, target_32)),
-                    IrConst::I32(v) => self.state.emit_fmt(format_args!("    movl ${}, %{}", *v, target_32)),
+                    IrConst::I8(v) => self.state.out.emit_instr_imm_reg("    movq", *v as i64, target_name),
+                    IrConst::I16(v) => self.state.out.emit_instr_imm_reg("    movq", *v as i64, target_name),
+                    IrConst::I32(v) => self.state.out.emit_instr_imm_reg("    movq", *v as i64, target_name),
                     _ => {
                         self.operand_to_callee_reg(op, target);
                         return;
@@ -589,7 +589,10 @@ impl X86Codegen {
                         self.operand_to_callee_reg(op, target);
                         return;
                     } else {
-                        self.state.out.emit_instr_rbp_reg("    movl", slot.0, target_32);
+                        // Use movq to preserve sign bits in upper 32 bits.
+                        // movl zero-extends, which corrupts negative I32 values
+                        // that later flow into 64-bit operations.
+                        self.state.out.emit_instr_rbp_reg("    movq", slot.0, target_name);
                     }
                 } else if self.state.reg_cache.acc_has(v.0, false) || self.state.reg_cache.acc_has(v.0, true) {
                     self.state.out.emit_instr_reg_reg("    movq", "rax", target_name);
