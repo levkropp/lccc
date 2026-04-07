@@ -357,6 +357,29 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
 
+    // Debug: count overlaps BEFORE phi coalesce
+    if std::env::var("CCC_VERIFY_REGALLOC").is_ok() {
+        let mut pre_count = 0;
+        let mut pre_reg_ivs: std::collections::HashMap<u8, Vec<(u32, u32, u32)>> = std::collections::HashMap::new();
+        for iv in &liveness.intervals {
+            if let Some(&reg) = assignments.get(&iv.value_id) {
+                pre_reg_ivs.entry(reg.0).or_default().push((iv.start, iv.end, iv.value_id));
+            }
+        }
+        for (_, intervals) in &pre_reg_ivs {
+            for i in 0..intervals.len() {
+                for j in (i+1)..intervals.len() {
+                    let (s1, e1, _) = intervals[i];
+                    let (s2, e2, _) = intervals[j];
+                    if s1 < e2 && s2 < e1 { pre_count += 1; }
+                }
+            }
+        }
+        if pre_count > 0 {
+            eprintln!("[REGALLOC-PRE-PHI] {} overlaps BEFORE phi coalesce", pre_count);
+        }
+    }
+
     // Propagate phi coalesce assignments: backedge source values inherit
     // the register of their phi dest. This makes the backedge Copy a no-op
     // when both values share the same register.
@@ -368,6 +391,16 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             let src_interval = liveness.intervals.iter()
                 .find(|iv| iv.value_id == backedge_src);
             if let Some(src_iv) = src_interval {
+                // Additional: check overlap with the phi dest's own interval
+                // (they share a register, so they should not overlap)
+                let dest_iv = liveness.intervals.iter()
+                    .find(|iv| iv.value_id == phi_dest);
+                if let Some(div) = dest_iv {
+                    if src_iv.start < div.end && div.start < src_iv.end {
+                        // Phi dest and backedge source intervals overlap — skip
+                        continue;
+                    }
+                }
                 // Check for conflicts with other values in the same register
                 let has_conflict = liveness.intervals.iter().any(|iv| {
                     if iv.value_id == backedge_src || iv.value_id == phi_dest { return false; }
@@ -384,6 +417,29 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 // No interval info — still safe to propagate (value might be dead)
                 assignments.insert(backedge_src, reg);
             }
+        }
+    }
+
+    // Debug: count overlaps after phi coalesce
+    if std::env::var("CCC_VERIFY_REGALLOC").is_ok() {
+        let mut overlap_count = 0;
+        let mut reg_ivs: std::collections::HashMap<u8, Vec<(u32, u32, u32)>> = std::collections::HashMap::new();
+        for iv in &liveness.intervals {
+            if let Some(&reg) = assignments.get(&iv.value_id) {
+                reg_ivs.entry(reg.0).or_default().push((iv.start, iv.end, iv.value_id));
+            }
+        }
+        for (_, intervals) in &reg_ivs {
+            for i in 0..intervals.len() {
+                for j in (i+1)..intervals.len() {
+                    let (s1, e1, _) = intervals[i];
+                    let (s2, e2, _) = intervals[j];
+                    if s1 < e2 && s2 < e1 { overlap_count += 1; }
+                }
+            }
+        }
+        if overlap_count > 0 {
+            eprintln!("[REGALLOC-POST-PHI] {} overlaps after phi coalesce", overlap_count);
         }
     }
 
