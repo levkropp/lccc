@@ -196,32 +196,25 @@ impl X86Codegen {
                     _ => false,
                 };
 
-                if true_in_dest {
-                    // true is in dest, so save it to %rcx first
-                    self.state.emit_fmt(format_args!("    movq %{}, %rcx", d_name));
-                    self.operand_to_callee_reg(false_val, d_reg);
-                } else {
-                    self.operand_to_callee_reg(false_val, d_reg);
-                    self.operand_to_rcx(true_val);
-                }
+                // Safe approach: use push/pop to save true_val on the stack,
+                // avoiding register clobbering between operand loads.
+                // The register allocator may assign overlapping registers to
+                // cond, true_val, and false_val since they're all "live" at the
+                // Select point but the allocator doesn't model simultaneous liveness.
 
-                // Load and test condition
-                match cond {
-                    Operand::Value(v) if self.reg_assignments.get(&v.0).copied() == Some(d_reg) => {
-                        // Cond is in dest — we already overwrote it. Use %rax as temp.
-                        self.operand_to_rax(cond);
-                        self.state.emit("    testq %rax, %rax");
-                    }
-                    Operand::Value(v) if self.reg_assignments.contains_key(&v.0) => {
-                        let cond_name = phys_reg_name(*self.reg_assignments.get(&v.0).unwrap());
-                        self.state.emit_fmt(format_args!("    testq %{}, %{}", cond_name, cond_name));
-                    }
-                    _ => {
-                        self.operand_to_rax(cond);
-                        self.state.emit("    testq %rax, %rax");
-                    }
-                }
+                // Step 1: load false_val to dest
+                self.operand_to_callee_reg(false_val, d_reg);
 
+                // Step 2: load true_val to rax, push it (safe from clobbering)
+                self.operand_to_rax(true_val);
+                self.state.emit("    pushq %rax");
+
+                // Step 3: load and test condition
+                self.operand_to_rax(cond);
+                self.state.emit("    testq %rax, %rax");
+
+                // Step 4: pop true_val to rcx and cmov
+                self.state.emit("    popq %rcx");
                 self.state.emit_fmt(format_args!("    cmovneq %rcx, %{}", d_name));
                 self.state.reg_cache.invalidate_acc();
                 return;
