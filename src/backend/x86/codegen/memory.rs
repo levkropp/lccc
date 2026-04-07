@@ -753,23 +753,27 @@ impl X86Codegen {
         }
 
         // Default GEP fold logic.
-        self.operand_to_rax(val);
         let addr = self.state.resolve_slot_addr(base.0);
         if let Some(addr) = addr {
             let store_instr = Self::mov_store_for_type(ty);
             match addr {
                 SlotAddr::OverAligned(slot, id) => {
-                    self.emit_save_acc_impl();
+                    // For over-aligned, load ptr first to rcx, then load value to rax
                     self.emit_alloca_aligned_addr_impl(slot, id);
                     self.emit_add_offset_to_addr_reg_impl(offset);
-                    self.emit_typed_store_indirect_impl(store_instr, ty);
+                    // rcx now holds the target address
+                    self.operand_to_rax(val);
+                    let store_reg = Self::reg_for_type("rax", ty);
+                    self.state.emit_fmt(format_args!("    {} %{}, (%rcx)", store_instr, store_reg));
                 }
                 SlotAddr::Direct(slot) => {
+                    self.operand_to_rax(val);
                     let folded_slot = StackSlot(slot.0 + offset);
                     self.emit_typed_store_to_slot_impl(store_instr, ty, folded_slot);
                 }
                 SlotAddr::Indirect(slot) => {
                     if let Some(&reg) = self.reg_assignments.get(&base.0) {
+                        self.operand_to_rax(val);
                         let reg_name = phys_reg_name(reg);
                         let store_reg = Self::reg_for_type("rax", ty);
                         if offset != 0 {
@@ -778,15 +782,23 @@ impl X86Codegen {
                             self.state.emit_fmt(format_args!("    {} %{}, (%{})", store_instr, store_reg, reg_name));
                         }
                     } else {
-                        self.emit_save_acc_impl();
+                        // Load pointer to %rcx FIRST, then load value to %rax.
+                        // This avoids emit_save_acc which can be clobbered by
+                        // operand_to_rax if the value uses %r11/%rdx as scratch.
                         self.emit_load_ptr_from_slot_impl(slot, base.0);
                         if offset != 0 {
                             self.emit_add_offset_to_addr_reg_impl(offset);
                         }
-                        self.emit_typed_store_indirect_impl(store_instr, ty);
+                        // Now load value — %rcx is safe (not clobbered by operand_to_rax)
+                        self.operand_to_rax(val);
+                        let store_reg = Self::reg_for_type("rax", ty);
+                        self.state.emit_fmt(format_args!("    {} %{}, (%rcx)", store_instr, store_reg));
                     }
                 }
             }
+        } else {
+            // No addr resolution — fall back
+            self.operand_to_rax(val);
         }
     }
 
@@ -911,9 +923,10 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_typed_store_indirect_impl(&mut self, instr: &'static str, ty: IrType) {
-        // Use %r11 when rdx is allocated, matching emit_save_acc_impl.
-        let base_name = if self.reg_assignments.values().any(|r| r.0 == 16) { "r11" } else { "rdx" };
-        let store_reg = Self::reg_for_type(base_name, ty);
+        // Store from the accumulator (%rax) to the address in %rcx.
+        // The value was loaded to %rax AFTER the pointer was loaded to %rcx,
+        // so %rax holds the correct value.
+        let store_reg = Self::reg_for_type("rax", ty);
         self.state.emit_fmt(format_args!("    {} %{}, (%rcx)", instr, store_reg));
     }
 
