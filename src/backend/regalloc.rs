@@ -360,10 +360,30 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // Propagate phi coalesce assignments: backedge source values inherit
     // the register of their phi dest. This makes the backedge Copy a no-op
     // when both values share the same register.
+    // Safety check: only propagate if the backedge source's interval doesn't
+    // conflict with other values already assigned to the same register.
     for &(phi_dest, backedge_src) in &phi_coalesce {
         if let Some(&reg) = assignments.get(&phi_dest) {
-            assignments.insert(backedge_src, reg);
-            // No need to add to used_regs_set — the phi dest already did.
+            // Find backedge_src's interval
+            let src_interval = liveness.intervals.iter()
+                .find(|iv| iv.value_id == backedge_src);
+            if let Some(src_iv) = src_interval {
+                // Check for conflicts with other values in the same register
+                let has_conflict = liveness.intervals.iter().any(|iv| {
+                    if iv.value_id == backedge_src || iv.value_id == phi_dest { return false; }
+                    if let Some(&other_reg) = assignments.get(&iv.value_id) {
+                        other_reg.0 == reg.0 && iv.start < src_iv.end && src_iv.start < iv.end
+                    } else {
+                        false
+                    }
+                });
+                if !has_conflict {
+                    assignments.insert(backedge_src, reg);
+                }
+            } else {
+                // No interval info — still safe to propagate (value might be dead)
+                assignments.insert(backedge_src, reg);
+            }
         }
     }
 
@@ -478,6 +498,29 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
 
     let mut used_regs: Vec<PhysReg> = used_regs_set.iter().map(|&r| PhysReg(r)).collect();
     used_regs.sort_by_key(|r| r.0);
+
+    // Verify: no two assigned values should have overlapping live intervals
+    // in the same physical register.
+    if std::env::var("CCC_VERIFY_REGALLOC").is_ok() {
+        let mut reg_intervals: std::collections::HashMap<u8, Vec<(u32, u32, u32)>> = std::collections::HashMap::new();
+        for iv in &liveness.intervals {
+            if let Some(&reg) = assignments.get(&iv.value_id) {
+                reg_intervals.entry(reg.0).or_default().push((iv.start, iv.end, iv.value_id));
+            }
+        }
+        for (&reg_id, intervals) in &reg_intervals {
+            for i in 0..intervals.len() {
+                for j in (i+1)..intervals.len() {
+                    let (s1, e1, v1) = intervals[i];
+                    let (s2, e2, v2) = intervals[j];
+                    if s1 < e2 && s2 < e1 {
+                        eprintln!("[REGALLOC-OVERLAP] reg={} val{}[{}-{}] overlaps val{}[{}-{}]",
+                            reg_id, v1, s1, e1, v2, s2, e2);
+                    }
+                }
+            }
+        }
+    }
 
     if std::env::var("CCC_DEBUG_REGALLOC").is_ok() && eligible.len() > 50 {
         let total_eligible = eligible.len();
