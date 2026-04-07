@@ -292,7 +292,20 @@ impl LinearScanAllocator {
         self.expire_old_intervals(range.start);
 
         // Step 2: Try to find a free register
+        let trace = std::env::var("CCC_TRACE_ALLOC").is_ok();
         if let Some(reg) = self.find_free_register(&range) {
+            // Verify: check for actual same-register overlap
+            if trace {
+                for active in &self.active {
+                    if let Some(&areg) = self.assignments.get(&active.range.value_id) {
+                        if areg == reg && active.range.overlaps_with(&range) {
+                            eprintln!("[ALLOC-BUG] Assigning val{}[{}-{}] to reg={} but val{}[{}-{}] already in reg={}!",
+                                range.value_id, range.start, range.end, reg.0,
+                                active.range.value_id, active.range.start, active.range.end, areg.0);
+                        }
+                    }
+                }
+            }
             // Found a free register - assign it
             self.assignments.insert(range.value_id, reg);
             self.occupy_register(reg, range.end + 1);
