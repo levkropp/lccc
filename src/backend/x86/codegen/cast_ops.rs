@@ -239,19 +239,24 @@ impl X86Codegen {
                 return true;
             }
             CastKind::IntNarrow { to_ty: t } => {
-                // Narrow: truncate. For register-to-register 32-bit narrows,
-                // use movq to preserve the full 64-bit value. movl would zero-extend
-                // the upper 32 bits, corrupting negative values that later flow
-                // into 64-bit operations through callee-saved registers.
+                // Narrow: truncate to the target width.
+                // For unsigned 32-bit types: movl zero-extends, giving correct U32 semantics.
+                // For signed 32-bit types: movslq sign-extends, preserving I32 semantics
+                // when the value later flows into 64-bit operations.
                 if let Some(src_reg) = src_phys {
                     let src_typed = typed_phys_reg_name(src_reg, t);
                     match t.size() {
                         4 => {
-                            // Use movq for reg-to-reg to avoid zero-extension.
-                            // The lower 32 bits contain the truncated value;
-                            // the upper bits are don't-care but must preserve sign.
-                            let src_name = phys_reg_name(src_reg);
-                            self.state.out.emit_instr_reg_reg("    movq", src_name, dest_64);
+                            if t.is_unsigned() {
+                                // U32 narrowing: movl truncates to 32 bits and zero-extends.
+                                let src_32 = phys_reg_name_32(src_reg);
+                                self.state.emit_fmt(format_args!("    movl %{}, %{}", src_32, dest_32));
+                            } else {
+                                // I32 narrowing: movslq truncates to 32 bits and sign-extends
+                                // to 64 bits, preserving negative values.
+                                let src_32 = phys_reg_name_32(src_reg);
+                                self.state.emit_fmt(format_args!("    movslq %{}, %{}", src_32, dest_64));
+                            }
                         }
                         2 => self.state.emit_fmt(format_args!("    movzwl %{}, %{}", src_typed, dest_32)),
                         1 => self.state.emit_fmt(format_args!("    movzbl %{}, %{}", src_typed, dest_32)),
@@ -271,13 +276,13 @@ impl X86Codegen {
                 return true;
             }
             CastKind::SignedToUnsignedSameSize { to_ty: t } => {
-                // Same size conversion. Use movq for 32-bit reg-to-reg to avoid
-                // zero-extension corrupting callee-saved register upper bits.
+                // I32→U32: reinterpret signed as unsigned, zero-extending upper bits.
+                // movl truncates to 32 bits and clears upper 32 — correct for unsigned.
                 if let Some(src_reg) = src_phys {
                     match t.size() {
                         4 => {
-                            let src_name = phys_reg_name(src_reg);
-                            self.state.out.emit_instr_reg_reg("    movq", src_name, dest_64);
+                            let src_32 = phys_reg_name_32(src_reg);
+                            self.state.emit_fmt(format_args!("    movl %{}, %{}", src_32, dest_32));
                         }
                         2 => self.state.emit_fmt(format_args!("    movzwl %{}, %{}", typed_phys_reg_name(src_reg, t), dest_32)),
                         1 => self.state.emit_fmt(format_args!("    movzbl %{}, %{}", typed_phys_reg_name(src_reg, t), dest_32)),
