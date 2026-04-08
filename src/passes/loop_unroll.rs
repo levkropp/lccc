@@ -251,6 +251,17 @@ fn analyze_loop(
         }
     }
 
+    // Skip unrolling for I32/U32 IV types on 64-bit targets.
+    // The unroller creates intermediate IV BinOps and Cmp instructions using
+    // the IV's narrow type, but the cloned body blocks may contain operations
+    // (pointer arithmetic, GEP, etc.) that expect the IV value to be 64-bit.
+    // After copy propagation, the narrow IV values flow into these 64-bit
+    // operations without proper widening, causing value corruption.
+    // TODO: Fix unroller to insert Cast(I32→I64) when IV is used in wider ops.
+    if !crate::common::types::target_is_32bit() && iv_ty.size() < 8 && iv_ty.is_integer() {
+        return None;
+    }
+
     Some(UnrollCandidate {
         header,
         latch,

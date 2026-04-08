@@ -80,8 +80,11 @@ pub fn widened_op_type(common_ty: IrType) -> IrType {
             IrType::I32
         }
     } else {
-        // On 64-bit: widen everything to I64 (machine word).
-        IrType::I64
+        // On 64-bit: preserve I32/U32 types for correct 32-bit semantics.
+        match common_ty {
+            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 => IrType::I32,
+            _ => common_ty,
+        }
     }
 }
 
