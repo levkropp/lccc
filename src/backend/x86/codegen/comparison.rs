@@ -196,69 +196,60 @@ impl X86Codegen {
                     _ => false,
                 };
 
-                // Safe approach: use push/pop to save true_val on the stack,
-                // avoiding register clobbering between operand loads.
-                // The register allocator may assign overlapping registers to
-                // cond, true_val, and false_val since they're all "live" at the
-                // Select point but the allocator doesn't model simultaneous liveness.
+                // Load condition FIRST, then true/false vals.
+                // operand_to_rax(cond) must run before loading true_val
+                // to rcx, because the condition load may clobber registers
+                // that the register allocator assigned to true_val (the
+                // allocator doesn't model simultaneous liveness of Select operands).
 
-                // Step 1: load false_val to dest
-                self.operand_to_callee_reg(false_val, d_reg);
-
-                // Step 2: load true_val to rax, push it (safe from clobbering)
-                self.operand_to_rax(true_val);
-                self.state.emit("    pushq %rax");
-
-                // Step 3: load and test condition
+                // Step 1: load and test condition
                 self.operand_to_rax(cond);
                 self.state.emit("    testq %rax, %rax");
+                // Save flags (condition result) — pushfq preserves ZF
+                self.state.emit("    pushfq");
+                if self.state.out.use_rsp_addressing {
+                    self.state.out.rsp_frame_size += 8;
+                }
 
-                // Step 4: pop true_val to rcx and cmov
-                self.state.emit("    popq %rcx");
+                // Step 2: load false_val to dest
+                self.operand_to_callee_reg(false_val, d_reg);
+
+                // Step 3: load true_val to rcx
+                self.operand_to_rcx(true_val);
+
+                // Step 4: restore flags and cmov
+                self.state.emit("    popfq");
+                if self.state.out.use_rsp_addressing {
+                    self.state.out.rsp_frame_size -= 8;
+                }
                 self.state.emit_fmt(format_args!("    cmovneq %rcx, %{}", d_name));
                 self.state.reg_cache.invalidate_acc();
                 return;
             }
         }
 
-        // Accumulator fallback
+        // Accumulator fallback — same pushfq approach as register-direct path
+        // to prevent condition loading from clobbering true_val's register.
+
+        // Step 1: load and test condition FIRST
+        self.operand_to_rax(cond);
+        self.state.emit("    testq %rax, %rax");
+        self.state.emit("    pushfq");
+        if self.state.out.use_rsp_addressing {
+            self.state.out.rsp_frame_size += 8;
+        }
+
+        // Step 2: load false_val to rax
         self.operand_to_rax(false_val);
+
+        // Step 3: load true_val to rcx (safe — condition already tested)
         self.operand_to_rcx(true_val);
 
-        // Use %r11 for the condition when %rdx is allocated to a value.
-        let cond_reg = if self.reg_assignments.values().any(|r| r.0 == 16) { "r11" } else { "rdx" };
-        let cond_reg_32 = if cond_reg == "r11" { "r11d" } else { "edx" };
-
-        match cond {
-            Operand::Const(c) => {
-                let val = match c {
-                    IrConst::I8(v) => *v as i64,
-                    IrConst::I16(v) => *v as i64,
-                    IrConst::I32(v) => *v as i64,
-                    IrConst::I64(v) => *v,
-                    IrConst::Zero => 0,
-                    _ => 0,
-                };
-                if val == 0 {
-                    self.state.emit_fmt(format_args!("    xorl %{0}, %{0}", cond_reg_32));
-                } else if val >= i32::MIN as i64 && val <= i32::MAX as i64 {
-                    self.state.out.emit_instr_imm_reg("    movq", val, cond_reg);
-                } else {
-                    self.state.out.emit_instr_imm_reg("    movabsq", val, cond_reg);
-                }
-            }
-            Operand::Value(v) => {
-                if let Some(&reg) = self.reg_assignments.get(&v.0) {
-                    let reg_name = phys_reg_name(reg);
-                    self.state.out.emit_instr_reg_reg("    movq", reg_name, cond_reg);
-                } else if self.state.get_slot(v.0).is_some() {
-                    self.value_to_reg(v, cond_reg);
-                } else {
-                    self.state.emit_fmt(format_args!("    xorl %{0}, %{0}", cond_reg_32));
-                }
-            }
+        // Step 4: restore flags and cmov
+        self.state.emit("    popfq");
+        if self.state.out.use_rsp_addressing {
+            self.state.out.rsp_frame_size -= 8;
         }
-        self.state.emit_fmt(format_args!("    testq %{0}, %{0}", cond_reg));
         self.state.emit("    cmovneq %rcx, %rax");
         self.state.reg_cache.invalidate_acc();
         self.store_rax_to(dest);
