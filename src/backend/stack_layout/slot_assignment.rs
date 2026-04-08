@@ -479,14 +479,17 @@ fn classify_value(
     let has_cross_block_use = ctx.use_blocks_map.get(&dest.0)
         .map(|blks| blks.iter().any(|&b| ctx.def_block.get(&dest.0).map_or(true, |&db| b != db)))
         .unwrap_or(false);
-    // Skip copy-aliased values that don't need cross-block persistence —
-    // they'll get their slot from the alias root in resolve_copy_aliases.
-    // EXCEPT when slot coalescing is disabled: in that case, the alias
-    // resolution skips non-phi-web aliases, so these values need their own slots.
+    // Always classify copy-aliased values into their own slots. The
+    // resolve_copy_aliases phase may later share the slot with the alias root
+    // when safe (no interference), but values must have their own fallback slot
+    // in case resolve_copy_aliases blocks the sharing due to liveness conflicts.
+    // Skipping classification here left values without any slot when sharing was
+    // blocked, causing them to get emergency slots that overlap with other values.
     if !is_i128 && !is_f128 && !is_protected && !is_multi_def && !has_cross_block_use && is_copy_aliased {
-        if std::env::var("CCC_NO_SLOT_COALESCE").is_err() {
-            return;
+        if std::env::var("CCC_NO_SLOT_COALESCE").is_ok() {
+            // When slot coalescing is fully disabled, classify normally (fall through).
         }
+        // Otherwise: fall through to normal classification — give the value its own slot.
     }
     if debug_protect && is_protected && is_copy_aliased {
         eprintln!("[CLASSIFY] SSA {} is protected AND copy-aliased, allocating slot anyway", dest.0);
@@ -959,8 +962,16 @@ pub(super) fn resolve_copy_aliases(
             continue;
         }
 
+        // Liveness-based interference check for copy alias coalescing.
         if let Some(&slot) = state.value_locations.get(&root_id) {
+            let dest_def = def_point.get(&dest_id).copied().unwrap_or(u32::MAX);
+            let root_last = last_use.get(&root_id).copied().unwrap_or(0);
+            if dest_def <= root_last {
+                continue; // Root still live when dest is defined
+            }
             state.value_locations.insert(dest_id, slot);
+        } else {
+            continue;
         }
         // Propagate small-slot property
         if state.small_slot_values.contains(&root_id) {
