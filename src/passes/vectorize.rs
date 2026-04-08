@@ -2663,12 +2663,14 @@ fn insert_reduction_remainder_loop(
         label: vec_exit_label,
         instructions: vec![
             // Horizontal reduction: scalar_sum = reduce(vec_accumulator)
-            // Read from vector SSA value, reduce to scalar
+            // Use the accumulator PHI (not vec_sum_value) so that when the
+            // vectorized loop has 0 iterations, we reduce the initial zero
+            // vector instead of an uninitialized temporary.
             Instruction::Intrinsic {
                 dest: Some(scalar_sum),
                 op: vec_horizontal_op,
                 dest_ptr: None,
-                args: vec![Operand::Value(vec_sum_value)],
+                args: vec![Operand::Value(pattern.accumulator_phi)],
             },
             // Compute starting index for remainder: i_rem_start = iv_final * vec_width
             Instruction::BinOp {

@@ -59,8 +59,12 @@ pub fn target_int_ir_type() -> IrType {
 /// - I32/U32 and smaller → I32 (machine word)
 /// - I64/U64 (long long) → I64 (requires register pairs)
 /// - I128/U128 → I128
-///   This replaces hardcoded `IrType::I64` in arithmetic lowering so that i686
-///   doesn't needlessly generate 64-bit operations for 32-bit C types.
+///
+/// NOTE: This unconditionally promotes I32/U32 to I64 on 64-bit targets,
+/// which means 32-bit operations (multiply, shift, division) use 64-bit
+/// instructions. The IntNarrow cast in the codegen handles truncation back
+/// to 32-bit semantics. A future improvement would preserve I32/U32 here,
+/// but this requires fixing GVN and cfg_simplify to handle I32 types.
 pub fn widened_op_type(common_ty: IrType) -> IrType {
     // Float and 128-bit types are never widened; return them unchanged.
     if common_ty.is_float() || common_ty == IrType::I128 || common_ty == IrType::U128
