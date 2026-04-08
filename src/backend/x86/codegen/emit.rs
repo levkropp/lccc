@@ -754,8 +754,9 @@ impl X86Codegen {
                 self.state.out.emit_instr_reg_reg("    movq", "rax", reg_name);
             }
         } else if let Some(slot) = self.state.get_slot(dest.0) {
-            // No register: store 32 bits to stack slot.
-            self.state.out.emit_instr_reg_rbp("    movl", "eax", slot.0);
+            // No register: store 64 bits to stack slot (use movq/rax to preserve
+            // sign-extended values that may later be used in 64-bit operations).
+            self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
         }
         self.state.reg_cache.set_acc(dest.0, false);
     }
