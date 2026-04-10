@@ -251,15 +251,31 @@ fn analyze_loop(
         }
     }
 
-    // Skip unrolling for I32/U32 IV types on 64-bit targets.
-    // The unroller creates intermediate IV BinOps and Cmp instructions using
-    // the IV's narrow type, but the cloned body blocks may contain operations
-    // (pointer arithmetic, GEP, etc.) that expect the IV value to be 64-bit.
-    // After copy propagation, the narrow IV values flow into these 64-bit
-    // operations without proper widening, causing value corruption.
-    // TODO: Fix unroller to insert Cast(I32→I64) when IV is used in wider ops.
+    // Skip unrolling for I32/U32 IV types on 64-bit targets when the loop body
+    // contains Cast(I32→I64) or GEP instructions that widen the IV. The unroller
+    // creates intermediate IV values at the narrow type, and in complex functions
+    // (like SQLite's 255K-line amalgamation) the widened values can interact
+    // incorrectly with subsequent optimization passes.
+    // Simple loops without IV widening (pure I32 arithmetic) are safe to unroll.
     if !crate::common::types::target_is_32bit() && iv_ty.size() < 8 && iv_ty.is_integer() {
-        return None;
+        let has_iv_widening = body_work.iter().any(|&bi| {
+            func.blocks[bi].instructions.iter().any(|inst| {
+                match inst {
+                    Instruction::Cast { src: Operand::Value(v), from_ty, to_ty, .. } => {
+                        v.0 == iv_phi.0
+                            && matches!(from_ty, IrType::I32 | IrType::U32)
+                            && matches!(to_ty, IrType::I64 | IrType::U64 | IrType::Ptr)
+                    }
+                    Instruction::GetElementPtr { offset: Operand::Value(v), .. } => {
+                        v.0 == iv_phi.0
+                    }
+                    _ => false,
+                }
+            })
+        });
+        if has_iv_widening {
+            return None;
+        }
     }
 
     Some(UnrollCandidate {
