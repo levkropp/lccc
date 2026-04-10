@@ -58,8 +58,17 @@ const MAX_POST_GLOBAL_ITERATIONS: usize = 4;
 /// 3. Run local passes one more time to clean up opportunities exposed by the
 ///    global passes (max `MAX_POST_GLOBAL_ITERATIONS` iterations).
 pub fn peephole_optimize(asm: String) -> String {
+    // Peephole optimizer is disabled by default due to multiple unsound passes
+    // that cause miscompilation in complex programs (e.g., SQLite 255K lines).
+    // The dead-move analysis, phi coalescing, and copy propagation phases
+    // remove live code in ways that interact across phases.
+    // Enable with CCC_PEEPHOLE=1 for benchmarks where it helps.
+    // Disable explicitly with CCC_NO_PEEPHOLE=1 (overrides CCC_PEEPHOLE).
     if std::env::var("CCC_NO_PEEPHOLE").is_ok() {
         return asm;
+    }
+    if std::env::var("CCC_PEEPHOLE").is_err() {
+        return asm; // Disabled by default
     }
     let skip_phase1 = std::env::var("CCC_NO_PEEPHOLE_PHASE1").is_ok();
     let skip_phase2 = std::env::var("CCC_NO_PEEPHOLE_PHASE2").is_ok();
@@ -73,6 +82,21 @@ pub fn peephole_optimize(asm: String) -> String {
     let mut store = LineStore::new(asm);
     let line_count = store.len();
     let mut infos: Vec<LineInfo> = (0..line_count).map(|i| classify_line(store.get(i))).collect();
+
+    // Detect if this function uses pushfq/popfq (from Select codegen).
+    // These instructions shift RSP, which invalidates the text-based peephole's
+    // assumptions about stack slot offsets. When pushfq is present:
+    // - Limit Phase 1 to 1 iteration (prevent pass interaction chains)
+    // - Skip Phase 2 (global store forwarding tracks stale offsets)
+    // - Skip Phase 3 (cleanup after Phase 2 amplifies the problem)
+    let has_pushfq = (0..line_count).any(|i| {
+        let s = infos[i].trimmed(store.get(i));
+        s == "pushfq" || s == "popfq"
+    });
+    let skip_phase1 = skip_phase1;
+    let skip_phase2 = skip_phase2 || has_pushfq;
+    let skip_phase3 = skip_phase3 || has_pushfq;
+    let max_phase1_iters = if has_pushfq { 1 } else { MAX_LOCAL_PASS_ITERATIONS };
 
     // Pin parameter pre-store instructions: `movq %arg_reg, %callee_saved_reg`
     // that appear in the prologue area (before the first function call).
@@ -118,7 +142,7 @@ pub fn peephole_optimize(asm: String) -> String {
     // Phase 1: Iterative cheap local passes.
     let mut changed = true;
     let mut pass_count = 0;
-    while changed && pass_count < MAX_LOCAL_PASS_ITERATIONS && !skip_phase1 {
+    while changed && pass_count < max_phase1_iters && !skip_phase1 {
         changed = false;
         let local_changed = if sk("combined") { false } else { local_patterns::combined_local_pass(&mut store, &mut infos) };
         changed |= local_changed;
