@@ -114,6 +114,10 @@ struct StackLayoutContext {
     /// elimination places Copies at predecessor block ends. If the source
     /// value's Tier 3 slot was reused by another block, the Copy reads garbage.
     phi_incoming_values: FxHashSet<u32>,
+    /// Block indices where the block has more instructions than the Tier 3
+    /// greedy coloring threshold. Values defined in these blocks are directed
+    /// to Tier 2 (liveness-packed) instead of Tier 3 (greedy reuse).
+    large_blocks: FxHashSet<usize>,
 }
 
 // ── Main stack space calculation ──────────────────────────────────────────
@@ -432,6 +436,17 @@ fn build_layout_context(
         }
     }
 
+    // Identify blocks too large for Tier 3 greedy coloring.
+    // The accumulator-based codegen processes instructions sequentially, but
+    // the actual spill ordering can diverge from IR instruction order in
+    // large blocks (register cache effects, multi-operand instructions,
+    // fused operations). Tier 2 liveness-packed allocation uses proper live
+    // interval computation that handles these cases correctly.
+    let large_blocks: FxHashSet<usize> = func.blocks.iter().enumerate()
+        .filter(|(_, b)| b.instructions.len() > slot_assignment::MAX_TIER3_BLOCK_INSTRUCTIONS)
+        .map(|(i, _)| i)
+        .collect();
+
     StackLayoutContext {
         coalesce,
         use_blocks_map,
@@ -444,5 +459,6 @@ fn build_layout_context(
         coalescable_allocas,
         immediately_consumed,
         phi_incoming_values,
+        large_blocks,
     }
 }

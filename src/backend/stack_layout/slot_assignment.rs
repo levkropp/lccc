@@ -27,6 +27,13 @@ use super::{
 /// Determine if a non-alloca value can be assigned to a block-local pool slot (Tier 3).
 /// Returns `Some(def_block_idx)` if the value is defined and used only within a
 /// single block, making it safe to share stack space with values from other blocks.
+/// Maximum number of IR instructions in a block for Tier 3 greedy slot reuse.
+/// Above this threshold, the accumulator-based codegen's instruction ordering
+/// diverges too much from IR instruction order, making the greedy coloring's
+/// liveness analysis unreliable. Large blocks use Tier 2 (liveness-packed)
+/// which uses proper live interval computation instead.
+pub(super) const MAX_TIER3_BLOCK_INSTRUCTIONS: usize = 200;
+
 pub(super) fn coalescable_group(
     val_id: u32,
     ctx: &StackLayoutContext,
@@ -64,7 +71,11 @@ pub(super) fn coalescable_group(
             }
 
             // Single-block value: defined and used in the same block.
+            // Skip Tier 3 for large blocks where greedy coloring is unreliable.
             if unique.len() == 1 && unique[0] == def_blk {
+                if ctx.large_blocks.contains(&def_blk) {
+                    return None; // Use Tier 2 for large blocks
+                }
                 return Some(def_blk);
             }
         } else {
@@ -755,8 +766,12 @@ pub(super) fn assign_tier2_liveness_packed_slots(
         return;
     }
 
-    if !coalesce {
-        // Fallback: permanent slots for all multi-block values.
+    // Disable Tier 2 liveness-packed slot sharing — always use permanent slots.
+    // The liveness intervals from compute_live_intervals don't perfectly model
+    // the accumulator-based codegen's spill ordering, causing slot collisions
+    // in large functions like SQLite's. Using permanent (non-shared) slots for
+    // multi-block values is safe and the extra stack space is manageable.
+    {
         for mbv in multi_block_values {
             let (slot, new_space) = assign_slot(*non_local_space, mbv.slot_size, 0);
             state.value_locations.insert(mbv.dest_id, StackSlot(slot));
