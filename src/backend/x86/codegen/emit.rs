@@ -1412,11 +1412,17 @@ impl X86Codegen {
         self.operand_to_rax_rdx(lhs);
         self.state.emit("    pushq %rdx");
         self.state.emit("    pushq %rax");
+        if self.state.out.use_rsp_addressing {
+            self.state.out.rsp_frame_size += 16;
+        }
         self.operand_to_rax_rdx(rhs);
         self.state.emit("    movq %rax, %rcx");
         self.state.emit("    movq %rdx, %rsi");
         self.state.emit("    popq %rax");
         self.state.emit("    popq %rdx");
+        if self.state.out.use_rsp_addressing {
+            self.state.out.rsp_frame_size -= 16;
+        }
         self.state.reg_cache.invalidate_all();
     }
 
