@@ -15,6 +15,7 @@ use crate::ir::reexports::{
 };
 use crate::common::asm_constraints::constraint_is_immediate_only;
 use crate::common::types::{IrType, AddressSpace};
+use crate::common::fx_hash::FxHashMap as FxInlineMap;
 use std::collections::HashMap;
 
 /// Maximum number of IR instructions (across all blocks) in a callee for it
@@ -27,6 +28,12 @@ const MAX_INLINE_INSTRUCTIONS: usize = 60;
 /// Must be high enough to handle static inline functions with control flow
 /// (e.g., if/else chains, early returns). GCC inlines these aggressively.
 const MAX_INLINE_BLOCKS: usize = 6;
+
+/// Higher block limit for callees that contain no back-edges (no loops).
+/// Functions with if/else chains, switch statements, or early returns can
+/// have many blocks without loops. These are safe to inline more aggressively
+/// since they don't create nested loop structures that overwhelm codegen.
+const MAX_INLINE_BLOCKS_NO_LOOPS: usize = 12;
 
 /// Maximum total inlining budget per caller function (total inlined instructions).
 /// Prevents exponential blowup from recursive inlining chains.
@@ -244,9 +251,10 @@ fn select_inline_site(
         // inlining, shift amounts can't be constant-propagated, producing
         // massive unoptimized code with 28KB+ stack frames that overflow
         // the kernel's 16KB stack.
+        let callee_block_limit = if callee_data.has_loops { MAX_INLINE_BLOCKS } else { MAX_INLINE_BLOCKS_NO_LOOPS };
         let is_static_inline_eligible = callee_data.is_static_inline
             && callee_inst_count <= MAX_INLINE_INSTRUCTIONS
-            && callee_data.blocks.len() <= MAX_INLINE_BLOCKS;
+            && callee_data.blocks.len() <= callee_block_limit;
         // For recursive callers, only inline tiny callees and always_inline callees.
         // Inlining larger callees into recursive functions multiplies the stack frame
         // increase by the recursion depth, easily causing stack overflow.
@@ -925,6 +933,9 @@ struct CalleeData {
     /// same to match GCC behavior and enable critical optimizations (e.g.,
     /// constant propagation of shift amounts in ror32 used by blake2s).
     is_static_inline: bool,
+    /// Whether this callee contains any back-edges (loops).
+    /// Functions without loops can use a higher block limit for inlining.
+    has_loops: bool,
 }
 
 /// A call site that is eligible for inlining.
@@ -1011,6 +1022,27 @@ fn build_callee_map(module: &IrModule) -> HashMap<String, CalleeData> {
         // GCC at -O2 inlines small static functions even without the `inline` keyword.
         // This prevents linker errors from undefined references in dead code paths.
         let inst_count_for_static: usize = func.blocks.iter().map(|b| b.instructions.len()).sum();
+
+        // Detect back-edges (loops) early, used for block limit decision.
+        let has_loops = {
+            let label_to_order: FxInlineMap<BlockId, usize> = func.blocks.iter()
+                .enumerate().map(|(i, b)| (b.label, i)).collect();
+            func.blocks.iter().enumerate().any(|(i, block)| {
+                let succs: Vec<BlockId> = match &block.terminator {
+                    Terminator::Branch(t) => vec![*t],
+                    Terminator::CondBranch { true_label, false_label, .. } => vec![*true_label, *false_label],
+                    Terminator::Switch { default, cases, .. } => {
+                        let mut s = vec![*default];
+                        s.extend(cases.iter().map(|(_, l)| *l));
+                        s
+                    }
+                    _ => vec![],
+                };
+                succs.iter().any(|succ| {
+                    label_to_order.get(succ).map_or(false, |&j| j <= i)
+                })
+            })
+        };
         let is_small_static = func.is_static && !func.is_inline
             && inst_count_for_static <= MAX_STATIC_NONINLINE_INSTRUCTIONS
             && func.blocks.len() <= MAX_STATIC_NONINLINE_BLOCKS;
@@ -1023,10 +1055,11 @@ fn build_callee_map(module: &IrModule) -> HashMap<String, CalleeData> {
         // modpost flags a .text -> .init.text section mismatch.
         // These are treated as normal inline candidates (not exceeds_normal_limits)
         // since they fit within MAX_INLINE_INSTRUCTIONS/MAX_INLINE_BLOCKS.
+        let medium_block_limit = if has_loops { MAX_INLINE_BLOCKS } else { MAX_INLINE_BLOCKS_NO_LOOPS };
         let is_medium_static = func.is_static && !func.is_inline
             && !is_small_static
             && inst_count_for_static <= MAX_INLINE_INSTRUCTIONS
-            && func.blocks.len() <= MAX_INLINE_BLOCKS;
+            && func.blocks.len() <= medium_block_limit;
         if !is_always_inline && !is_trivially_empty && !is_small_static && !is_medium_static
             && (!func.is_static || !func.is_inline) {
                 if debug_callee {
@@ -1052,7 +1085,11 @@ fn build_callee_map(module: &IrModule) -> HashMap<String, CalleeData> {
         // callees will only be inlined when the caller has a custom section attribute
         // (e.g., .head.text, .noinstr.text), where cross-section calls are dangerous.
         let inst_count: usize = func.blocks.iter().map(|b| b.instructions.len()).sum();
-        let fits_normal = inst_count <= MAX_INLINE_INSTRUCTIONS && func.blocks.len() <= MAX_INLINE_BLOCKS;
+        // Non-loop callees get a higher block limit since their control flow
+        // (if/else chains, switch, early returns) doesn't create nested loops
+        // when inlined into a loop caller.
+        let effective_block_limit = if has_loops { MAX_INLINE_BLOCKS } else { MAX_INLINE_BLOCKS_NO_LOOPS };
+        let fits_normal = inst_count <= MAX_INLINE_INSTRUCTIONS && func.blocks.len() <= effective_block_limit;
         let fits_relaxed = inst_count <= MAX_ALWAYS_INLINE_INSTRUCTIONS && func.blocks.len() <= MAX_ALWAYS_INLINE_BLOCKS;
         let exceeds_normal = !is_always_inline && !fits_normal;
         if is_always_inline {
@@ -1132,6 +1169,7 @@ fn build_callee_map(module: &IrModule) -> HashMap<String, CalleeData> {
             is_always_inline,
             exceeds_normal_limits: exceeds_normal,
             is_static_inline: func.is_static && func.is_inline,
+            has_loops,
         });
     }
 
