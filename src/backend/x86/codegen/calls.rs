@@ -140,6 +140,11 @@ impl X86Codegen {
                             self.state.emit("    pushq %rcx");
                         }
                     }
+                    let push_bytes = (n_qwords * 8) as i64;
+                    if self.state.out.use_rsp_addressing {
+                        self.state.out.rsp_frame_size += push_bytes;
+                    }
+                    sp_adjust += push_bytes;
                 }
                 CallArgClass::Stack => {
                     self.operand_to_rax(&args[si]);
