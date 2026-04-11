@@ -128,6 +128,18 @@ pub(crate) fn vectorize_with_analysis(func: &mut IrFunction, cfg: &CfgAnalysis) 
         if let Some(pattern) = analyze_loop_pattern(func, loop_info, cfg) {
             // Select vector width: default to AVX2 (4-wide) unless explicitly disabled
             let use_sse2 = std::env::var("LCCC_FORCE_SSE2").is_ok();
+            let vec_width: i64 = if use_sse2 { 2 } else { 4 };
+
+            // Check: if the loop limit is a known constant smaller than the vector width,
+            // skip vectorization — the vectorized loop would never execute, and the
+            // remainder loop may not correctly handle the full trip count.
+            let skip_small = match &pattern.limit {
+                Operand::Const(c) => c.to_i64().map_or(false, |n| n <= vec_width),
+                _ => false,
+            };
+            if skip_small {
+                if debug { eprintln!("[VEC] Skip: loop limit < vector width ({})", vec_width); }
+            } else
 
             if use_sse2 {
                 if debug {
