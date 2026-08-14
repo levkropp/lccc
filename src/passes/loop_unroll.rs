@@ -1023,14 +1023,16 @@ mod tests {
             source_spans: Vec::new(),
         });
 
-        // B2: body — GEP + store
+        // B2: body — GEP + store. The GEP uses a constant offset (not the IV)
+        // so the loop stays eligible under the IV-widening guard, which only
+        // rejects GEPs that index directly by the narrow IV.
         func.blocks.push(BasicBlock {
             label: BlockId(2),
             instructions: vec![
                 Instruction::GetElementPtr {
                     dest: Value(4),
                     base: Value(10), // arr (loop-invariant, defined outside)
-                    offset: Operand::Value(Value(1)),
+                    offset: Operand::Const(IrConst::I32(0)),
                     ty: IrType::I32,
                 },
                 Instruction::Store {
@@ -1095,6 +1097,26 @@ mod tests {
                 !matches!(lhs, Operand::Value(v) if v.0 == 1),
                 "latch IV increment should use iv_7 (not original iv_phi Value(1))"
             );
+        }
+    }
+
+    #[test]
+    fn test_no_unroll_iv_indexed_gep() {
+        // A body that GEPs directly by the narrow (I32) IV must NOT be unrolled
+        // on 64-bit targets: the unroller's intermediate IV values stay narrow
+        // and would corrupt 64-bit pointer arithmetic after copy propagation.
+        let mut func = make_counting_loop(100);
+        for inst in &mut func.blocks[2].instructions {
+            if let Instruction::GetElementPtr { offset, .. } = inst {
+                *offset = Operand::Value(Value(1)); // index by the IV
+            }
+        }
+        let n = unroll_loops(&mut func);
+        if crate::common::types::target_is_32bit() {
+            assert_eq!(n, 1, "32-bit targets have no widening hazard");
+        } else {
+            assert_eq!(n, 0, "IV-indexed GEP loop should not be unrolled");
+            assert_eq!(func.blocks.len(), 5, "block count should be unchanged");
         }
     }
 

@@ -327,6 +327,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     for &reg in assignments.values() {
         used_regs_set.insert(reg.0);
     }
+    // Caller-saved registers allocated in Phase 2. These do NOT belong in
+    // used_regs_set (no prologue save), but Phase 2b must not reallocate them.
+    let mut phase2_caller_used: FxHashSet<u8> = FxHashSet::default();
 
     // Phase 2: caller-saved linear scan for unallocated non-call-spanning values.
     if !config.caller_saved_regs.is_empty() {
@@ -352,7 +355,13 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
 
             for (vid, reg) in caller_allocator.assignments {
                 assignments.insert(vid, reg);
-                used_regs_set.insert(reg.0);
+                // Do NOT add to used_regs_set: these are caller-saved
+                // registers holding values that never span a call. The ABI
+                // lets this function clobber their incoming contents freely,
+                // so a prologue push / epilogue pop would preserve nothing.
+                // Track them separately so Phase 2b doesn't reallocate a
+                // register that is already in use.
+                phase2_caller_used.insert(reg.0);
             }
         }
     }
@@ -500,6 +509,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         // Use all available caller-saved registers (not just r10/r11)
         let span_regs: Vec<PhysReg> = config.caller_saved_regs.iter()
             .filter(|r| !used_regs_set.contains(&r.0)) // exclude any already used as callee-saved
+            .filter(|r| !phase2_caller_used.contains(&r.0)) // exclude Phase 2 allocations
             .copied()
             .collect();
 

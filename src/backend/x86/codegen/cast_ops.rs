@@ -144,8 +144,145 @@ impl X86Codegen {
             }
         }
 
+        // Scalar FP casts: stage FP sources directly in XMM registers and keep
+        // FP results in the SSE domain instead of round-tripping through %rax.
+        if !is_i128_type(from_ty) && !is_i128_type(to_ty)
+            && from_ty != IrType::F128 && to_ty != IrType::F128
+            && (from_ty.is_float() || to_ty.is_float())
+        {
+            if self.try_emit_scalar_fp_cast(dest, src, from_ty, to_ty) {
+                return;
+            }
+        }
+
         // Fall through to default implementation for all other cases
         crate::backend::traits::emit_cast_default(self, dest, src, from_ty, to_ty);
+    }
+
+    /// Try to emit a scalar F64/F32 cast keeping FP values in XMM registers
+    /// end-to-end. Returns true if the cast was emitted, false to fall through.
+    /// Mirrors the instruction sequences of emit_generic_cast in f128.rs, but
+    /// takes FP inputs directly in %xmm0 and stores FP results via store_xmm_to.
+    fn try_emit_scalar_fp_cast(&mut self, dest: &Value, src: &Operand, from_ty: IrType, to_ty: IrType) -> bool {
+        use crate::backend::cast::{classify_cast, CastKind};
+        match classify_cast(from_ty, to_ty) {
+            CastKind::Noop if from_ty.is_float() && to_ty.is_float() => {
+                // Float-to-float copy (e.g. LongDouble-as-F64): just move it.
+                self.emit_fp_operand_to_xmm(src, from_ty, "xmm0");
+                self.store_xmm_to(dest, "xmm0", to_ty);
+                true
+            }
+            CastKind::FloatToFloat { widen } => {
+                self.emit_fp_operand_to_xmm(src, from_ty, "xmm0");
+                if widen {
+                    self.state.emit("    cvtss2sd %xmm0, %xmm0");
+                } else {
+                    self.state.emit("    cvtsd2ss %xmm0, %xmm0");
+                }
+                self.store_xmm_to(dest, "xmm0", to_ty);
+                true
+            }
+            CastKind::SignedToFloat { to_f64, from_ty: ft } => {
+                self.operand_to_rax(src);
+                // Sign-extend sub-64-bit sources to 64 bits (Noop for I64).
+                self.emit_cast_instrs_x86(ft, IrType::I64);
+                if to_f64 {
+                    self.state.emit("    cvtsi2sdq %rax, %xmm0");
+                } else {
+                    self.state.emit("    cvtsi2ssq %rax, %xmm0");
+                }
+                self.store_xmm_to(dest, "xmm0", to_ty);
+                true
+            }
+            CastKind::UnsignedToFloat { to_f64, from_ty: ft } => {
+                self.operand_to_rax(src);
+                if ft == IrType::U64 {
+                    // U64: handle values >= 2^63 via shift+round (mirrors
+                    // emit_u64_to_float, but the result stays in %xmm0).
+                    let big_label = self.state.fresh_label("u2f_big");
+                    let done_label = self.state.fresh_label("u2f_done");
+                    self.state.emit("    testq %rax, %rax");
+                    self.state.out.emit_jcc_label("    js", &big_label);
+                    if to_f64 {
+                        self.state.emit("    cvtsi2sdq %rax, %xmm0");
+                    } else {
+                        self.state.emit("    cvtsi2ssq %rax, %xmm0");
+                    }
+                    self.state.out.emit_jmp_label(&done_label);
+                    self.state.out.emit_named_label(&big_label);
+                    self.state.emit("    movq %rax, %rcx");
+                    self.state.emit("    shrq $1, %rax");
+                    self.state.emit("    andq $1, %rcx");
+                    self.state.emit("    orq %rcx, %rax");
+                    if to_f64 {
+                        self.state.emit("    cvtsi2sdq %rax, %xmm0");
+                        self.state.emit("    addsd %xmm0, %xmm0");
+                    } else {
+                        self.state.emit("    cvtsi2ssq %rax, %xmm0");
+                        self.state.emit("    addss %xmm0, %xmm0");
+                    }
+                    self.state.out.emit_named_label(&done_label);
+                    self.state.reg_cache.invalidate_sec(); // clobbered %rcx
+                    self.store_xmm_to(dest, "xmm0", to_ty);
+                } else {
+                    // U8/U16/U32: already zero-extended in %rax by the load.
+                    if to_f64 {
+                        self.state.emit("    cvtsi2sdq %rax, %xmm0");
+                    } else {
+                        self.state.emit("    cvtsi2ssq %rax, %xmm0");
+                    }
+                    self.store_xmm_to(dest, "xmm0", to_ty);
+                }
+                true
+            }
+            CastKind::FloatToSigned { from_f64 } => {
+                self.emit_fp_operand_to_xmm(src, from_ty, "xmm0");
+                if from_f64 {
+                    self.state.emit("    cvttsd2siq %xmm0, %rax");
+                } else {
+                    self.state.emit("    cvttss2siq %xmm0, %rax");
+                }
+                // Sign-extend to the target width (Noop for 64-bit targets).
+                self.emit_cast_instrs_x86(IrType::I64, to_ty);
+                self.state.reg_cache.invalidate_acc();
+                self.store_rax_to(dest);
+                true
+            }
+            CastKind::FloatToUnsigned { from_f64, to_u64 } => {
+                self.emit_fp_operand_to_xmm(src, from_ty, "xmm0");
+                if from_f64 && to_u64 {
+                    // F64 → U64: handle values >= 2^63 (mirrors
+                    // emit_float_to_unsigned, but the input is already in %xmm0).
+                    let big_label = self.state.fresh_label("f2u_big");
+                    let done_label = self.state.fresh_label("f2u_done");
+                    self.state.emit("    movabsq $4890909195324358656, %rcx");
+                    self.state.emit("    movq %rcx, %xmm1");
+                    self.state.emit("    ucomisd %xmm1, %xmm0");
+                    self.state.out.emit_jcc_label("    jae", &big_label);
+                    self.state.emit("    cvttsd2siq %xmm0, %rax");
+                    self.state.out.emit_jmp_label(&done_label);
+                    self.state.out.emit_named_label(&big_label);
+                    self.state.emit("    subsd %xmm1, %xmm0");
+                    self.state.emit("    cvttsd2siq %xmm0, %rax");
+                    self.state.emit("    movabsq $9223372036854775808, %rcx");
+                    self.state.emit("    addq %rcx, %rax");
+                    self.state.out.emit_named_label(&done_label);
+                    self.state.reg_cache.invalidate_sec(); // clobbered %rcx
+                } else if from_f64 {
+                    self.state.emit("    cvttsd2siq %xmm0, %rax");
+                } else {
+                    self.state.emit("    cvttss2siq %xmm0, %rax");
+                }
+                if !to_u64 {
+                    // Zero-extend/truncate to the target unsigned width.
+                    self.emit_cast_instrs_x86(IrType::I64, to_ty);
+                }
+                self.state.reg_cache.invalidate_acc();
+                self.store_rax_to(dest);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Try to emit an integer cast directly to the destination register.

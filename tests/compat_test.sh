@@ -4,7 +4,7 @@
 
 set -e
 GCC_INC="-I$(gcc -print-file-name=include)"
-LCCC="./target/release/lccc $GCC_INC -O2"
+LCCC="${LCCC_BIN:-./target/release/lccc} $GCC_INC -O2"
 GCC="gcc -O2"
 PASS=0
 FAIL=0

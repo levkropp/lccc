@@ -123,10 +123,8 @@ impl X86Codegen {
                     self.state.out.emit_instr_rbp_reg("    movsd", slot.0, "xmm1");
                 }
             }
-            Operand::Const(IrConst::F64(f)) => {
-                let bits = f.to_bits();
-                self.state.out.emit_instr_imm_reg("    movabsq", bits as i64, "rax");
-                self.state.emit("    movq %rax, %xmm1");
+            Operand::Const(IrConst::F64(_)) => {
+                self.emit_fp_operand_to_xmm(src, IrType::F64, "xmm1");
                 self.state.reg_cache.invalidate_all();
             }
             _ => {
@@ -150,10 +148,8 @@ impl X86Codegen {
                     self.state.out.emit_instr_rbp_reg("    movss", slot.0, "xmm1");
                 }
             }
-            Operand::Const(IrConst::F32(f)) => {
-                let bits = f.to_bits();
-                self.state.out.emit_instr_imm_reg("    movl", bits as i64, "eax");
-                self.state.emit("    movd %eax, %xmm1");
+            Operand::Const(IrConst::F32(_)) => {
+                self.emit_fp_operand_to_xmm(src, IrType::F32, "xmm1");
                 self.state.reg_cache.invalidate_all();
             }
             _ => {

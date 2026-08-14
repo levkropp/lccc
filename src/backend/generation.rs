@@ -1407,9 +1407,22 @@ fn generate_copy(cg: &mut dyn ArchCodegen, dest: &Value, src: &Operand) {
     // value (a loaded byte from the array instead of the array's address).
     if let Operand::Value(src_val) = src {
         if cg.state_ref().is_alloca(src_val.0) {
-            if let Some(slot) = cg.state_ref().get_slot(src_val.0) {
-                // Directly emit leaq to compute the alloca's stack address
-                cg.state().out.emit_instr_rbp_reg("    leaq", slot.0, "rax");
+            if let Some(addr) = cg.state_ref().resolve_slot_addr(src_val.0) {
+                // Materialize the address through architecture hooks.  This used
+                // to emit an x86 `leaq` directly from shared code, leaking x86
+                // assembly into ARM/RISC-V output whenever an array decayed via
+                // a Copy instruction.
+                match addr {
+                    crate::backend::state::SlotAddr::OverAligned(slot, id) => {
+                        cg.emit_alloca_aligned_addr_to_acc(slot, id);
+                    }
+                    crate::backend::state::SlotAddr::Direct(slot) => {
+                        cg.emit_gep_direct_const(slot, 0);
+                    }
+                    crate::backend::state::SlotAddr::Indirect(_) => {
+                        unreachable!("alloca address cannot use an indirect slot");
+                    }
+                }
                 cg.state().reg_cache.set_acc(src_val.0, true);
                 cg.emit_store_result(dest);
                 return;
@@ -1596,4 +1609,3 @@ pub use super::stack_layout::{
     calculate_stack_space_common,
     find_param_alloca,
 };
-

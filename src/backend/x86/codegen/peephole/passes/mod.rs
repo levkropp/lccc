@@ -64,9 +64,12 @@ pub fn peephole_optimize(asm: String) -> String {
     // remove live code in ways that interact across phases.
     // Enable with CCC_PEEPHOLE=1 for benchmarks where it helps.
     // Disable explicitly with CCC_NO_PEEPHOLE=1 (overrides CCC_PEEPHOLE).
+    // Unit tests always exercise the full pipeline regardless of these vars.
+    #[cfg(not(test))]
     if std::env::var("CCC_NO_PEEPHOLE").is_ok() {
         return asm;
     }
+    #[cfg(not(test))]
     if std::env::var("CCC_PEEPHOLE").is_err() {
         return asm; // Disabled by default
     }

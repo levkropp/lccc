@@ -41,3 +41,4 @@ bench_*
 # Misc
 .tmp
 .env
+.bench/

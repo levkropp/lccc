@@ -100,8 +100,9 @@ impl ArmCodegen {
             let dest_name = callee_saved_name(dest_phys);
             let dest_name_32 = callee_saved_name_32(dest_phys);
 
+            let is_shift = matches!(op, IrBinOp::Shl | IrBinOp::AShr | IrBinOp::LShr);
             let is_simple_alu = matches!(op, IrBinOp::Add | IrBinOp::Sub | IrBinOp::And
-                | IrBinOp::Or | IrBinOp::Xor | IrBinOp::Mul);
+                | IrBinOp::Or | IrBinOp::Xor | IrBinOp::Mul) || is_shift;
             if is_simple_alu {
                 let mnemonic = arm_alu_mnemonic(op);
 
@@ -116,6 +117,41 @@ impl ArmCodegen {
                         }
                         self.state.reg_cache.invalidate_acc();
                         return;
+                    }
+                }
+
+                if matches!(op, IrBinOp::And | IrBinOp::Or | IrBinOp::Xor) {
+                    let width = if use_32bit { 32 } else { 64 };
+                    if let Some(imm) = Self::const_as_logical_imm(rhs, width) {
+                        self.operand_to_callee_reg(lhs, dest_phys);
+                        if use_32bit {
+                            self.state.emit_fmt(format_args!("    {} {}, {}, #{:#x}", mnemonic, dest_name_32, dest_name_32, imm));
+                            if !is_unsigned { self.state.emit_fmt(format_args!("    sxtw {}, {}", dest_name, dest_name_32)); }
+                        } else {
+                            self.state.emit_fmt(format_args!("    {} {}, {}, #{:#x}", mnemonic, dest_name, dest_name, imm));
+                        }
+                        self.state.reg_cache.invalidate_acc();
+                        return;
+                    }
+                }
+
+                // AArch64 encodes a constant shift directly in the instruction.
+                // Keeping the value in its assigned register avoids several moves
+                // through x0/x1/x2 for the common C bit-manipulation idiom.
+                if is_shift {
+                    if let Some(imm) = Self::const_as_imm12(rhs) {
+                        let width = if use_32bit { 32 } else { 64 };
+                        if imm < width {
+                            self.operand_to_callee_reg(lhs, dest_phys);
+                            if use_32bit {
+                                self.state.emit_fmt(format_args!("    {} {}, {}, #{}", mnemonic, dest_name_32, dest_name_32, imm));
+                                if !is_unsigned { self.state.emit_fmt(format_args!("    sxtw {}, {}", dest_name, dest_name_32)); }
+                            } else {
+                                self.state.emit_fmt(format_args!("    {} {}, {}, #{}", mnemonic, dest_name, dest_name, imm));
+                            }
+                            self.state.reg_cache.invalidate_acc();
+                            return;
+                        }
                     }
                 }
 

@@ -259,8 +259,18 @@ impl X86Codegen {
                     float_count += 1;
                 }
                 CallArgClass::FloatReg { reg_idx } => {
-                    self.operand_to_rax(arg);
-                    self.state.out.emit_instr_reg_reg("    movq", "rax", xmm_regs[reg_idx]);
+                    match arg {
+                        Operand::Const(IrConst::F64(_)) => {
+                            self.emit_fp_operand_to_xmm(arg, IrType::F64, xmm_regs[reg_idx]);
+                        }
+                        Operand::Const(IrConst::F32(_)) => {
+                            self.emit_fp_operand_to_xmm(arg, IrType::F32, xmm_regs[reg_idx]);
+                        }
+                        _ => {
+                            self.operand_to_rax(arg);
+                            self.state.out.emit_instr_reg_reg("    movq", "rax", xmm_regs[reg_idx]);
+                        }
+                    }
                     float_count += 1;
                 }
                 CallArgClass::IntReg { reg_idx } => {
@@ -400,8 +410,7 @@ impl X86Codegen {
                 self.store_rax_rdx_to(dest);
             }
         } else if return_type == IrType::F32 {
-            self.state.emit("    movd %xmm0, %eax");
-            self.store_rax_to(dest);
+            self.store_xmm_to(dest, "xmm0", IrType::F32);
         } else if return_type == IrType::F128 {
             if let Some(slot) = self.state.get_slot(dest.0) {
                 self.state.out.emit_instr_rbp("    fstpt", slot.0);
@@ -418,8 +427,7 @@ impl X86Codegen {
                 self.store_rax_to(dest);
             }
         } else if return_type == IrType::F64 {
-            self.state.emit("    movq %xmm0, %rax");
-            self.store_rax_to(dest);
+            self.store_xmm_to(dest, "xmm0", IrType::F64);
         } else {
             self.store_rax_to(dest);
         }

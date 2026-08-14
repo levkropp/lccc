@@ -37,69 +37,15 @@ impl X86Codegen {
         }
         let mnemonic = self.emit_float_binop_mnemonic_impl(op);
         let suffix = if ty == IrType::F64 { "sd" } else { "ss" };
-        let (mov_rax_to_xmm0, mov_xmm0_to_rax) = if ty == IrType::F32 {
-            ("movd %eax, %xmm0", "movd %xmm0, %eax")
-        } else {
-            ("movq %rax, %xmm0", "movq %xmm0, %rax")
-        };
 
-        // Load LHS to %xmm0 — use constant pool for FP constants
-        match lhs {
-            Operand::Const(IrConst::F64(v)) => {
-                let bits = v.to_bits();
-                if bits == 0 {
-                    self.state.emit("    xorpd %xmm0, %xmm0");
-                } else {
-                    let label = self.state.get_fp_const_label(bits);
-                    self.state.emit_fmt(format_args!("    movsd {}(%rip), %xmm0", label));
-                }
-            }
-            Operand::Const(IrConst::F32(v)) => {
-                let bits = v.to_bits() as u64;
-                if bits == 0 {
-                    self.state.emit("    xorps %xmm0, %xmm0");
-                } else {
-                    let label = self.state.get_fp_const_label(bits);
-                    self.state.emit_fmt(format_args!("    movss {}(%rip), %xmm0", label));
-                }
-            }
-            _ => {
-                self.operand_to_rax(lhs);
-                self.state.emit_fmt(format_args!("    {}", mov_rax_to_xmm0));
-            }
-        }
-
-        // Load RHS to %xmm1 — use constant pool for FP constants
-        match rhs {
-            Operand::Const(IrConst::F64(v)) => {
-                let bits = v.to_bits();
-                if bits == 0 {
-                    self.state.emit("    xorpd %xmm1, %xmm1");
-                } else {
-                    let label = self.state.get_fp_const_label(bits);
-                    self.state.emit_fmt(format_args!("    movsd {}(%rip), %xmm1", label));
-                }
-            }
-            Operand::Const(IrConst::F32(v)) => {
-                let bits = v.to_bits() as u64;
-                if bits == 0 {
-                    self.state.emit("    xorps %xmm1, %xmm1");
-                } else {
-                    let label = self.state.get_fp_const_label(bits);
-                    self.state.emit_fmt(format_args!("    movss {}(%rip), %xmm1", label));
-                }
-            }
-            _ => {
-                self.operand_to_rcx(rhs);
-                let mov_rcx_to_xmm1 = if ty == IrType::F32 { "movd %ecx, %xmm1" } else { "movq %rcx, %xmm1" };
-                self.state.emit_fmt(format_args!("    {}", mov_rcx_to_xmm1));
-            }
-        }
+        // Load LHS → %xmm0 and RHS → %xmm1, keeping FP values in the SSE
+        // domain (constant pool for literals, movsd/movss for XMM-allocated
+        // values and stack slots; GPR round-trip only as a fallback).
+        self.emit_fp_operand_to_xmm(lhs, ty, "xmm0");
+        self.emit_fp_operand_to_xmm(rhs, ty, "xmm1");
 
         self.state.emit_fmt(format_args!("    {}{} %xmm1, %xmm0", mnemonic, suffix));
-        self.state.emit_fmt(format_args!("    {}", mov_xmm0_to_rax));
-        self.state.reg_cache.invalidate_acc();
-        self.store_rax_to(dest);
+        self.store_xmm_to(dest, "xmm0", ty);
     }
 
     pub(super) fn emit_float_binop_impl_impl(&mut self, _mnemonic: &str, _ty: IrType) {
@@ -196,7 +142,9 @@ impl X86Codegen {
     }
 
     /// Load an FP operand directly into an XMM register, using the constant pool
-    /// for FP literal constants instead of going through a GPR.
+    /// for FP literal constants instead of going through a GPR. Value operands
+    /// allocated to an XMM register or a stack slot are loaded directly with
+    /// `movsd`/`movss`; the GPR path is only a last-resort fallback.
     pub(super) fn emit_fp_operand_to_xmm(&mut self, op: &Operand, ty: IrType, xmm: &str) {
         match op {
             Operand::Const(IrConst::F64(v)) => {
@@ -218,6 +166,39 @@ impl X86Codegen {
                 }
             }
             _ => {
+                // Value operand: keep FP values in the SSE domain.
+                if let Operand::Value(v) = op {
+                    if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                        let reg_name = phys_reg_name(reg);
+                        if is_xmm_reg(reg) {
+                            // XMM → XMM: movapd copies all 128 bits. The
+                            // register-register movsd form would preserve the
+                            // destination's upper 64 bits, creating a false
+                            // dependency on the old destination value that
+                            // serializes against in-flight divsd/sqrtsd chains
+                            // (measured ~2.4x slowdown on nbody under Rosetta).
+                            if reg_name != xmm {
+                                self.state.emit_fmt(format_args!("    movapd %{}, %{}", reg_name, xmm));
+                            }
+                            return;
+                        }
+                        // GPR → XMM (bit-reinterpreted value)
+                        if ty == IrType::F32 {
+                            self.state.emit_fmt(format_args!("    movd %{}, %{}", phys_reg_name_32(reg), xmm));
+                        } else {
+                            self.state.emit_fmt(format_args!("    movq %{}, %{}", reg_name, xmm));
+                        }
+                        return;
+                    }
+                    if !self.state.is_alloca(v.0) && !self.state.vector_values.contains(&v.0) {
+                        if let Some(slot) = self.state.get_slot(v.0) {
+                            // Stack slot → XMM: direct load, no GPR round-trip.
+                            let instr = if ty == IrType::F32 { "    movss" } else { "    movsd" };
+                            self.state.out.emit_instr_rbp_reg(instr, slot.0, xmm);
+                            return;
+                        }
+                    }
+                }
                 // Fall back to GPR → XMM path
                 let gpr = if xmm == "xmm0" { "rax" } else { "rcx" };
                 let gpr32 = if xmm == "xmm0" { "eax" } else { "ecx" };
@@ -233,5 +214,20 @@ impl X86Codegen {
                 }
             }
         }
+    }
+
+    /// Stage an FP store value in an XMM register: returns the value's own
+    /// XMM register when it has one, otherwise loads it into %xmm0 and
+    /// returns "xmm0". Never clobbers %rcx (safe after address setup).
+    pub(super) fn fp_store_value_xmm(&mut self, val: &Operand, ty: IrType) -> &'static str {
+        if let Operand::Value(v) = val {
+            if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                if is_xmm_reg(reg) {
+                    return phys_reg_name(reg);
+                }
+            }
+        }
+        self.emit_fp_operand_to_xmm(val, ty, "xmm0");
+        "xmm0"
     }
 }

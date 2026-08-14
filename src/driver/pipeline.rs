@@ -1186,6 +1186,20 @@ impl Driver {
                           func.blocks.iter().map(|b| b.label.0).collect::<Vec<_>>());
             }
         }
+        // TEMP: full IR dump
+        if std::env::var("LCCC_DUMP_IR").is_ok() {
+            for func in &module.functions {
+                if func.is_declaration { continue; }
+                eprintln!("=== IR {} ===", func.name);
+                for (bi, b) in func.blocks.iter().enumerate() {
+                    eprintln!("  block {} (label {}):", bi, b.label.0);
+                    for inst in &b.instructions {
+                        eprintln!("    {:?}", inst);
+                    }
+                    eprintln!("    term: {:?}", b.terminator);
+                }
+            }
+        }
 
         // Note: we intentionally do NOT run copy_prop after phi elimination.
         // The IR is no longer in SSA form at this point - Copy instructions from

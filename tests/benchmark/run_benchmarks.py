@@ -25,7 +25,7 @@ from statistics import mean, stdev
 HERE = Path(__file__).parent.resolve()
 PROGRAMS = HERE / "programs"
 REPO_ROOT = HERE.parent.parent
-LCCC = REPO_ROOT / "target" / "release" / "lccc"
+LCCC = Path(os.environ.get("LCCC_BIN", REPO_ROOT / "target" / "release" / "lccc"))
 GCC_INC = subprocess.check_output(
     ["gcc", "-print-file-name=include"], text=True
 ).strip()
@@ -105,7 +105,10 @@ def get_text_size(binary_path):
 
 def compile_one(compiler_name, src, out, extra_flags):
     exe, flags = COMPILERS[compiler_name]
-    cmd = [exe] + flags + extra_flags + ["-o", str(out), str(src)]
+    # Keep libraries after the translation unit.  GNU ld resolves archives
+    # left-to-right, so placing -lm before the source leaves symbols such as
+    # sqrt unresolved with GCC.
+    cmd = [exe] + flags + ["-o", str(out), str(src)] + extra_flags
     t0 = time.perf_counter()
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     t1 = time.perf_counter()

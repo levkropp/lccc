@@ -93,6 +93,9 @@ pub(super) fn arm_alu_mnemonic(op: IrBinOp) -> &'static str {
         IrBinOp::Or => "orr",
         IrBinOp::Xor => "eor",
         IrBinOp::Mul => "mul",
+        IrBinOp::Shl => "lsl",
+        IrBinOp::AShr => "asr",
+        IrBinOp::LShr => "lsr",
         _ => unreachable!("unsupported ALU op for arm_alu_mnemonic: {:?}", op),
     }
 }
@@ -272,6 +275,53 @@ impl ArmCodegen {
             }
             _ => None,
         }
+    }
+
+    /// Extract an integer constant and check whether it is encodable as an
+    /// AArch64 logical immediate for the requested register width.
+    pub(super) fn const_as_logical_imm(op: &Operand, width: u32) -> Option<u64> {
+        let raw = match op {
+            Operand::Const(IrConst::I8(v)) => *v as u8 as u64,
+            Operand::Const(IrConst::I16(v)) => *v as u16 as u64,
+            Operand::Const(IrConst::I32(v)) => *v as u32 as u64,
+            Operand::Const(IrConst::I64(v)) => *v as u64,
+            Operand::Const(IrConst::Zero) => 0,
+            _ => return None,
+        };
+        let value = if width == 32 { raw & u32::MAX as u64 } else { raw };
+        if value == 0 || value == if width == 32 { u32::MAX as u64 } else { u64::MAX } {
+            return None;
+        }
+
+        // Logical immediates are a rotated run of ones in a power-of-two-sized
+        // element, replicated to fill the register.
+        for element_width in [2u32, 4, 8, 16, 32, 64] {
+            if element_width > width { break; }
+            let element_mask = if element_width == 64 { u64::MAX } else { (1u64 << element_width) - 1 };
+            let element = value & element_mask;
+            let mut replicated = 0u64;
+            let mut bit = 0;
+            while bit < width {
+                replicated |= element << bit;
+                bit += element_width;
+            }
+            let register_mask = if width == 32 { u32::MAX as u64 } else { u64::MAX };
+            if replicated != value || element == 0 || element == element_mask { continue; }
+            for ones in 1..element_width {
+                let run = (1u64 << ones) - 1;
+                for rotation in 0..element_width {
+                    let rotated = if rotation == 0 {
+                        run
+                    } else {
+                        ((run >> rotation) | (run << (element_width - rotation))) & element_mask
+                    };
+                    if rotated == element {
+                        return Some(value & register_mask);
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// If `op` is a constant that is a power of two, return its log2 (shift amount).
@@ -1828,6 +1878,9 @@ impl ArchCodegen for ArmCodegen {
     fn emit_add_secondary_to_acc(&mut self) { self.state.emit("    add x0, x1, x0"); }
     fn emit_gep_add_const_to_acc(&mut self, offset: i64) { if offset != 0 { self.emit_add_imm_to_acc_impl(offset); } }
     fn emit_acc_to_secondary(&mut self) { self.state.emit("    mov x1, x0"); }
+    fn emit_reg_to_acc(&mut self, reg: PhysReg) {
+        self.state.emit_fmt(format_args!("    mov x0, {}", callee_saved_name(reg)));
+    }
     fn emit_memcpy_store_dest_from_acc(&mut self) { }
     fn emit_memcpy_store_src_from_acc(&mut self) { self.state.emit("    mov x10, x9"); }
     fn emit_call_spill_fptr(&mut self, func_ptr: &Operand) {
@@ -1996,4 +2049,3 @@ impl Default for ArmCodegen {
         Self::new()
     }
 }
-

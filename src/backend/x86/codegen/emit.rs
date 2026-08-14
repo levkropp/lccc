@@ -736,6 +736,51 @@ impl X86Codegen {
         self.state.reg_cache.set_acc(dest.0, false);
     }
 
+    /// Store an XMM register holding a scalar F64/F32 value to a value's
+    /// location, keeping the value in the SSE domain: `movsd`/`movss` for
+    /// XMM-allocated destinations and stack slots, `movq`/`movd` for
+    /// GPR-allocated destinations. Falls back to a move through %rax only
+    /// when the destination has neither a register nor a slot (e.g.
+    /// immediately-consumed values that must live in the accumulator).
+    ///
+    /// The direct paths do not touch %rax, so the accumulator cache is left
+    /// untouched (matching the register-direct load/store paths); only the
+    /// %rax fallback invalidates it (via store_rax_to).
+    pub(super) fn store_xmm_to(&mut self, dest: &Value, src_xmm: &str, ty: IrType) {
+        if let Some(&reg) = self.reg_assignments.get(&dest.0) {
+            let reg_name = phys_reg_name(reg);
+            if is_xmm_reg(reg) {
+                if reg_name != src_xmm {
+                    // movapd (not movsd/movss): the reg-reg scalar forms
+                    // preserve the destination's upper bits, creating a false
+                    // dependency on its old value. movapd copies all 128 bits
+                    // (dead above bit 63 for scalars) with no false dependency.
+                    self.state.emit_fmt(format_args!("    movapd %{}, %{}", src_xmm, reg_name));
+                }
+            } else if ty == IrType::F32 {
+                self.state.emit_fmt(format_args!("    movd %{}, %{}", src_xmm, phys_reg_name_32(reg)));
+            } else {
+                self.state.emit_fmt(format_args!("    movq %{}, %{}", src_xmm, reg_name));
+            }
+            return;
+        }
+        if !self.state.is_alloca(dest.0) && !self.state.vector_values.contains(&dest.0) {
+            if let Some(slot) = self.state.get_slot(dest.0) {
+                let instr = if ty == IrType::F32 { "    movss" } else { "    movsd" };
+                self.state.out.emit_instr_reg_rbp(instr, src_xmm, slot.0);
+                return;
+            }
+        }
+        // Fallback: route through %rax like store_rax_to does.
+        if ty == IrType::F32 {
+            self.state.emit_fmt(format_args!("    movd %{}, %eax", src_xmm));
+        } else {
+            self.state.emit_fmt(format_args!("    movq %{}, %rax", src_xmm));
+        }
+        self.state.reg_cache.invalidate_acc();
+        self.store_rax_to(dest);
+    }
+
     /// Store %eax (32-bit) to a value's location using movl instead of movq.
     /// Breaks false dependencies on upper 32 bits and halves memory bandwidth
     /// for stack spills. Only safe when all subsequent loads of this value also
@@ -2245,17 +2290,49 @@ impl ArchCodegen for X86Codegen {
                 if d.0 != s.0 {
                     let d_name = phys_reg_name(d);
                     let s_name = phys_reg_name(s);
-                    self.state.out.emit_instr_reg_reg("    movq", s_name, d_name);
+                    if is_xmm_reg(d) && is_xmm_reg(s) {
+                        // XMM → XMM copy: movapd moves all 128 bits (upper 64
+                        // are dead for scalar F64/F32) without the reg-reg
+                        // movsd merge form's false dependency on the old
+                        // destination value.
+                        self.state.emit_fmt(format_args!("    movapd %{}, %{}", s_name, d_name));
+                    } else {
+                        self.state.out.emit_instr_reg_reg("    movq", s_name, d_name);
+                    }
                 }
                 self.state.reg_cache.invalidate_acc();
             }
             (Some(d), None) => {
+                if is_xmm_reg(d) {
+                    let d_name = phys_reg_name(d);
+                    let ty = match src {
+                        Operand::Const(IrConst::F32(_)) => IrType::F32,
+                        _ => IrType::F64,
+                    };
+                    self.emit_fp_operand_to_xmm(src, ty, d_name);
+                    self.state.reg_cache.invalidate_acc();
+                    return;
+                }
                 self.operand_to_rax(src);
                 let d_name = phys_reg_name(d);
                 self.state.out.emit_instr_reg_reg("    movq", "rax", d_name);
                 self.state.reg_cache.invalidate_acc();
             }
             _ => {
+                // XMM source → stack-slot dest: movsd directly, no GPR relay.
+                // Only F64 values are XMM-allocated and all slots are 8 bytes,
+                // so movsd is type-safe here. %rax is untouched, so the
+                // accumulator cache stays valid.
+                if let Operand::Value(v) = src {
+                    if let Some(s) = src_phys {
+                        if is_xmm_reg(s) && !self.state.is_alloca(dest.0) && !self.state.vector_values.contains(&dest.0) {
+                            if let Some(slot) = self.state.get_slot(dest.0) {
+                                self.state.out.emit_instr_reg_rbp("    movsd", phys_reg_name(s), slot.0);
+                                return;
+                            }
+                        }
+                    }
+                }
                 self.operand_to_rax(src);
                 self.store_rax_to(dest);
             }

@@ -112,7 +112,10 @@ impl ArmCodegen {
     }
 
     pub(super) fn emit_typed_store_indirect_impl(&mut self, instr: &'static str, ty: IrType) {
-        let reg = Self::reg_for_type("x1", ty);
+        // emit_store_default loads the pointer into x9 first and the value into
+        // the accumulator (x0) second.  Using x1 here stores an unrelated value
+        // for globals, heap fields, and all other indirect destinations.
+        let reg = Self::reg_for_type("x0", ty);
         self.state.emit_fmt(format_args!("    {} {}, [x9]", instr, reg));
     }
 
@@ -237,6 +240,40 @@ impl ArmCodegen {
     }
 
     pub(super) fn emit_memcpy_impl_impl(&mut self, size: usize) {
+        // Struct assignments are overwhelmingly small fixed-size copies.  A
+        // byte-at-a-time runtime loop is especially costly when the copy sits
+        // in a hot loop, so use AArch64 pair transfers for sizes that can be
+        // unrolled without excessive code growth.  x9 is the destination and
+        // x10 the source; x12/x13 are reserved codegen scratch registers.
+        if size <= 256 {
+            let mut offset = 0usize;
+            while offset + 16 <= size {
+                self.state.emit_fmt(format_args!("    ldp x12, x13, [x10, #{}]", offset));
+                self.state.emit_fmt(format_args!("    stp x12, x13, [x9, #{}]", offset));
+                offset += 16;
+            }
+            if offset + 8 <= size {
+                self.state.emit_fmt(format_args!("    ldr x12, [x10, #{}]", offset));
+                self.state.emit_fmt(format_args!("    str x12, [x9, #{}]", offset));
+                offset += 8;
+            }
+            if offset + 4 <= size {
+                self.state.emit_fmt(format_args!("    ldr w12, [x10, #{}]", offset));
+                self.state.emit_fmt(format_args!("    str w12, [x9, #{}]", offset));
+                offset += 4;
+            }
+            if offset + 2 <= size {
+                self.state.emit_fmt(format_args!("    ldrh w12, [x10, #{}]", offset));
+                self.state.emit_fmt(format_args!("    strh w12, [x9, #{}]", offset));
+                offset += 2;
+            }
+            if offset < size {
+                self.state.emit_fmt(format_args!("    ldrb w12, [x10, #{}]", offset));
+                self.state.emit_fmt(format_args!("    strb w12, [x9, #{}]", offset));
+            }
+            return;
+        }
+
         let label_id = self.state.next_label_id();
         let loop_label = format!(".Lmemcpy_loop_{}", label_id);
         let done_label = format!(".Lmemcpy_done_{}", label_id);

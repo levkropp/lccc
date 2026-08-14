@@ -33,6 +33,9 @@ GCC_INC = find_gcc_include()
 
 # Find LCCC binary
 def find_lccc():
+    env = os.environ.get("LCCC_BIN")
+    if env and os.path.isfile(env):
+        return env
     candidates = [
         os.path.join(os.path.dirname(__file__), "../../target/release/lccc"),
         "lccc",

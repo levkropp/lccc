@@ -245,11 +245,13 @@ impl X86Codegen {
 
         if omit_fp {
             // Frame-pointer-less prologue.
-            // Use compact push/pop encoding for ALL saved registers (both callee
-            // and caller-saved from Phase 2/2b). pushq is 1-2 bytes vs movq's
-            // 7-8 bytes. The Phase 2b spill slots (for selective save/restore
-            // at call sites) are in the subq area, not the push area, so they
-            // don't interfere.
+            // Use compact push/pop encoding for all saved registers (only
+            // callee-saved registers appear here; Phase 2 caller-saved
+            // allocations need no prologue save, and Phase 2b caller-saved
+            // spans are saved selectively at call sites). pushq is 1-2 bytes
+            // vs movq's 7-8 bytes. The Phase 2b spill slots (for selective
+            // save/restore at call sites) are in the subq area, not the push
+            // area, so they don't interfere.
             let n_saves = used_regs.len() as i64;
             let use_push_pop = n_saves > 0;
 

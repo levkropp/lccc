@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).parent.parent.parent
-LCCC = REPO_ROOT / "target" / "release" / "lccc"
+LCCC = Path(os.environ.get("LCCC_BIN", REPO_ROOT / "target" / "release" / "lccc"))
 GCC_INC = subprocess.check_output(
     ["gcc", "-print-file-name=include"], text=True
 ).strip()
@@ -270,6 +270,11 @@ int main(void) {
     printf("%s\n", "foo" "bar" "baz");
     // Escape sequences
     printf("%d %d %d\n", '\n', '\t', '\0');
+    const int *w1 = L"wide";
+    const int *w2 = L"wide";
+    const unsigned short *u1 = u"utf16";
+    const unsigned short *u2 = u"utf16";
+    printf("wide_eq=%d utf16_eq=%d\n", w1 == w2, u1 == u2);
     return 0;
 }
 ''', [], None),

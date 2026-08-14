@@ -10,6 +10,7 @@
 //! optimizer and catch issues early.
 
 pub(crate) mod cfg_simplify;
+pub(crate) mod bit_idioms;
 pub(crate) mod constant_fold;
 pub(crate) mod copy_prop;
 pub(crate) mod dce;
@@ -224,6 +225,21 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str) {
     }
     inline::run(module);
 
+    // TEMP debug: dump IR right after inlining.
+    if std::env::var("LCCC_DUMP_IR_INLINE").is_ok() {
+        for func in &module.functions {
+            if func.is_declaration { continue; }
+            eprintln!("=== IR(post-inline) {} ===", func.name);
+            for (bi, b) in func.blocks.iter().enumerate() {
+                eprintln!("  block {} (label {}):", bi, b.label.0);
+                for inst in &b.instructions {
+                    eprintln!("    {:?}", inst);
+                }
+                eprintln!("    term: {:?}", b.terminator);
+            }
+        }
+    }
+
     // After inlining, convert extern inline gnu_inline functions to declarations.
     // These function bodies were only needed for inlining; they must not be emitted
     // as standalone definitions because their internal calls (e.g., `call btowc`)
@@ -411,10 +427,16 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
             total_changes_excl_dce += n;
         }
 
-        // Phase 2b-vec: SSE2 vectorization — iter 0 only, EARLY in pipeline.
+        // Phase 2b-vec: x86-64 vectorization — iter 0 only, EARLY in pipeline.
         // Run before GVN/LICM/etc to catch IR in simpler state.
+        // The vectorizer currently emits Vec* intrinsics backed by XMM/YMM
+        // registers. Other backends deliberately reject those intrinsics, so
+        // running this pass for them turns ordinary scalar loops into a compiler
+        // panic instead of preserving the valid scalar program.
         // Pass name for CCC_DISABLE_PASSES: "vectorize"
-        if iter == 0 && !disabled.contains("vectorize") {
+        if iter == 0 && target == crate::backend::Target::X86_64
+            && !disabled.contains("vectorize")
+        {
             let n = timed_pass!("vectorize",
                 run_on_visited(module, &dirty, &mut changed, vectorize::vectorize_function));
             total_changes += n;
@@ -435,6 +457,11 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
         if !dis.simplify && should_run!(3, 1, 2) {
             let n = timed_pass!("simplify", run_on_visited(module, &dirty, &mut changed, simplify::simplify_function));
             cur_pass_changes[3] = n;
+            total_changes += n;
+            total_changes_excl_dce += n;
+
+            let n = timed_pass!("bit_idioms", run_on_visited(module, &dirty, &mut changed, bit_idioms::recognize_function));
+            cur_pass_changes[3] += n;
             total_changes += n;
             total_changes_excl_dce += n;
         }
