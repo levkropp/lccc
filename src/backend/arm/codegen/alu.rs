@@ -49,6 +49,16 @@ impl ArmCodegen {
                 if use_32bit { callee_saved_name_32(reg).to_string() }
                 else { callee_saved_name(reg).to_string() }
             } else {
+                // Not register-assigned: load stack-homed values directly into
+                // the scratch register, avoiding the ldr-into-x0 + mov detour.
+                if let Operand::Value(v) = op {
+                    if !this.state.is_alloca(v.0) {
+                        if let Some(slot) = this.state.get_slot(v.0) {
+                            this.emit_load_from_sp(scratch, slot.0, "ldr");
+                            return scratch.to_string();
+                        }
+                    }
+                }
                 this.operand_to_x0(op);
                 let acc_name = if use_32bit { "w0" } else { "x0" };
                 this.state.emit_fmt(format_args!("    mov {}, {}", scratch, acc_name));
