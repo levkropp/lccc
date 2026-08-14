@@ -646,6 +646,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         .get(&iv.value_id)
                         .is_some_and(|&o| o.0 == d.0 && iv.start < src_iv.end && src_iv.start < iv.end)
                 });
+                if std::env::var("CCC_DEBUG_FPCOAL").is_ok() {
+                    eprintln!("[FPCOAL] phi={} (d{}) src={} (d{}) conflict={}", phi_dest, d.0, backedge_src, s.0, conflict);
+                }
                 if !conflict {
                     assignments.insert(backedge_src, d);
                 }
