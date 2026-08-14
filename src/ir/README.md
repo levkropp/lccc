@@ -397,7 +397,7 @@ Methods:
   operations (UDiv, URem, LShr) reinterpret the bits as `u64`.
 - `eval_i128(lhs, rhs) -> Option<i128>` -- same for `i128` operands.
 
-### IrUnaryOp (7 variants)
+### IrUnaryOp (8 variants)
 
 | Variant | Description |
 |---------|-------------|
@@ -406,6 +406,7 @@ Methods:
 | `Clz` | Count leading zeros |
 | `Ctz` | Count trailing zeros |
 | `Bswap` | Byte swap |
+| `BitReverse` | Reverse all bits in an integer |
 | `Popcount` | Population count (number of set bits) |
 | `IsConstant` | `__builtin_constant_p`: returns 1 if operand is a compile-time constant, 0 otherwise. Lowered as an IR instruction so it can be resolved after inlining and constant propagation. |
 

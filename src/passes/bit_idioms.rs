@@ -194,7 +194,28 @@ fn match_bswap32_network(result: Operand, defs: &[Option<Instruction>]) -> Optio
     match_halves(a, b).or_else(|| match_halves(b, a))
 }
 
-pub(crate) fn recognize_function(func: &mut IrFunction) -> usize {
+fn match_masked_swap_stage(result: Operand, amount: u64, mask: u64, defs: &[Option<Instruction>]) -> Option<Operand> {
+    let (a, b, ty) = binop(result, IrBinOp::Or, defs)?;
+    if ty != IrType::U32 && ty != IrType::I32 { return None; }
+    let match_halves = |right: Operand, left: Operand| -> Option<Operand> {
+        let shifted = commutative_const(right, IrBinOp::And, mask, defs)?;
+        let original = shift(shifted, IrBinOp::LShr, amount, defs)?;
+        let masked = shift(left, IrBinOp::Shl, amount, defs)?;
+        let left_original = commutative_const(masked, IrBinOp::And, mask, defs)?;
+        same(original, left_original, defs).then_some(peel(original, defs))
+    };
+    match_halves(a, b).or_else(|| match_halves(b, a))
+}
+
+fn match_bit_reverse32(result: Operand, defs: &[Option<Instruction>]) -> Option<Operand> {
+    let mut value = match_bswap32_network(result, defs)?;
+    for (amount, mask) in [(4, 0x0f0f_0f0f), (2, 0x3333_3333), (1, 0x5555_5555)] {
+        value = match_masked_swap_stage(value, amount, mask, defs)?;
+    }
+    Some(peel(value, defs))
+}
+
+pub(crate) fn recognize_function(func: &mut IrFunction, enable_bit_reverse: bool) -> usize {
     let mut defs = vec![None; func.max_value_id() as usize + 1];
     for block in &func.blocks {
         for inst in &block.instructions {
@@ -219,6 +240,13 @@ pub(crate) fn recognize_function(func: &mut IrFunction) -> usize {
                 Instruction::BinOp { dest, op: IrBinOp::Or, ty, .. }
                     if *ty == IrType::U32 || *ty == IrType::I32 => {
                     let result = Operand::Value(*dest);
+                    if enable_bit_reverse {
+                        if let Some(src) = match_bit_reverse32(result, &defs) {
+                            *inst = Instruction::UnaryOp { dest: *dest, op: IrUnaryOp::BitReverse, src, ty: IrType::U32 };
+                            changes += 1;
+                            continue;
+                        }
+                    }
                     if let Some(src) = match_bswap32_network(result, &defs) {
                         *inst = Instruction::UnaryOp { dest: *dest, op: IrUnaryOp::Bswap, src, ty: IrType::U32 };
                         changes += 1;

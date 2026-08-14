@@ -34,6 +34,20 @@ pub fn run_regalloc_and_merge_clobbers(
     let xmm_regs = if available_regs.iter().any(|r| r.0 == 1) {
         // x86-64: xmm2-xmm7 available for F64 values
         vec![PhysReg(20), PhysReg(21), PhysReg(22), PhysReg(23), PhysReg(24), PhysReg(25)]
+    } else if available_regs.iter().any(|r| r.0 == 28) {
+        // AArch64: v16-v23 are caller-saved SIMD/FP registers.  Keep their
+        // allocator IDs disjoint from x0-x30; the ARM emitter maps 40..47 to
+        // d16..d23.  The generic FP allocator only assigns values that do not
+        // span calls, so no save/restore sequence is required.
+        //
+        // When the function has no loop-promoted F64 values, the dedicated
+        // d24..d31 promotion pool (allocator IDs 48..55) is unused, so open it
+        // up to the general scan — FP-heavy loops easily keep 8+ values live.
+        if func.loop_promoted_f64_values.is_empty() {
+            (40..=55).map(PhysReg).collect()
+        } else {
+            (40..=47).map(PhysReg).collect()
+        }
     } else {
         Vec::new()
     };

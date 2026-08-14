@@ -818,6 +818,7 @@ fn build_outlined_function(
         param_alloca_values: Vec::new(),
         uses_sret: false,
         is_gnu_inline_def: false,
+        loop_promoted_f64_values: Vec::new(),
         global_init_label_blocks: Vec::new(),
         ret_eightbyte_classes: Vec::new(),
     }

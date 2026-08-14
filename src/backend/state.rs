@@ -424,6 +424,8 @@ impl CodegenState {
         self.f128_direct_slots.clear();
         self.f128_load_sources.clear();
         self.small_slot_values.clear();
+        self.vector_values.clear();
+        self.protected_slot_values.clear();
         self.reg_assigned_values.clear();
         self.asm_output_values.clear();
         self.param_pre_stored.clear();

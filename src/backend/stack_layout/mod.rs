@@ -171,6 +171,9 @@ pub fn calculate_stack_space_common(
                     IntrinsicOp::VecAddF64x4 | IntrinsicOp::VecAddF64x2 |
                     IntrinsicOp::VecAddI32x8 | IntrinsicOp::VecAddI32x4 |
                     IntrinsicOp::VecMulF64x4 | IntrinsicOp::VecMulF64x2
+                    | IntrinsicOp::VecLoadWidenI32ToI64x2
+                    | IntrinsicOp::VecAddI64x2 | IntrinsicOp::VecMulI64x2
+                    | IntrinsicOp::VecZeroI64x2
                 );
                 if is_vector {
                     state.vector_values.insert(d.0);

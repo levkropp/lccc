@@ -3,7 +3,7 @@
 use crate::ir::reexports::{Operand, Value};
 use crate::common::types::IrType;
 use crate::backend::state::{StackSlot, SlotAddr};
-use super::emit::{ArmCodegen, callee_saved_name};
+use super::emit::{ArmCodegen, arm_fp_name, callee_saved_name, is_arm_fp_phys};
 
 impl ArmCodegen {
     // ---- Store/Load overrides ----
@@ -13,6 +13,29 @@ impl ArmCodegen {
             crate::backend::f128_softfloat::f128_emit_store(self, val, ptr);
             return;
         }
+        if matches!(ty, IrType::F32 | IrType::F64) {
+            if let Operand::Value(v) = val {
+                if let Some(&phys) = self.reg_assignments.get(&v.0) {
+                    if is_arm_fp_phys(phys) {
+                        let fp = arm_fp_name(phys, ty);
+                        if let Some(addr) = self.state.resolve_slot_addr(ptr.0) {
+                            match addr {
+                                SlotAddr::OverAligned(slot, id) => {
+                                    self.emit_alloca_aligned_addr_impl(slot, id);
+                                    self.state.emit_fmt(format_args!("    str {}, [x9]", fp));
+                                }
+                                SlotAddr::Direct(slot) => self.emit_store_to_sp(&fp, slot.0, "str"),
+                                SlotAddr::Indirect(slot) => {
+                                    self.emit_load_ptr_from_slot_impl(slot, ptr.0);
+                                    self.state.emit_fmt(format_args!("    str {}, [x9]", fp));
+                                }
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+        }
         crate::backend::traits::emit_store_default(self, val, ptr, ty);
     }
 
@@ -21,6 +44,27 @@ impl ArmCodegen {
             crate::backend::f128_softfloat::f128_emit_load(self, dest, ptr);
             return;
         }
+        if matches!(ty, IrType::F32 | IrType::F64) {
+            if let Some(&phys) = self.reg_assignments.get(&dest.0) {
+                if is_arm_fp_phys(phys) {
+                    let fp = arm_fp_name(phys, ty);
+                    if let Some(addr) = self.state.resolve_slot_addr(ptr.0) {
+                        match addr {
+                            SlotAddr::OverAligned(slot, id) => {
+                                self.emit_alloca_aligned_addr_impl(slot, id);
+                                self.state.emit_fmt(format_args!("    ldr {}, [x9]", fp));
+                            }
+                            SlotAddr::Direct(slot) => self.emit_load_from_sp(&fp, slot.0, "ldr"),
+                            SlotAddr::Indirect(slot) => {
+                                self.emit_load_ptr_from_slot_impl(slot, ptr.0);
+                                self.state.emit_fmt(format_args!("    ldr {}, [x9]", fp));
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
+        }
         crate::backend::traits::emit_load_default(self, dest, ptr, ty);
     }
 
@@ -28,6 +72,46 @@ impl ArmCodegen {
         if ty == IrType::F128 {
             crate::backend::f128_softfloat::f128_emit_store_with_offset(self, val, base, offset);
             return;
+        }
+        // FP value with a register assignment: store the d/s register directly,
+        // folding the constant offset into the addressing mode when encodable.
+        if matches!(ty, IrType::F32 | IrType::F64) {
+            if let Operand::Value(v) = val {
+                if let Some(&phys) = self.reg_assignments.get(&v.0) {
+                    if is_arm_fp_phys(phys) {
+                        let fp = arm_fp_name(phys, ty);
+                        let addr = self.state.resolve_slot_addr(base.0);
+                        if let Some(addr) = addr {
+                            let scale: i64 = if ty == IrType::F32 { 4 } else { 8 };
+                            match addr {
+                                SlotAddr::OverAligned(slot, id) => {
+                                    self.emit_alloca_aligned_addr_impl(slot, id);
+                                    self.emit_add_offset_to_addr_reg_impl(offset);
+                                    self.state.emit_fmt(format_args!("    str {}, [x9]", fp));
+                                }
+                                SlotAddr::Direct(slot) => {
+                                    let folded_slot = StackSlot(slot.0 + offset);
+                                    self.emit_store_to_sp(&fp, folded_slot.0, "str");
+                                }
+                                SlotAddr::Indirect(slot) => {
+                                    self.emit_load_ptr_from_slot_impl(slot, base.0);
+                                    if offset > 0 && offset % scale == 0 && offset / scale <= 4095 {
+                                        self.state.emit_fmt(format_args!("    str {}, [x9, #{}]", fp, offset));
+                                    } else if (-256..=255).contains(&offset) {
+                                        self.state.emit_fmt(format_args!("    stur {}, [x9, #{}]", fp, offset));
+                                    } else {
+                                        if offset != 0 {
+                                            self.emit_add_offset_to_addr_reg_impl(offset);
+                                        }
+                                        self.state.emit_fmt(format_args!("    str {}, [x9]", fp));
+                                    }
+                                }
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
         }
         self.operand_to_x0(val);
         let addr = self.state.resolve_slot_addr(base.0);
@@ -63,6 +147,29 @@ impl ArmCodegen {
         if ty == IrType::F128 {
             crate::backend::f128_softfloat::f128_emit_load_with_offset(self, dest, base, offset);
             return;
+        }
+        if matches!(ty, IrType::F32 | IrType::F64) {
+            if let (Some(&dest_phys), Some(&base_phys)) =
+                (self.reg_assignments.get(&dest.0), self.reg_assignments.get(&base.0))
+            {
+                if is_arm_fp_phys(dest_phys) && !is_arm_fp_phys(base_phys) {
+                    let fp = arm_fp_name(dest_phys, ty);
+                    let base_reg = callee_saved_name(base_phys);
+                    let scale = if ty == IrType::F32 { 4 } else { 8 };
+                    if offset == 0 {
+                        self.state.emit_fmt(format_args!("    ldr {}, [{}]", fp, base_reg));
+                    } else if offset > 0 && offset % scale == 0 && offset / scale <= 4095 {
+                        self.state.emit_fmt(format_args!("    ldr {}, [{}, #{}]", fp, base_reg, offset));
+                    } else if (-256..=255).contains(&offset) {
+                        self.state.emit_fmt(format_args!("    ldur {}, [{}, #{}]", fp, base_reg, offset));
+                    } else {
+                        self.state.emit_fmt(format_args!("    mov x9, {}", base_reg));
+                        self.emit_add_offset_to_addr_reg_impl(offset);
+                        self.state.emit_fmt(format_args!("    ldr {}, [x9]", fp));
+                    }
+                    return;
+                }
+            }
         }
         let addr = self.state.resolve_slot_addr(base.0);
         if let Some(addr) = addr {

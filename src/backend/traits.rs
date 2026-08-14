@@ -382,6 +382,23 @@ pub trait ArchCodegen {
         self.emit_int_binop(add_dest, IrBinOp::Add, acc, &Operand::Value(Value(_mul_dest.0)), ty);
     }
 
+    fn supports_fused_float_mul_add(&self) -> bool { false }
+
+    /// Whether the target can encode a shifted register directly as the second
+    /// operand of an integer logical instruction (for example AArch64's
+    /// `orr w0, w1, w2, lsr #5`).
+    fn supports_shifted_logical(&self) -> bool { false }
+
+    /// Emit `dest = other logical_op (shift_lhs shift_op shift_amount)`.
+    /// Called only for an adjacent, single-use shift/logical pair.
+    fn emit_shifted_logical(&mut self, shift_dest: &Value, shift_op: IrBinOp,
+                            shift_lhs: &Operand, shift_amount: &Operand,
+                            logical_op: IrBinOp, other: &Operand,
+                            dest: &Value, ty: IrType) {
+        self.emit_int_binop(shift_dest, shift_op, shift_lhs, shift_amount, ty);
+        self.emit_int_binop(dest, logical_op, other, &Operand::Value(*shift_dest), ty);
+    }
+
     /// Emit a float binary operation (add/sub/mul/div).
     fn emit_float_binop(&mut self, dest: &Value, op: FloatOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
         let mnemonic = self.emit_float_binop_mnemonic(op);
@@ -1101,6 +1118,9 @@ pub trait ArchCodegen {
     fn emit_int_clz(&mut self, ty: IrType);
     fn emit_int_ctz(&mut self, ty: IrType);
     fn emit_int_bswap(&mut self, ty: IrType);
+    fn emit_int_bitreverse(&mut self, _ty: IrType) {
+        panic!("bit-reverse IR reached a backend without native lowering")
+    }
     fn emit_int_popcount(&mut self, ty: IrType);
 
     // --- Control flow primitives ---
@@ -1720,6 +1740,7 @@ pub fn emit_unaryop_default(cg: &mut (impl ArchCodegen + ?Sized), dest: &Value, 
             IrUnaryOp::Clz => cg.emit_int_clz(ty),
             IrUnaryOp::Ctz => cg.emit_int_ctz(ty),
             IrUnaryOp::Bswap => cg.emit_int_bswap(ty),
+            IrUnaryOp::BitReverse => cg.emit_int_bitreverse(ty),
             IrUnaryOp::Popcount => cg.emit_int_popcount(ty),
             IrUnaryOp::IsConstant => unreachable!("IsConstant handled above"),
         }

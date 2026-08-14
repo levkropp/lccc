@@ -151,7 +151,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         .collect();
 
     // Collect values whose types don't fit in a single GPR.
-    let non_gpr_values = collect_non_gpr_values(func, is_32bit);
+    // The AArch64 FP pool (allocator IDs 40+) additionally keeps scalar
+    // float intrinsic results out of GPRs so they can use FP registers.
+    let arm_fp_pool = config.xmm_regs.first().is_some_and(|r| r.0 == 40)
+        && std::env::var("CCC_NO_VECREG").is_err();
+    let non_gpr_values = collect_non_gpr_values(func, is_32bit, arm_fp_pool);
 
     // Helper closure to check if a type is unsuitable for GPR allocation
     let is_non_gpr_type = |ty: &IrType| -> bool {
@@ -292,11 +296,32 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // The backedge source is removed from the eligible set so it doesn't get
     // allocated independently. After allocation, it inherits the phi dest's
     // register assignment.
-    let phi_coalesce = if std::env::var("CCC_NO_PHI_COALESCE").is_ok() {
+    let all_phi_pairs = detect_phi_coalesce_groups(func, &liveness);
+    let mut phi_coalesce = if std::env::var("CCC_NO_PHI_COALESCE").is_ok() {
         Vec::new()
     } else {
-        detect_phi_coalesce_groups(func, &liveness)
+        all_phi_pairs.clone()
     };
+    // Never propagate a register assignment onto an ineligible value.  In
+    // particular an Alloca's Value denotes its address, not a scalar loaded
+    // from its slot; treating it like a registered integer changes pointer
+    // semantics and can corrupt loops whose phi initially receives an alloca.
+    let integer_binop_defs: FxHashSet<u32> = func.blocks.iter()
+        .flat_map(|block| block.instructions.iter())
+        .filter_map(|inst| match inst {
+            Instruction::BinOp { dest, ty, .. } if !is_non_gpr_type(ty) => Some(dest.0),
+            _ => None,
+        })
+        .collect();
+    phi_coalesce.retain(|(phi_dest, backedge_src)| {
+        eligible.contains(phi_dest)
+            && eligible.contains(backedge_src)
+            // Limit the relaxed live-range overlap rule to scalar arithmetic
+            // recurrences. Pointer/GEP, load, call, and copy sources can carry
+            // address identity or memory lifetime constraints not represented
+            // by the simple interval test.
+            && integer_binop_defs.contains(backedge_src)
+    });
     for &(_phi_dest, backedge_src) in &phi_coalesce {
         // Remove backedge source from eligibility — it will inherit the phi dest's register.
         eligible.remove(&backedge_src);
@@ -400,16 +425,12 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             let src_interval = liveness.intervals.iter()
                 .find(|iv| iv.value_id == backedge_src);
             if let Some(src_iv) = src_interval {
-                // Additional: check overlap with the phi dest's own interval
-                // (they share a register, so they should not overlap)
-                let dest_iv = liveness.intervals.iter()
-                    .find(|iv| iv.value_id == phi_dest);
-                if let Some(div) = dest_iv {
-                    if src_iv.start < div.end && div.start < src_iv.end {
-                        // Phi dest and backedge source intervals overlap — skip
-                        continue;
-                    }
-                }
+                // The source and phi-destination intervals normally overlap in
+                // linearized loop liveness: the phi is conservatively live for
+                // the whole loop while its replacement is computed near the
+                // backedge.  That overlap is precisely what coalescing resolves.
+                // detect_phi_coalesce_groups has already proved that the old phi
+                // value is not used after the replacement is defined.
                 // Check for conflicts with other values in the same register
                 let has_conflict = liveness.intervals.iter().any(|iv| {
                     if iv.value_id == backedge_src || iv.value_id == phi_dest { return false; }
@@ -452,9 +473,61 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
 
+    // AArch64 (allocator IDs 40..47 → v16..v23) additionally allocates
+    // 128-bit vector values and copy-form F64 values (loop accumulators)
+    // to FP/SIMD registers; other targets keep those stack-homed because
+    // their emitters are not register-aware for them.
+    let (vector_values, f64_value_set) = if arm_fp_pool {
+        (collect_vector_values(func), collect_f64_values(func))
+    } else {
+        (FxHashSet::default(), FxHashSet::default())
+    };
+
     // Phase 3: XMM register allocation for F64 values that don't span calls.
     // These values were excluded from GPR allocation but can use XMM registers.
     if !config.xmm_regs.is_empty() {
+        // Values actually consumed by a real (non-Copy) instruction.  SSA copy
+        // webs can carry a value across loop boundaries without it ever being
+        // used in a computation; such values would otherwise win FP registers
+        // with their huge intervals and starve the real accumulators.
+        // A copy source feeding (transitively) a real use still qualifies —
+        // e.g. an fmadd result copied into a loop accumulator.
+        let mut real_use: FxHashSet<u32> = FxHashSet::default();
+        if arm_fp_pool {
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if matches!(inst, Instruction::Copy { .. }) {
+                        continue;
+                    }
+                    for_each_operand_in_instruction(inst, |op| {
+                        if let Operand::Value(v) = op {
+                            real_use.insert(v.0);
+                        }
+                    });
+                }
+                for_each_operand_in_terminator(&block.terminator, |op| {
+                    if let Operand::Value(v) = op {
+                        real_use.insert(v.0);
+                    }
+                });
+            }
+            loop {
+                let mut changed = false;
+                for block in &func.blocks {
+                    for inst in &block.instructions {
+                        if let Instruction::Copy { dest, src: Operand::Value(src_val) } = inst {
+                            if real_use.contains(&dest.0) && !real_use.contains(&src_val.0) {
+                                real_use.insert(src_val.0);
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+        }
         // Collect F64 values: values in non_gpr_values that are F64 typed,
         // haven't been assigned a GPR, and don't span calls.
         let f64_intervals: Vec<LiveInterval> = liveness
@@ -464,23 +537,56 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             .filter(|iv| iv.end > iv.start)
             .filter(|iv| !assignments.contains_key(&iv.value_id))
             .filter(|iv| !spans_any_call(iv, call_points))
+            // Skip values that are only ever copied (never feed a computation):
+            // they don't need a register and would starve values that do.
+            .filter(|iv| !arm_fp_pool || real_use.contains(&iv.value_id))
             // Only include values that are actually F64 (not i128, not f32, etc.)
+            // — plus (AArch64) 128-bit vector values and copy-form F64 values.
             .filter(|iv| {
-                // Check if this value is produced by a F64-typed instruction
-                func.blocks.iter().any(|block| {
-                    block.instructions.iter().any(|inst| {
-                        match inst {
-                            Instruction::BinOp { dest, ty, .. }
-                            | Instruction::UnaryOp { dest, ty, .. } if *ty == IrType::F64 => dest.0 == iv.value_id,
-                            Instruction::Load { dest, ty, .. } if *ty == IrType::F64 => dest.0 == iv.value_id,
-                            Instruction::Cast { dest, to_ty, .. } if *to_ty == IrType::F64 => dest.0 == iv.value_id,
-                            _ => false,
-                        }
-                    })
-                })
+                vector_values.contains(&iv.value_id) || f64_value_set.contains(&iv.value_id) || {
+                    if arm_fp_pool {
+                        return false;
+                    }
+                    func.blocks.iter().any(|block| block.instructions.iter().any(|inst| match inst {
+                        Instruction::BinOp { dest, ty, .. }
+                        | Instruction::UnaryOp { dest, ty, .. } if *ty == IrType::F64 => dest.0 == iv.value_id,
+                        Instruction::Load { dest, ty, .. } if *ty == IrType::F64 => dest.0 == iv.value_id,
+                        Instruction::Cast { dest, to_ty, .. } if *to_ty == IrType::F64 => dest.0 == iv.value_id,
+                        _ => false,
+                    }))
+                }
             })
             .copied()
             .collect();
+
+        if std::env::var("CCC_DEBUG_VECREG").is_ok() {
+            eprintln!("[VECREG] func={} vector_values={:?}", func.name, vector_values);
+            for &vid in &vector_values {
+                let iv = liveness.intervals.iter().find(|iv| iv.value_id == vid);
+                eprintln!("[VECREG]   v{}: interval={:?} non_gpr={} assigned={} spans_call={}",
+                    vid, iv.map(|i| (i.start, i.end)), non_gpr_values.contains(&vid),
+                    assignments.contains_key(&vid),
+                    iv.is_some_and(|i| spans_any_call(i, call_points)));
+            }
+        }
+        if std::env::var("CCC_DEBUG_FPREG").is_ok() {
+            eprintln!("[FPREG] func={} f64_count={} intervals_in={}", func.name, f64_value_set.len(), f64_intervals.len());
+            for iv in &f64_intervals {
+                eprintln!("[FPREG]   cand v{} [{}, {}]", iv.value_id, iv.start, iv.end);
+            }
+            for &vid in &f64_value_set {
+                if liveness.intervals.iter().all(|iv| iv.value_id != vid) {
+                    eprintln!("[FPREG]   v{}: NO INTERVAL", vid);
+                }
+            }
+            for iv in &liveness.intervals {
+                if f64_value_set.contains(&iv.value_id) && f64_intervals.iter().all(|c| c.value_id != iv.value_id) {
+                    eprintln!("[FPREG]   excluded v{} [{}, {}] non_gpr={} assigned={} spans_call={}",
+                        iv.value_id, iv.start, iv.end, non_gpr_values.contains(&iv.value_id),
+                        assignments.contains_key(&iv.value_id), spans_any_call(iv, call_points));
+                }
+            }
+        }
 
         if !f64_intervals.is_empty() {
             let f64_ranges = live_range::build_live_ranges(
@@ -492,9 +598,57 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 LinearScanAllocator::new(f64_ranges, config.xmm_regs.clone());
             xmm_allocator.run();
 
+            for (vid, reg) in &xmm_allocator.assignments {
+                if std::env::var("CCC_DEBUG_VECREG").is_ok() && vector_values.contains(vid) {
+                    eprintln!("[VECREG]   assigned v{} -> reg {}", vid, reg.0);
+                }
+            }
             for (vid, reg) in xmm_allocator.assignments {
                 assignments.insert(vid, reg);
                 // XMM regs (20+) are caller-saved, no prologue save needed
+            }
+        }
+    }
+
+    // AArch64 reserves allocator IDs 48..55 for explicitly marked loop-carried
+    // F64 values (d24..d31). They are caller-saved and disjoint from the generic
+    // d16..d23 pool, so reductions do not reduce temporary-register capacity.
+    if config.xmm_regs.first().is_some_and(|r| r.0 == 40) {
+        for (index, value) in func.loop_promoted_f64_values.iter().take(8).enumerate() {
+            assignments.insert(value.0, PhysReg(48 + index as u8));
+        }
+    }
+
+    // AArch64 FP phi coalescing: give the value copied into a loop-carried
+    // F64/vector accumulator at the backedge the accumulator's own register,
+    // eliminating the backedge fmov/mov from the loop's serial dependency
+    // chain (e.g. `fmadd d16, .., d16` instead of fmadd into a temp + fmov).
+    if arm_fp_pool {
+        for &(phi_dest, backedge_src) in &all_phi_pairs {
+            let d_reg = assignments.get(&phi_dest).copied().filter(|r| (40..=55).contains(&r.0));
+            let s_reg = assignments.get(&backedge_src).copied().filter(|r| (40..=55).contains(&r.0));
+            let (Some(d), Some(s)) = (d_reg, s_reg) else { continue };
+            if d == s {
+                continue;
+            }
+            if !f64_value_set.contains(&phi_dest) && !vector_values.contains(&phi_dest) {
+                continue;
+            }
+            // Conflict check: no other value assigned d may overlap the src
+            // interval (the phi dest itself is expected to overlap — that is
+            // precisely what coalescing resolves).
+            if let Some(src_iv) = liveness.intervals.iter().find(|iv| iv.value_id == backedge_src) {
+                let conflict = liveness.intervals.iter().any(|iv| {
+                    if iv.value_id == backedge_src || iv.value_id == phi_dest {
+                        return false;
+                    }
+                    assignments
+                        .get(&iv.value_id)
+                        .is_some_and(|&o| o.0 == d.0 && iv.start < src_iv.end && src_iv.start < iv.end)
+                });
+                if !conflict {
+                    assignments.insert(backedge_src, d);
+                }
             }
         }
     }
@@ -616,7 +770,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
 /// Collect values whose types don't fit in a single GPR (floats, i128, and
 /// on 32-bit targets: i64/u64). Copy instructions that chain from these
 /// values must also be excluded via fixpoint propagation.
-fn collect_non_gpr_values(func: &IrFunction, is_32bit: bool) -> FxHashSet<u32> {
+fn collect_non_gpr_values(func: &IrFunction, is_32bit: bool, arm_fp_pool: bool) -> FxHashSet<u32> {
     let is_non_gpr_type = |ty: &IrType| -> bool {
         ty.is_float()
             || ty.is_long_double()
@@ -672,17 +826,16 @@ fn collect_non_gpr_values(func: &IrFunction, is_32bit: bool) -> FxHashSet<u32> {
                 Instruction::Intrinsic { dest: Some(d), op, .. } => {
                     // Vector intrinsics produce 128/256-bit values that cannot be
                     // stored in scalar GPRs. Exclude them from register allocation.
-                    use crate::ir::intrinsics::IntrinsicOp;
-                    let is_vector = matches!(op,
-                        IntrinsicOp::VecZeroF64x4 | IntrinsicOp::VecZeroF64x2 |
-                        IntrinsicOp::VecZeroI32x8 | IntrinsicOp::VecZeroI32x4 |
-                        IntrinsicOp::VecLoadF64x4 | IntrinsicOp::VecLoadF64x2 |
-                        IntrinsicOp::VecLoadI32x8 | IntrinsicOp::VecLoadI32x4 |
-                        IntrinsicOp::VecAddF64x4 | IntrinsicOp::VecAddF64x2 |
-                        IntrinsicOp::VecAddI32x8 | IntrinsicOp::VecAddI32x4 |
-                        IntrinsicOp::VecMulF64x4 | IntrinsicOp::VecMulF64x2
-                    );
-                    if is_vector {
+                    if op.produces_vector_value() {
+                        non_gpr_values.insert(d.0);
+                    } else if arm_fp_pool && matches!(op,
+                        crate::ir::intrinsics::IntrinsicOp::SqrtF64
+                        | crate::ir::intrinsics::IntrinsicOp::FabsF64
+                        | crate::ir::intrinsics::IntrinsicOp::SqrtF32
+                        | crate::ir::intrinsics::IntrinsicOp::FabsF32)
+                    {
+                        // Scalar float intrinsics produce FP values; keep them
+                        // out of GPR allocation so they can use FP registers.
                         non_gpr_values.insert(d.0);
                     }
                 }
@@ -724,6 +877,91 @@ fn collect_non_gpr_values(func: &IrFunction, is_32bit: bool) -> FxHashSet<u32> {
     }
 
     non_gpr_values
+}
+
+/// Collect SSA values that hold 128/256-bit vector data: destinations of
+/// vector-producing intrinsics plus any Copy destinations whose source is a
+/// vector value (iterated to fixpoint, mirroring the non-GPR propagation).
+/// Used on AArch64 to allocate NEON registers to vector values (the Phase 3
+/// FP/vector pool maps allocator IDs 40..47 to v16..v23).
+fn collect_vector_values(func: &IrFunction) -> FxHashSet<u32> {
+    let mut vector_values: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Intrinsic { dest: Some(d), op, .. } = inst {
+                if op.produces_vector_value() {
+                    vector_values.insert(d.0);
+                }
+            }
+        }
+    }
+    loop {
+        let mut changed = false;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::Copy { dest, src: Operand::Value(src_val) } = inst {
+                    if !vector_values.contains(&dest.0) && vector_values.contains(&src_val.0) {
+                        vector_values.insert(dest.0);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    vector_values
+}
+
+/// Collect SSA values that hold scalar F64 data: destinations of F64-typed
+/// instructions (BinOp/UnaryOp/Load/Cast), F64-returning intrinsics, and
+/// F64 constants — plus, iteratively, any Copy whose source is F64.  The copy
+/// propagation is what makes loop-carried F64 accumulators (lowered to Copy
+/// form after phi elimination) visible to the Phase 3 FP register scan.
+fn collect_f64_values(func: &IrFunction) -> FxHashSet<u32> {
+    let mut f64_values: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::BinOp { dest, ty, .. }
+                | Instruction::UnaryOp { dest, ty, .. }
+                | Instruction::Load { dest, ty, .. } if *ty == IrType::F64 => {
+                    f64_values.insert(dest.0);
+                }
+                Instruction::Cast { dest, to_ty, .. } if *to_ty == IrType::F64 => {
+                    f64_values.insert(dest.0);
+                }
+                Instruction::Copy { dest, src: Operand::Const(IrConst::F64(_)) } => {
+                    f64_values.insert(dest.0);
+                }
+                Instruction::Intrinsic { dest: Some(d), op, .. }
+                    if matches!(op, crate::ir::intrinsics::IntrinsicOp::SqrtF64
+                        | crate::ir::intrinsics::IntrinsicOp::FabsF64) =>
+                {
+                    f64_values.insert(d.0);
+                }
+                _ => {}
+            }
+        }
+    }
+    loop {
+        let mut changed = false;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::Copy { dest, src: Operand::Value(src_val) } = inst {
+                    if !f64_values.contains(&dest.0) && f64_values.contains(&src_val.0) {
+                        f64_values.insert(dest.0);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    f64_values
 }
 
 /// Remove values from the eligible set that are used as operands in instructions

@@ -15,6 +15,7 @@ impl ArmCodegen {
         use crate::ir::reexports::Instruction;
         use crate::backend::regalloc::PhysReg;
 
+        self.loop_promoted_f64_values = func.loop_promoted_f64_values.clone();
         let mut asm_clobbered_regs: Vec<PhysReg> = Vec::new();
         Self::prescan_inline_asm_callee_saved(func, &mut asm_clobbered_regs);
         let base_regs: &[PhysReg] = if func.is_variadic { &[] } else { &ARM_CALLEE_SAVED };
@@ -26,6 +27,7 @@ impl ArmCodegen {
             ARM_CALLER_SAVED.to_vec()
         };
         let mut has_f128_ops = false;
+        let mut has_i128_ops = false;
         for block in &func.blocks {
             for inst in &block.instructions {
                 match inst {
@@ -40,12 +42,35 @@ impl ArmCodegen {
                     Instruction::Cast { from_ty, .. } if *from_ty == IrType::F128 => {
                         has_f128_ops = true;
                     }
+                    Instruction::BinOp { ty, .. } | Instruction::UnaryOp { ty, .. }
+                    | Instruction::Cmp { ty, .. } | Instruction::Load { ty, .. }
+                    | Instruction::Store { ty, .. }
+                        if matches!(ty, IrType::I128 | IrType::U128) => has_i128_ops = true,
+                    Instruction::Cast { from_ty, to_ty, .. }
+                        if matches!(from_ty, IrType::I128 | IrType::U128)
+                            || matches!(to_ty, IrType::I128 | IrType::U128) => has_i128_ops = true,
                     _ => {}
                 }
             }
         }
-        if has_f128_ops {
+        if has_f128_ops || has_i128_ops {
             caller_saved_regs.clear();
+        } else {
+            // Pure scalar-ALU functions never invoke the address, memcpy,
+            // call-staging, intrinsic, or inline-assembly scratch paths. Make
+            // the otherwise-reserved caller-saved registers available to
+            // high-pressure kernels (cryptographic rounds, arithmetic loops).
+            let pure_scalar_alu = func.blocks.iter().all(|block| block.instructions.iter().all(|inst| matches!(inst,
+                Instruction::Alloca { .. } | Instruction::ParamRef { .. }
+                | Instruction::Copy { .. } | Instruction::Phi { .. }
+                | Instruction::BinOp { .. } | Instruction::UnaryOp { .. }
+                | Instruction::Cmp { .. } | Instruction::Cast { .. }
+                | Instruction::Select { .. }
+            )));
+            if pure_scalar_alu {
+                caller_saved_regs.extend([PhysReg(9), PhysReg(10), PhysReg(11),
+                    PhysReg(12), PhysReg(15)]);
+            }
         }
 
         let (reg_assigned, cached_liveness, _caller_save_spans) = crate::backend::generation::run_regalloc_and_merge_clobbers(

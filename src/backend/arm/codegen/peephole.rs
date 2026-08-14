@@ -425,6 +425,9 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= eliminate_redundant_branches(&lines, &mut kinds, n);
         changed |= eliminate_self_moves(&mut kinds, n);
         changed |= eliminate_move_chains(&mut lines, &mut kinds, n);
+        changed |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
+        changed |= propagate_address_aliases(&mut lines, &mut kinds, n);
+        changed |= fold_destructive_pointer_updates(&mut lines, &mut kinds, n);
         changed |= fuse_branch_over_branch(&mut lines, &mut kinds, n);
         rounds += 1;
     }
@@ -438,6 +441,9 @@ pub fn peephole_optimize(asm: String) -> String {
     //
     // Copy propagation and dead store elimination are independent and safe.
     propagate_register_copies(&mut lines, &mut kinds, n);
+    reuse_stack_loads_within_blocks(&mut lines, &mut kinds, n);
+    propagate_register_copies(&mut lines, &mut kinds, n);
+    eliminate_dead_call_staging_moves(&lines, &mut kinds, n);
     global_dead_store_elimination(&lines, &mut kinds, n);
 
     // Phase 3: Local cleanup after global passes (up to 4 rounds)
@@ -450,6 +456,9 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_redundant_branches(&lines, &mut kinds, n);
             changed2 |= eliminate_self_moves(&mut kinds, n);
             changed2 |= eliminate_move_chains(&mut lines, &mut kinds, n);
+            changed2 |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
+            changed2 |= propagate_address_aliases(&mut lines, &mut kinds, n);
+            changed2 |= fold_destructive_pointer_updates(&mut lines, &mut kinds, n);
             rounds2 += 1;
         }
     }
@@ -463,6 +472,275 @@ pub fn peephole_optimize(asm: String) -> String {
         }
     }
     result
+}
+
+/// Propagate a register copy used only as a memory-address alias within one
+/// basic block. This handles vector intrinsics where an SSA Copy gives the C
+/// pointer a short-lived register solely for `[xN]` loads/stores.
+fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    fn mentions(line: &str, reg: u8) -> bool {
+        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|tok| tok == xreg_name(reg) || tok == wreg_name(reg))
+    }
+    let mut changed = false;
+    for i in 0..n {
+        let LineKind::Move { dst, src, is_32bit: false } = kinds[i] else { continue };
+        if dst == src || dst >= 29 || src >= 29 { continue; }
+        let mut uses = Vec::new();
+        let mut valid = true;
+        let mut j = i + 1;
+        while j < n {
+            if matches!(kinds[j], LineKind::Label | LineKind::Branch | LineKind::CondBranch
+                | LineKind::CmpBranch | LineKind::Call | LineKind::Ret) { break; }
+            if written_gp_register(&lines[j], kinds[j]) == Some(src) {
+                let mut tail = j + 1;
+                while tail < n && !matches!(kinds[tail], LineKind::Label | LineKind::Branch
+                    | LineKind::CondBranch | LineKind::CmpBranch | LineKind::Call | LineKind::Ret)
+                {
+                    if mentions(&lines[tail], dst) { valid = false; }
+                    tail += 1;
+                }
+                break;
+            }
+            if written_gp_register(&lines[j], kinds[j]) == Some(dst) {
+                break;
+            }
+            if mentions(&lines[j], dst) {
+                let address = format!("[{}", xreg_name(dst));
+                if lines[j].contains(&address) {
+                    uses.push(j);
+                } else {
+                    valid = false;
+                    break;
+                }
+            }
+            j += 1;
+        }
+        if valid && !uses.is_empty() {
+            for use_idx in uses {
+                lines[use_idx] = replace_whole_word(&lines[use_idx], xreg_name(dst), xreg_name(src));
+                kinds[use_idx] = classify_line(&lines[use_idx]);
+            }
+            kinds[i] = LineKind::Nop;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Fold an SSA pointer update that is copied back to its loop-carried register:
+/// `mov x0,xS; add x0,xS,#K; mov xT,x0; ...; mov xS,xT` → `add xS,xS,#K`.
+/// The scan proves neither xS nor xT is referenced in the intervening region.
+fn fold_destructive_pointer_updates(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    fn mentions(line: &str, reg: u8) -> bool {
+        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|tok| tok == xreg_name(reg) || tok == wreg_name(reg))
+    }
+    let mut changed = false;
+    for i in 0..n.saturating_sub(3) {
+        let LineKind::Move { dst: 0, src, is_32bit: false } = kinds[i] else { continue };
+        if src == 0 || src >= 29 { continue; }
+        let mut j = i + 1;
+        while j < n && kinds[j] == LineKind::Nop { j += 1; }
+        if j >= n || kinds[j] != LineKind::Alu { continue; }
+        let expected = format!("add x0, {}, #", xreg_name(src));
+        let trimmed = lines[j].trim();
+        if !trimmed.starts_with(&expected) { continue; }
+        let immediate = match trimmed.rsplit_once('#').and_then(|(_, v)| v.parse::<i64>().ok()) {
+            Some(v) if (0..=4095).contains(&v) => v,
+            _ => continue,
+        };
+        let mut k = j + 1;
+        while k < n && kinds[k] == LineKind::Nop { k += 1; }
+        let temp = match kinds.get(k).copied() {
+            Some(LineKind::Move { dst, src: 0, is_32bit: false }) if dst != src => dst,
+            _ => continue,
+        };
+        let mut end = k + 1;
+        let mut valid = true;
+        let mut found = None;
+        while end < n && end <= k + 16 {
+            if matches!(kinds[end], LineKind::Label | LineKind::Branch | LineKind::CondBranch
+                | LineKind::CmpBranch | LineKind::Call | LineKind::Ret) { break; }
+            if let LineKind::Move { dst, src: move_src, is_32bit: false } = kinds[end] {
+                if dst == src && move_src == temp { found = Some(end); break; }
+            }
+            if mentions(&lines[end], src) || mentions(&lines[end], temp) {
+                valid = false;
+                break;
+            }
+            end += 1;
+        }
+        let Some(end) = found else { continue };
+        if !valid { continue; }
+        lines[i] = format!("    add {}, {}, #{}", xreg_name(src), xreg_name(src), immediate);
+        kinds[i] = LineKind::Alu;
+        kinds[j] = LineKind::Nop;
+        kinds[k] = LineKind::Nop;
+        kinds[end] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+/// Reuse a value already copied out of a stack slot inside one basic block.
+///
+/// Register-pressure-heavy code commonly contains
+/// `ldr x0, [sp,#N]; mov wD,w0` several times for the same spill.  Once the
+/// first copy is in a register, later reloads can source that register until
+/// either it or the slot is overwritten.  Keep this deliberately local and
+/// clear state for instruction classes whose register effects are ambiguous.
+fn reuse_stack_loads_within_blocks(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut cached: Vec<(i32, bool, u8, bool)> = Vec::new();
+    let mut changed = false;
+    let mut i = 0;
+    let mut block_safe = false;
+
+    while i < n {
+        if kinds[i] == LineKind::Label {
+            let mut j = i + 1;
+            block_safe = true;
+            while j < n && kinds[j] != LineKind::Label {
+                if matches!(kinds[j], LineKind::MemOther | LineKind::Other
+                    | LineKind::StorePairSp | LineKind::LoadPairSp
+                    | LineKind::LoadsbReg | LineKind::Call)
+                {
+                    block_safe = false;
+                    break;
+                }
+                j += 1;
+            }
+        }
+        match kinds[i] {
+            LineKind::Label | LineKind::Branch | LineKind::CondBranch
+            | LineKind::CmpBranch | LineKind::Call | LineKind::Ret
+            | LineKind::MemOther | LineKind::Other | LineKind::StorePairSp
+            | LineKind::LoadPairSp | LineKind::LoadsbReg => cached.clear(),
+            LineKind::StoreSp { offset, .. } => cached.retain(|(off, _, _, _)| *off != offset),
+            _ => {}
+        }
+
+        if !block_safe {
+            i += 1;
+            continue;
+        }
+
+        let (load_reg, offset, is_word) = match kinds[i] {
+            LineKind::LoadSp { reg, offset, is_word } => (reg, offset, is_word),
+            _ => {
+                if let Some(dst) = written_gp_register(&lines[i], kinds[i]) {
+                    cached.retain(|(_, _, reg, _)| *reg != dst);
+                }
+                i += 1;
+                continue;
+            }
+        };
+
+        let old = cached.iter().find(|(off, word, reg, _)| {
+            *off == offset && *word == is_word && *reg != load_reg
+        }).copied();
+        cached.retain(|(_, _, reg, _)| *reg != load_reg);
+
+        let mut j = i + 1;
+        while j < n && kinds[j] == LineKind::Nop { j += 1; }
+        if j < n {
+            if let LineKind::Move { dst, src, is_32bit } = kinds[j] {
+                if src == load_reg {
+                    if let Some((_, _, source, source_word)) = old.filter(|entry| entry.3 == is_32bit) {
+                        kinds[i] = LineKind::Nop;
+                        lines[j] = format!("    mov {}, {}",
+                            if is_32bit { wreg_name(dst) } else { xreg_name(dst) },
+                            if source_word { wreg_name(source) } else { xreg_name(source) });
+                        kinds[j] = LineKind::Move { dst, src: source, is_32bit };
+                        changed = true;
+                    }
+                    cached.retain(|(_, _, reg, _)| *reg != dst);
+                    cached.retain(|(off, word, _, _)| *off != offset || *word != is_word);
+                    cached.push((offset, is_word, dst, is_32bit));
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    changed
+}
+
+/// Return the GP register written by instruction classes whose first operand
+/// is unambiguously a destination. Unknown classes are handled by clearing the
+/// cache in the caller.
+fn written_gp_register(line: &str, kind: LineKind) -> Option<u8> {
+    match kind {
+        LineKind::Move { dst, .. } | LineKind::MoveImm { dst }
+        | LineKind::MoveWide { dst } | LineKind::Sxtw { dst, .. }
+        | LineKind::LoadSp { reg: dst, .. } | LineKind::LoadswSp { reg: dst, .. } => Some(dst),
+        LineKind::Alu => {
+            let operands = line.trim().split_once(' ')?.1;
+            let dst = operands.split(',').next()?;
+            let reg = parse_reg(dst);
+            (reg != REG_NONE).then_some(reg)
+        }
+        _ => None,
+    }
+}
+
+/// Remove `mov x9, xN` immediately followed by a memory operation that already
+/// addresses through xN. Regalloc-aware loads can make the legacy x9 setup dead.
+fn eliminate_unused_x9_address_moves(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for i in 0..n.saturating_sub(1) {
+        let LineKind::Move { dst: 9, src, is_32bit: false } = kinds[i] else { continue };
+        let mut j = i + 1;
+        while j < n && kinds[j] == LineKind::Nop { j += 1; }
+        if j >= n || !matches!(kinds[j], LineKind::MemOther | LineKind::LoadsbReg) { continue; }
+        let needle = format!("[{}", xreg_name(src));
+        if lines[j].contains(&needle) && !lines[j].contains("[x9") {
+            kinds[i] = LineKind::Nop;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Remove a move into an AArch64 caller-saved staging register when the value
+/// is never referenced before the next call clobbers it. Copy propagation
+/// commonly turns
+/// `mov x9, x24; mov x0, x9; bl f` into
+/// `mov x9, x24; mov x0, x24; bl f`, leaving the first move dead.
+fn eliminate_dead_call_staging_moves(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
+    fn mentions_reg(line: &str, reg: u8) -> bool {
+        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|token| token == xreg_name(reg) || token == wreg_name(reg))
+    }
+
+    let mut changed = false;
+    for i in 0..n {
+        let dst = match kinds[i] {
+            LineKind::Move { dst, .. } if (9..=15).contains(&dst) => dst,
+            _ => continue,
+        };
+        let mut j = i + 1;
+        let mut used = false;
+        let mut reaches_call = false;
+        while j < n {
+            match kinds[j] {
+                LineKind::Nop | LineKind::Directive => {}
+                LineKind::Call => { reaches_call = true; break; }
+                LineKind::Label | LineKind::Branch | LineKind::CondBranch
+                | LineKind::CmpBranch | LineKind::Ret => break,
+                _ => {
+                    if mentions_reg(&lines[j], dst) { used = true; break; }
+                }
+            }
+            j += 1;
+        }
+        if reaches_call && !used {
+            kinds[i] = LineKind::Nop;
+            changed = true;
+        }
+    }
+    changed
 }
 
 // ── Pass 1: Adjacent store/load elimination ──────────────────────────────────
@@ -834,9 +1112,7 @@ fn propagate_register_copies(lines: &mut [String], kinds: &mut [LineKind], n: us
 }
 
 // Shared peephole string utilities -- see backend/peephole_common.rs
-use crate::backend::peephole_common::replace_source_reg_in_instruction;
-#[cfg(test)]
-use crate::backend::peephole_common::replace_whole_word;
+use crate::backend::peephole_common::{replace_source_reg_in_instruction, replace_whole_word};
 
 // ── Global dead store elimination ────────────────────────────────────────────
 //
@@ -1205,6 +1481,39 @@ mod tests {
             replace_whole_word("x10", "x1", "x5"),
             "x10"
         );
+    }
+
+    #[test]
+    fn test_dead_call_staging_move_removed_after_copy_prop() {
+        let input = "    mov x9, x24\n    mov x0, x24\n    bl strlen\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.contains("mov x9, x24"));
+        assert!(result.contains("mov x0, x24"));
+    }
+
+    #[test]
+    fn test_used_call_staging_move_preserved() {
+        let input = "    mov x9, x24\n    add x24, x24, #8\n    ldr x0, [x9]\n    bl consume\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("mov x9, x24"));
+    }
+
+    #[test]
+    fn test_vector_address_alias_propagation() {
+        let input = "    mov x4, x5\n    ldr q2, [x4]\n    fmla v2.2d, v1.2d, v15.2d\n    str q2, [x4]\n    add x5, x5, #16\n    b .Lloop\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.contains("mov x4, x5"));
+        assert!(result.contains("ldr q2, [x5]"));
+        assert!(result.contains("str q2, [x5]"));
+    }
+
+    #[test]
+    fn test_destructive_pointer_update_fold() {
+        let input = "    mov x0, x6\n    add x0, x6, #16\n    mov x8, x0\n    add w24, w24, #1\n    mov x6, x8\n    b .Lloop\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("add x6, x6, #16"));
+        assert!(!result.contains("mov x8, x0"));
+        assert!(!result.contains("mov x6, x8"));
     }
 
     // ── Dead store elimination tests ─────────────────────────────────

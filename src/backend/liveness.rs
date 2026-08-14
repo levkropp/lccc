@@ -204,6 +204,23 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
     // Phase 5: Build and sort intervals.
     let intervals = build_intervals(&value_ids, &ps.def_points, &ps.last_use_points);
 
+    if let Ok(dbg) = std::env::var("CCC_DEBUG_LIVE") {
+        if let Ok(target) = dbg.parse::<u32>() {
+            if let Some(&dense) = id_to_dense.get(&target) {
+                eprintln!("[LIVE] v{} def={} last_use={}", target, ps.def_points[dense], ps.last_use_points[dense]);
+                for (bi, b) in func.blocks.iter().enumerate() {
+                    let li = live_in[bi].contains(dense);
+                    let lo = live_out[bi].contains(dense);
+                    if li || lo {
+                        eprintln!("[LIVE]   block {} (label {}) live_in={} live_out={} pts=[{},{}]",
+                            bi, b.label.0, li, lo, ps.block_start_points[bi], ps.block_end_points[bi]);
+                    }
+                }
+                eprintln!("[LIVE]   call_points={:?}", ps.call_points);
+            }
+        }
+    }
+
     LivenessResult {
         intervals,
         call_points: ps.call_points,

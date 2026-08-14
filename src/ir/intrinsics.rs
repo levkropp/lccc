@@ -76,6 +76,9 @@ pub enum IntrinsicOp {
     /// args[1]: pointer to 2×F64 (one SSE register worth)
     /// NOT pure: modifies memory at dest_ptr.
     FmaF64x2,
+    /// Two-wide FMA using a broadcast previously loaded by BroadcastLoadF64.
+    /// dest_ptr is C and args[0] is the B vector pointer.
+    FmaF64x2Hoisted,
     /// Packed double FMA for AVX2 4-wide vectorized loops.
     /// Computes: *dest_ptr[0..4] += broadcast(*args[0]) * *args[1][0..4]
     /// dest_ptr: pointer to 4×F64 accumulator (read+write, 32 bytes)
@@ -192,6 +195,10 @@ pub enum IntrinsicOp {
     /// Vector add: %dest_vec = %src1_vec + %src2_vec - SSE2 4×I32
     /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
     VecAddI32x4,
+    /// Load two signed I32 lanes and widen to two I64 lanes.
+    VecLoadWidenI32ToI64x2,
+    VecAddI64x2,
+    VecMulI64x2,
 
     /// Horizontal reduction: %scalar = horizontal_add(%vec) - AVX2 4×F64 → F64
     /// args[0] = source vector value; dest = scalar F64 result
@@ -205,6 +212,7 @@ pub enum IntrinsicOp {
     /// Horizontal reduction: %scalar = horizontal_add(%vec) - SSE2 4×I32 → I32
     /// args[0] = source vector value; dest = scalar I32 result
     VecHorizontalAddI32x4,
+    VecHorizontalAddI64x2,
 
     /// Vector zero: %dest_vec = {0.0, 0.0, 0.0, 0.0} - AVX2 4×F64
     /// No args; dest = zero vector
@@ -218,6 +226,7 @@ pub enum IntrinsicOp {
     /// Vector zero: %dest_vec = {0, 0, 0, 0} - SSE2 4×I32
     /// No args; dest = zero vector
     VecZeroI32x4,
+    VecZeroI64x2,
     /// AES-NI: aesenc (single round encrypt)
     /// args[0] = state ptr, args[1] = round key ptr; dest_ptr = result ptr
     Aesenc128,
@@ -378,6 +387,24 @@ impl IntrinsicOp {
             IntrinsicOp::AddI32x8 | IntrinsicOp::AddI32x4 |
             IntrinsicOp::HorizontalAddF64x4 | IntrinsicOp::HorizontalAddF64x2 |
             IntrinsicOp::HorizontalAddI32x8 | IntrinsicOp::HorizontalAddI32x4
+        )
+    }
+
+    /// Returns true if this intrinsic produces a 128/256-bit vector value
+    /// (as opposed to a scalar).  These values cannot live in a GPR; backends
+    /// either home them on the stack or allocate SIMD registers for them.
+    pub fn produces_vector_value(&self) -> bool {
+        matches!(self,
+            IntrinsicOp::VecZeroF64x4 | IntrinsicOp::VecZeroF64x2 |
+            IntrinsicOp::VecZeroI32x8 | IntrinsicOp::VecZeroI32x4 |
+            IntrinsicOp::VecLoadF64x4 | IntrinsicOp::VecLoadF64x2 |
+            IntrinsicOp::VecLoadI32x8 | IntrinsicOp::VecLoadI32x4 |
+            IntrinsicOp::VecAddF64x4 | IntrinsicOp::VecAddF64x2 |
+            IntrinsicOp::VecAddI32x8 | IntrinsicOp::VecAddI32x4 |
+            IntrinsicOp::VecMulF64x4 | IntrinsicOp::VecMulF64x2
+            | IntrinsicOp::VecLoadWidenI32ToI64x2
+            | IntrinsicOp::VecAddI64x2 | IntrinsicOp::VecMulI64x2
+            | IntrinsicOp::VecZeroI64x2
         )
     }
 }

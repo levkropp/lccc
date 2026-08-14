@@ -770,6 +770,7 @@ mod tests {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
+            loop_promoted_f64_values: Vec::new(),
         };
 
         let mut module = IrModule {
@@ -847,6 +848,7 @@ mod tests {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
+            loop_promoted_f64_values: Vec::new(),
         };
 
         let mut module = IrModule {
@@ -915,6 +917,7 @@ mod tests {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
+            loop_promoted_f64_values: Vec::new(),
         };
 
         let mut module = IrModule {
@@ -989,6 +992,7 @@ mod tests {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
+            loop_promoted_f64_values: Vec::new(),
         };
 
         let mut module = IrModule {
@@ -1064,6 +1068,7 @@ mod tests {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
+            loop_promoted_f64_values: Vec::new(),
         };
 
         let mut module = IrModule {
@@ -1144,6 +1149,7 @@ mod tests {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
+            loop_promoted_f64_values: Vec::new(),
         };
 
         let mut module = IrModule {
@@ -1251,6 +1257,7 @@ mod tests {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
+            loop_promoted_f64_values: Vec::new(),
         };
 
         let mut module = IrModule {
@@ -1309,6 +1316,7 @@ mod tests {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
+            loop_promoted_f64_values: Vec::new(),
         }
     }
 

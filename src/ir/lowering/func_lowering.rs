@@ -572,6 +572,7 @@ impl Lowerer {
             global_init_label_blocks: global_init_labels,
             ret_eightbyte_classes,
             is_gnu_inline_def: is_gnu_inline_no_extern_def,
+            loop_promoted_f64_values: Vec::new(),
         };
         // Collect __attribute__((symver("..."))) directives
         if let Some(ref sv) = func.attrs.symver {
@@ -593,7 +594,7 @@ impl Lowerer {
         for param in &func.params {
             for expr in &param.vla_size_exprs {
                 // Evaluate the expression for its side effects; discard the result.
-                let _ = self.lower_expr(expr);
+                self.lower_expr_discarded(expr);
             }
         }
     }

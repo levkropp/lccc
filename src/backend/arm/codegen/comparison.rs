@@ -6,16 +6,13 @@ use super::emit::{ArmCodegen, arm_int_cond_code, arm_invert_cond_code};
 
 impl ArmCodegen {
     pub(super) fn emit_float_cmp_impl(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
-        self.operand_to_x0(lhs);
-        self.state.emit("    mov x1, x0");
-        self.operand_to_x0(rhs);
         if ty == IrType::F32 {
-            self.state.emit("    fmov s0, w1");
-            self.state.emit("    fmov s1, w0");
+            self.float_operand_to_reg(lhs, ty, "s0");
+            self.float_operand_to_reg(rhs, ty, "s1");
             self.state.emit("    fcmp s0, s1");
         } else {
-            self.state.emit("    fmov d0, x1");
-            self.state.emit("    fmov d1, x0");
+            self.float_operand_to_reg(lhs, ty, "d0");
+            self.float_operand_to_reg(rhs, ty, "d1");
             self.state.emit("    fcmp d0, d1");
         }
         let cond = match op {

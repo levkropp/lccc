@@ -155,7 +155,7 @@ impl I686Codegen {
                 self.emit_f32_store_from_x87(dest);
             }
             // FmaF64x2, FmaF64x4, and reduction intrinsics are x86-64 SSE2/AVX2 intrinsics; not implemented on i686.
-            IntrinsicOp::FmaF64x2 | IntrinsicOp::FmaF64x4 |
+            IntrinsicOp::FmaF64x2 | IntrinsicOp::FmaF64x2Hoisted | IntrinsicOp::FmaF64x4 |
             IntrinsicOp::FmaF64x4Hoisted | IntrinsicOp::BroadcastLoadF64 | IntrinsicOp::FmaF64x4SIB |
             IntrinsicOp::LoadF64x4 | IntrinsicOp::LoadF64x2 |
             IntrinsicOp::LoadI32x8 | IntrinsicOp::LoadI32x4 |
@@ -440,7 +440,10 @@ impl I686Codegen {
             IntrinsicOp::VecAddI32x8 | IntrinsicOp::VecAddI32x4 |
             IntrinsicOp::VecHorizontalAddF64x4 | IntrinsicOp::VecHorizontalAddF64x2 |
             IntrinsicOp::VecHorizontalAddI32x8 | IntrinsicOp::VecHorizontalAddI32x4 |
-            IntrinsicOp::VecZeroF64x4 | IntrinsicOp::VecZeroF64x2 | IntrinsicOp::VecZeroI32x8 | IntrinsicOp::VecZeroI32x4 => {
+            IntrinsicOp::VecZeroF64x4 | IntrinsicOp::VecZeroF64x2 | IntrinsicOp::VecZeroI32x8 | IntrinsicOp::VecZeroI32x4 |
+            IntrinsicOp::VecLoadWidenI32ToI64x2 | IntrinsicOp::VecAddI64x2 |
+            IntrinsicOp::VecMulI64x2 | IntrinsicOp::VecHorizontalAddI64x2 |
+            IntrinsicOp::VecZeroI64x2 => {
                 // These are x86-64-specific register-based vector operations
                 unimplemented!("Register-based vector intrinsics not implemented for i686");
             }

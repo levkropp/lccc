@@ -774,7 +774,7 @@ impl Lowerer {
         self.lower_inc_dec_impl(inner, is_inc, false)
     }
 
-    fn lower_inc_dec_impl(&mut self, inner: &Expr, is_inc: bool, return_new: bool) -> Operand {
+    pub(super) fn lower_inc_dec_impl(&mut self, inner: &Expr, is_inc: bool, return_new: bool) -> Operand {
         if let Some(result) = self.try_lower_bitfield_inc_dec(inner, is_inc, return_new) {
             return result;
         }

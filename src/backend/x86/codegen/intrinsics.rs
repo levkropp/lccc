@@ -572,6 +572,9 @@ impl X86Codegen {
                     self.state.emit("    movupd %xmm0, (%rax)");         // store back
                 }
             }
+            IntrinsicOp::FmaF64x2Hoisted => {
+                // Emitted only by the AArch64 two-wide vectorizer.
+            }
             IntrinsicOp::FmaF64x4 => {
                 // dest_ptr[0..4] += broadcast(args[0]) * args[1][0..4]
                 // args[0] = A pointer (scalar F64, broadcast to all 4 lanes)
@@ -1123,6 +1126,11 @@ impl X86Codegen {
                         self.state.emit("    movdqu %xmm0, (%rdx)");
                     }
                 }
+            }
+            IntrinsicOp::VecLoadWidenI32ToI64x2 | IntrinsicOp::VecAddI64x2 |
+            IntrinsicOp::VecMulI64x2 | IntrinsicOp::VecHorizontalAddI64x2 |
+            IntrinsicOp::VecZeroI64x2 => {
+                // AArch64-only widening reduction intrinsics.
             }
         }
     }

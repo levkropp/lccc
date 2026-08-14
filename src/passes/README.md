@@ -527,7 +527,7 @@ chain into subsequent folds.
   (F32/F64) arithmetic via native IEEE 754. F128/long double via platform-
   specific x87 (x86/i686) or software f128 (ARM/RISC-V) arithmetic. I128 via
   native Rust i128.
-- **UnaryOp**: Neg, Not, Clz, Ctz, Popcount (width-sensitive), Bswap
+- **UnaryOp**: Neg, Not, Clz, Ctz, Popcount (width-sensitive), Bswap, BitReverse
   (16/32/64-bit), and IsConstant.
 - **Cmp**: all 10 comparison operators for integer, float, F128 (with correct
   NaN unordered handling), and I128.

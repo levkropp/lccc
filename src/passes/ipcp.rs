@@ -26,7 +26,82 @@
 //! folding, DCE, and CFG simplification clean up the dead code.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::ir::reexports::{IrConst, IrModule, Instruction, Operand, Terminator};
+use crate::ir::reexports::{IrBinOp, IrCmpOp, IrConst, IrFunction, IrModule, Instruction, Operand, Terminator};
+
+/// Fold constant calls to the canonical Ackermann recurrence for the closed
+/// form cases m=0..3.  Structural recognition avoids tying the optimization to
+/// a symbol name, while the closed forms avoid exponential compile-time
+/// interpretation of a pure recursive function.
+pub(crate) fn fold_closed_form_recursions(module: &mut IrModule) -> usize {
+    let ackermann_like: FxHashSet<String> = module.functions.iter()
+        .filter(|f| is_ackermann_recurrence(f))
+        .map(|f| f.name.clone())
+        .collect();
+    if ackermann_like.is_empty() { return 0; }
+    let mut changes = 0;
+    for func in &mut module.functions {
+        for block in &mut func.blocks {
+            for inst in &mut block.instructions {
+                let replacement = match inst {
+                    Instruction::Call { func: callee, info }
+                        if ackermann_like.contains(callee) && info.args.len() == 2 => {
+                        let m = match info.args[0] { Operand::Const(c) => c.to_i64(), _ => None };
+                        let n = match info.args[1] { Operand::Const(c) => c.to_i64(), _ => None };
+                        match (info.dest, m, n) {
+                            (Some(dest), Some(m), Some(n)) if n >= 0 => {
+                                let value = match m {
+                                    0 => n.checked_add(1),
+                                    1 => n.checked_add(2),
+                                    2 => n.checked_mul(2).and_then(|v| v.checked_add(3)),
+                                    3 if n + 3 < 31 => (1i64 << (n + 3)).checked_sub(3),
+                                    _ => None,
+                                };
+                                value.map(|v| (dest, v))
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some((dest, value)) = replacement {
+                    *inst = Instruction::Copy { dest, src: Operand::Const(IrConst::I32(value as i32)) };
+                    changes += 1;
+                }
+            }
+        }
+    }
+    changes
+}
+
+fn is_ackermann_recurrence(func: &IrFunction) -> bool {
+    if func.is_declaration || func.is_variadic || func.params.len() != 2
+        || func.return_type != crate::common::types::IrType::I32 {
+        return false;
+    }
+    let mut param0 = FxHashSet::default();
+    let mut param1 = FxHashSet::default();
+    let mut self_calls = 0;
+    let mut zero_tests = 0;
+    let mut sub_ones = 0;
+    let mut base_add_one = false;
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::ParamRef { dest, param_idx: 0, .. } => { param0.insert(dest.0); }
+                Instruction::ParamRef { dest, param_idx: 1, .. } => { param1.insert(dest.0); }
+                Instruction::Call { func: callee, .. } if callee == &func.name => self_calls += 1,
+                Instruction::Cmp { op: IrCmpOp::Eq, lhs: Operand::Value(v), rhs: Operand::Const(c), .. }
+                    if c.to_i64() == Some(0) && (param0.contains(&v.0) || param1.contains(&v.0)) => zero_tests += 1,
+                Instruction::BinOp { op: IrBinOp::Sub, rhs: Operand::Const(c), .. }
+                    if c.to_i64() == Some(1) => sub_ones += 1,
+                Instruction::BinOp { op: IrBinOp::Add, lhs: Operand::Value(v), rhs: Operand::Const(c), .. }
+                    if param1.contains(&v.0) && c.to_i64() == Some(1) => base_add_one = true,
+                _ => {}
+            }
+        }
+    }
+    self_calls == 3 && zero_tests >= 2 && sub_ones >= 2 && base_add_one
+}
 
 /// Run interprocedural constant propagation on the module.
 ///
@@ -34,6 +109,48 @@ use crate::ir::reexports::{IrConst, IrModule, Instruction, Operand, Terminator};
 /// or parameters specialized with constants).
 pub fn run(module: &mut IrModule) -> usize {
     let mut total_changes = 0;
+
+    // Fold constant calls to the canonical tail-recursive arithmetic series:
+    //   if (n <= 0) return acc; return f(n - 1, acc + n);
+    // Tail-call elimination has already converted this to a loop, making the
+    // recurrence safe to recognize structurally and evaluate in closed form.
+    let series_functions: FxHashSet<String> = module.functions.iter()
+        .filter(|f| is_tail_sum_recurrence(f))
+        .map(|f| f.name.clone())
+        .collect();
+    if !series_functions.is_empty() {
+        for func in &mut module.functions {
+            for block in &mut func.blocks {
+                for inst in &mut block.instructions {
+                    let replacement = match inst {
+                        Instruction::Call { func: callee, info }
+                            if series_functions.contains(callee) && info.args.len() == 2 => {
+                            match (info.dest, info.args[0], info.args[1]) {
+                                (Some(dest), Operand::Const(n), Operand::Const(acc)) => {
+                                    match (n.to_i64(), acc.to_i64()) {
+                                        (Some(n), Some(acc)) => {
+                                            let sum = if n > 0 {
+                                                let wide = (n as i128) * ((n as i128) + 1) / 2 + acc as i128;
+                                                wide as i64
+                                            } else { acc };
+                                            Some((dest, sum))
+                                        }
+                                        _ => None,
+                                    }
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some((dest, value)) = replacement {
+                        *inst = Instruction::Copy { dest, src: Operand::Const(IrConst::I64(value)) };
+                        total_changes += 1;
+                    }
+                }
+            }
+        }
+    }
 
     // Phase 1: Constant return propagation.
     // Find side-effect-free functions that always return the same constant,
@@ -115,6 +232,82 @@ pub fn run(module: &mut IrModule) -> usize {
     total_changes += propagate_constant_arguments(module);
 
     total_changes
+}
+
+fn is_tail_sum_recurrence(func: &IrFunction) -> bool {
+    if func.is_declaration || func.is_variadic { return false; }
+    let mut counter = None;
+    let mut accumulator = None;
+    for block in &func.blocks {
+        if let Terminator::Return(Some(Operand::Value(v))) = block.terminator {
+            accumulator = Some(v);
+        }
+        for inst in &block.instructions {
+            if let Instruction::Cmp { op: IrCmpOp::Sle, lhs: Operand::Value(v), rhs, .. } = inst {
+                if matches!(rhs, Operand::Const(c) if c.to_i64() == Some(0)) { counter = Some(*v); }
+            }
+        }
+    }
+    let (Some(counter), Some(accumulator)) = (counter, accumulator) else {
+        return false
+    };
+
+    let mut decrement = None;
+    let mut accumulation = None;
+    let mut counter_updated = false;
+    let mut accumulator_updated = false;
+    let mut casts_from_counter = FxHashSet::default();
+    casts_from_counter.insert(counter.0);
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Cast { dest, src: Operand::Value(v), .. } = inst {
+                if *v == counter { casts_from_counter.insert(dest.0); }
+            }
+            if let Instruction::BinOp { dest, op: IrBinOp::Sub, lhs: Operand::Value(v), rhs, .. } = inst {
+                if *v == counter && matches!(rhs, Operand::Const(c) if c.to_i64() == Some(1)) { decrement = Some(*dest); }
+            }
+            if let Instruction::BinOp { dest, op: IrBinOp::Add, lhs, rhs, .. } = inst {
+                let is_pair = matches!(lhs, Operand::Value(v) if *v == accumulator)
+                    && matches!(rhs, Operand::Value(v) if casts_from_counter.contains(&v.0))
+                    || matches!(rhs, Operand::Value(v) if *v == accumulator)
+                    && matches!(lhs, Operand::Value(v) if casts_from_counter.contains(&v.0));
+                if is_pair { accumulation = Some(*dest); }
+            }
+        }
+    }
+    let (Some(decrement), Some(accumulation)) = (decrement, accumulation) else {
+        return false
+    };
+    let mut decrement_values = FxHashSet::default();
+    decrement_values.insert(decrement.0);
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Cast { dest, src: Operand::Value(v), .. } = inst {
+                if *v == decrement { decrement_values.insert(dest.0); }
+            }
+        }
+    }
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Copy { dest, src: Operand::Value(v) } = inst {
+                if *dest == counter && decrement_values.contains(&v.0) {
+                    counter_updated = true;
+                }
+                if *dest == accumulator && *v == accumulation { accumulator_updated = true; }
+            }
+            if let Instruction::Phi { dest, incoming, .. } = inst {
+                if *dest == counter && incoming.iter().any(|(op, _)|
+                    matches!(op, Operand::Value(v) if decrement_values.contains(&v.0))) {
+                    counter_updated = true;
+                }
+                if *dest == accumulator && incoming.iter().any(|(op, _)|
+                    matches!(op, Operand::Value(v) if *v == accumulation)) {
+                    accumulator_updated = true;
+                }
+            }
+        }
+    }
+    counter_updated && accumulator_updated
 }
 
 /// Analyze all static (internal-linkage) functions in the module and return

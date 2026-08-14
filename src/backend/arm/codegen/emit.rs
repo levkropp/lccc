@@ -26,8 +26,8 @@ use super::asm_emitter::ARM_GP_SCRATCH;
 
 /// Callee-saved registers available for register allocation: x20-x28.
 /// x19 is reserved (some ABIs use it), x29=fp, x30=lr.
-pub(super) const ARM_CALLEE_SAVED: [PhysReg; 9] = [
-    PhysReg(20), PhysReg(21), PhysReg(22), PhysReg(23), PhysReg(24),
+pub(super) const ARM_CALLEE_SAVED: [PhysReg; 10] = [
+    PhysReg(19), PhysReg(20), PhysReg(21), PhysReg(22), PhysReg(23), PhysReg(24),
     PhysReg(25), PhysReg(26), PhysReg(27), PhysReg(28),
 ];
 
@@ -43,14 +43,16 @@ pub(super) const ARM_CALLEE_SAVED: [PhysReg; 9] = [
 /// (inline assembly scratch pool). Since caller-saved allocation only assigns
 /// values whose live ranges do NOT span any call, the call staging use is safe.
 /// Functions with inline assembly have the caller-saved pool disabled entirely.
-pub(super) const ARM_CALLER_SAVED: [PhysReg; 2] = [
-    PhysReg(13), PhysReg(14),
+pub(super) const ARM_CALLER_SAVED: [PhysReg; 7] = [
+    PhysReg(4), PhysReg(5), PhysReg(6), PhysReg(7), PhysReg(8), PhysReg(13), PhysReg(14),
 ];
 
 pub(super) fn callee_saved_name(reg: PhysReg) -> &'static str {
     match reg.0 {
         // Caller-saved registers
-        13 => "x13", 14 => "x14",
+        4 => "x4", 5 => "x5", 6 => "x6", 7 => "x7", 8 => "x8",
+        9 => "x9", 10 => "x10", 11 => "x11", 12 => "x12",
+        13 => "x13", 14 => "x14", 15 => "x15",
         // Callee-saved registers
         19 => "x19", 20 => "x20", 21 => "x21", 22 => "x22", 23 => "x23", 24 => "x24",
         25 => "x25", 26 => "x26", 27 => "x27", 28 => "x28",
@@ -61,12 +63,29 @@ pub(super) fn callee_saved_name(reg: PhysReg) -> &'static str {
 pub(super) fn callee_saved_name_32(reg: PhysReg) -> &'static str {
     match reg.0 {
         // Caller-saved registers
-        13 => "w13", 14 => "w14",
+        4 => "w4", 5 => "w5", 6 => "w6", 7 => "w7", 8 => "w8",
+        9 => "w9", 10 => "w10", 11 => "w11", 12 => "w12",
+        13 => "w13", 14 => "w14", 15 => "w15",
         // Callee-saved registers
         19 => "w19", 20 => "w20", 21 => "w21", 22 => "w22", 23 => "w23", 24 => "w24",
         25 => "w25", 26 => "w26", 27 => "w27", 28 => "w28",
         _ => unreachable!("invalid ARM register index"),
     }
+}
+
+pub(super) fn is_arm_fp_phys(reg: PhysReg) -> bool {
+    (40..=55).contains(&reg.0)
+}
+
+pub(super) fn arm_fp_name(reg: PhysReg, ty: IrType) -> String {
+    let number = reg.0 - 24; // allocator IDs 40..55 map to v16..v31
+    if ty == IrType::F32 { format!("s{}", number) } else { format!("d{}", number) }
+}
+
+/// 128-bit NEON view of an allocated FP/SIMD register (allocator IDs 40..55
+/// map to v16..v31).  Used for vector values holding full 128-bit lanes.
+pub(super) fn arm_vector_name(reg: PhysReg) -> String {
+    format!("v{}", reg.0 - 24)
 }
 
 /// Check if a register name is an AArch64 floating-point/SIMD register
@@ -161,6 +180,8 @@ pub struct ArmCodegen {
     pub(super) asm_fp_scratch_idx: usize,
     /// Register allocator: value ID -> physical callee-saved register.
     pub(super) reg_assignments: FxHashMap<u32, PhysReg>,
+    /// F64 loop-memory phi values explicitly selected for FP allocation.
+    pub(super) loop_promoted_f64_values: Vec<Value>,
     /// Which callee-saved registers are actually used (for save/restore).
     pub(super) used_callee_saved: Vec<PhysReg>,
     /// SP offset where callee-saved registers are stored.
@@ -188,6 +209,7 @@ impl ArmCodegen {
             asm_scratch_idx: 0,
             asm_fp_scratch_idx: 0,
             reg_assignments: FxHashMap::default(),
+            loop_promoted_f64_values: Vec::new(),
             used_callee_saved: Vec::new(),
             callee_save_offset: 0,
             frame_base_offset: None,
@@ -1080,8 +1102,12 @@ impl ArmCodegen {
                 }
                 // Check for callee-saved register assignment.
                 if let Some(&reg) = self.reg_assignments.get(&v.0) {
-                    let reg_name = callee_saved_name(reg);
-                    self.state.emit_fmt(format_args!("    mov x0, {}", reg_name));
+                    if is_arm_fp_phys(reg) {
+                        self.state.emit_fmt(format_args!("    fmov x0, d{}", reg.0 - 24));
+                    } else {
+                        let reg_name = callee_saved_name(reg);
+                        self.state.emit_fmt(format_args!("    mov x0, {}", reg_name));
+                    }
                     self.state.reg_cache.set_acc(v.0, false);
                     return;
                 }
@@ -1107,8 +1133,12 @@ impl ArmCodegen {
     pub(super) fn store_x0_to(&mut self, dest: &Value) {
         if let Some(&reg) = self.reg_assignments.get(&dest.0) {
             // Value has a callee-saved register: store only to register, skip stack.
-            let reg_name = callee_saved_name(reg);
-            self.state.emit_fmt(format_args!("    mov {}, x0", reg_name));
+            if is_arm_fp_phys(reg) {
+                self.state.emit_fmt(format_args!("    fmov d{}, x0", reg.0 - 24));
+            } else {
+                let reg_name = callee_saved_name(reg);
+                self.state.emit_fmt(format_args!("    mov {}, x0", reg_name));
+            }
         } else if let Some(slot) = self.state.get_slot(dest.0) {
             self.emit_store_to_sp("x0", slot.0, "str");
         }
@@ -1278,7 +1308,11 @@ impl ArmCodegen {
             match arg {
                 Operand::Value(v) => {
                     if let Some(&reg) = self.reg_assignments.get(&v.0) {
-                        self.state.emit_fmt(format_args!("    mov {}, {}", dest, callee_saved_name(reg)));
+                        if is_arm_fp_phys(reg) {
+                            self.state.emit_fmt(format_args!("    fmov {}, d{}", dest, reg.0 - 24));
+                        } else {
+                            self.state.emit_fmt(format_args!("    mov {}, {}", dest, callee_saved_name(reg)));
+                        }
                     } else if let Some(slot) = self.state.get_slot(v.0) {
                         let adjusted = slot.0 + slot_adjust + extra_sp_adj;
                         if self.state.is_alloca(v.0) {
@@ -1305,7 +1339,11 @@ impl ArmCodegen {
             match arg {
                 Operand::Value(v) => {
                     if let Some(&reg) = self.reg_assignments.get(&v.0) {
-                        self.state.emit_fmt(format_args!("    mov {}, {}", dest, callee_saved_name(reg)));
+                        if is_arm_fp_phys(reg) {
+                            self.state.emit_fmt(format_args!("    fmov {}, d{}", dest, reg.0 - 24));
+                        } else {
+                            self.state.emit_fmt(format_args!("    mov {}, {}", dest, callee_saved_name(reg)));
+                        }
                     } else if let Some(slot) = self.state.get_slot(v.0) {
                         if self.state.is_alloca(v.0) {
                             self.emit_alloca_addr(dest, v.0, slot.0);
@@ -1778,6 +1816,23 @@ pub(super) const ARM_ARG_REGS: [&str; 8] = ["x0", "x1", "x2", "x3", "x4", "x5", 
 const ARM_TMP_REGS: [&str; 8] = ["x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16"];
 
 impl ArchCodegen for ArmCodegen {
+    fn supports_fused_float_mul_add(&self) -> bool { true }
+    fn supports_shifted_logical(&self) -> bool { true }
+    fn emit_shifted_logical(&mut self, _shift_dest: &Value, shift_op: IrBinOp,
+                            shift_lhs: &Operand, shift_amount: &Operand,
+                            logical_op: IrBinOp, other: &Operand,
+                            dest: &Value, ty: IrType) {
+        self.emit_shifted_logical_impl(shift_op, shift_lhs, shift_amount,
+                                       logical_op, other, dest, ty);
+    }
+    fn emit_fused_mul_add(&mut self, mul_dest: &Value, mul_lhs: &Operand, mul_rhs: &Operand,
+                          acc: &Operand, add_dest: &Value, ty: IrType) {
+        if ty == IrType::F32 || ty == IrType::F64 {
+            self.emit_fused_mul_add_impl(mul_dest, mul_lhs, mul_rhs, acc, add_dest, ty);
+        } else {
+            self.emit_int_fused_mul_add_impl(mul_lhs, mul_rhs, acc, add_dest, ty);
+        }
+    }
     fn state(&mut self) -> &mut CodegenState { &mut self.state }
     fn state_ref(&self) -> &CodegenState { &self.state }
 
@@ -1874,6 +1929,109 @@ impl ArchCodegen for ArmCodegen {
     // ---- Standard trait methods (kept inline - arch-specific) ----
     fn emit_load_operand(&mut self, op: &Operand) { self.operand_to_x0(op); }
     fn emit_store_result(&mut self, dest: &Value) { self.store_x0_to(dest); }
+    fn emit_copy_value(&mut self, dest: &Value, src: &Operand) {
+        let src_value = match src { Operand::Value(v) => Some(*v), _ => None };
+        // Vector PHIs are lowered to ordinary Copy instructions.  A scalar
+        // x-register copy silently discarded the upper half of 128-bit NEON
+        // accumulators, so preserve the complete value here.
+        let is_vector = self.state.vector_values.contains(&dest.0)
+            || src_value.is_some_and(|src| self.state.vector_values.contains(&src.0));
+        if is_vector {
+            // Prefer NEON register assignments over stack slots: a loop-carried
+            // vector accumulator must stay in a q register across the backedge
+            // to avoid a str/ldr round-trip per iteration.
+            let dest_phys = self.get_phys_reg_for_value(dest.0).filter(|r| is_arm_fp_phys(*r));
+            let src_phys = src_value
+                .and_then(|v| self.get_phys_reg_for_value(v.0))
+                .filter(|r| is_arm_fp_phys(*r));
+            match (dest_phys, src_phys) {
+                (Some(d), Some(s)) => {
+                    if d != s {
+                        self.state.emit_fmt(format_args!(
+                            "    mov {}.16b, {}.16b", arm_vector_name(d), arm_vector_name(s)));
+                    }
+                }
+                (Some(d), None) => {
+                    let d_q = format!("q{}", d.0 - 24);
+                    match src_value {
+                        Some(src) => {
+                            if let Some(slot) = self.state.get_slot(src.0) {
+                                self.emit_load_from_sp(&d_q, slot.0, "ldr");
+                            }
+                        }
+                        None => {
+                            let d_name = arm_vector_name(d);
+                            self.state.emit_fmt(format_args!(
+                                "    eor {0}.16b, {0}.16b, {0}.16b", d_name));
+                        }
+                    }
+                }
+                (None, Some(s)) => {
+                    if let Some(slot) = self.state.get_slot(dest.0) {
+                        let s_q = format!("q{}", s.0 - 24);
+                        self.emit_store_to_sp(&s_q, slot.0, "str");
+                    }
+                }
+                (None, None) => {
+                    if let Some(src) = src_value {
+                        if let Some(slot) = self.state.get_slot(src.0) {
+                            self.emit_load_from_sp("q0", slot.0, "ldr");
+                        }
+                    } else {
+                        self.state.emit("    eor v0.16b, v0.16b, v0.16b");
+                    }
+                    if let Some(slot) = self.state.get_slot(dest.0) {
+                        self.emit_store_to_sp("q0", slot.0, "str");
+                    }
+                }
+            }
+            self.state.reg_cache.invalidate_acc();
+            return;
+        }
+        let is_promoted = self.loop_promoted_f64_values.iter().any(|v| v.0 == dest.0)
+            || src_value.is_some_and(|src| self.loop_promoted_f64_values.iter().any(|v| v.0 == src.0));
+        if is_promoted {
+            self.float_operand_to_reg(src, IrType::F64, "d0");
+            self.store_float_reg(dest, IrType::F64, "d0");
+            self.state.reg_cache.invalidate_acc();
+            return;
+        }
+        // F64 values with FP register assignments (from the Phase 3 scan):
+        // copy via the FP register file, never bouncing through x0/stack.
+        let dest_fp = self.get_phys_reg_for_value(dest.0).filter(|r| is_arm_fp_phys(*r));
+        let src_fp = src_value
+            .and_then(|v| self.get_phys_reg_for_value(v.0))
+            .filter(|r| is_arm_fp_phys(*r));
+        if dest_fp.is_some() || src_fp.is_some() {
+            match (dest_fp, src_fp) {
+                (Some(d), Some(s)) => {
+                    if d != s {
+                        self.state.emit_fmt(format_args!(
+                            "    fmov {}, {}", arm_fp_name(d, IrType::F64), arm_fp_name(s, IrType::F64)));
+                    }
+                }
+                _ => {
+                    self.float_operand_to_reg(src, IrType::F64, "d0");
+                    self.store_float_reg(dest, IrType::F64, "d0");
+                }
+            }
+            self.state.reg_cache.invalidate_acc();
+            return;
+        }
+        let dest_phys = self.get_phys_reg_for_value(dest.0);
+        let src_phys = src_value.and_then(|v| self.get_phys_reg_for_value(v.0));
+        match (dest_phys, src_phys) {
+            (Some(d), Some(s)) => {
+                if d.0 != s.0 { self.emit_reg_to_reg_move(s, d); }
+                self.state.reg_cache.invalidate_acc();
+            }
+            (Some(d), None) => {
+                self.emit_load_operand(src); self.emit_acc_to_phys_reg(d);
+                self.state.reg_cache.invalidate_acc();
+            }
+            _ => { self.emit_load_operand(src); self.emit_store_result(dest); }
+        }
+    }
     fn emit_save_acc(&mut self) { self.state.emit("    mov x1, x0"); }
     fn emit_add_secondary_to_acc(&mut self) { self.state.emit("    add x0, x1, x0"); }
     fn emit_gep_add_const_to_acc(&mut self, offset: i64) { if offset != 0 { self.emit_add_imm_to_acc_impl(offset); } }
@@ -1955,6 +2113,7 @@ impl ArchCodegen for ArmCodegen {
         fn emit_int_clz(&mut self, ty: IrType) => emit_int_clz_impl;
         fn emit_int_ctz(&mut self, ty: IrType) => emit_int_ctz_impl;
         fn emit_int_bswap(&mut self, ty: IrType) => emit_int_bswap_impl;
+        fn emit_int_bitreverse(&mut self, ty: IrType) => emit_int_bitreverse_impl;
         fn emit_int_popcount(&mut self, ty: IrType) => emit_int_popcount_impl;
         fn emit_int_binop(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) => emit_int_binop_impl;
         fn emit_copy_i128(&mut self, dest: &Value, src: &Operand) => emit_copy_i128_impl;

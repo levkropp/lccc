@@ -92,6 +92,7 @@ pub(crate) fn simplify_function(func: &mut IrFunction) -> usize {
     let mut cmp_defs: Vec<Option<CmpDef>> = vec![None; max_id + 1];
     let mut binop_defs: Vec<Option<BinOpDef>> = vec![None; max_id + 1];
     let mut neg_defs: Vec<Option<NegDef>> = vec![None; max_id + 1];
+    let mut value_types: Vec<Option<IrType>> = vec![None; max_id + 1];
     // Track values known to be boolean (0 or 1). This includes Cmp results
     // and bitwise And/Or/Xor of boolean values.
     let mut is_boolean = vec![false; max_id + 1];
@@ -99,6 +100,18 @@ pub(crate) fn simplify_function(func: &mut IrFunction) -> usize {
     // Collect definitions - first pass: mark Cmp results as boolean
     for block in &func.blocks {
         for inst in &block.instructions {
+            match inst {
+                Instruction::BinOp { dest, ty, .. }
+                | Instruction::UnaryOp { dest, ty, .. }
+                | Instruction::Load { dest, ty, .. }
+                | Instruction::ParamRef { dest, ty, .. } => {
+                    set_def(&mut value_types, dest.0, *ty);
+                }
+                Instruction::Cast { dest, to_ty, .. } => {
+                    set_def(&mut value_types, dest.0, *to_ty);
+                }
+                _ => {}
+            }
             match inst {
                 Instruction::Cast { dest, src, from_ty, to_ty } => {
                     set_def(&mut cast_defs, dest.0, CastDef {
@@ -157,7 +170,7 @@ pub(crate) fn simplify_function(func: &mut IrFunction) -> usize {
 
     for block in &mut func.blocks {
         for inst in &mut block.instructions {
-            if let Some(simplified) = try_simplify(inst, &cast_defs, &gep_defs, &cmp_defs, &binop_defs, &neg_defs, &is_boolean) {
+            if let Some(simplified) = try_simplify_with_types(inst, &cast_defs, &gep_defs, &cmp_defs, &binop_defs, &neg_defs, &is_boolean, &value_types) {
                 *inst = simplified;
                 total += 1;
             }
@@ -228,7 +241,7 @@ struct BinOpDef {
 }
 
 /// Try to simplify an instruction using algebraic identities and strength reduction.
-fn try_simplify(
+fn try_simplify_with_types(
     inst: &Instruction,
     cast_defs: &[Option<CastDef>],
     gep_defs: &[Option<GepDef>],
@@ -236,13 +249,14 @@ fn try_simplify(
     binop_defs: &[Option<BinOpDef>],
     neg_defs: &[Option<NegDef>],
     is_boolean: &[bool],
+    value_types: &[Option<IrType>],
 ) -> Option<Instruction> {
     match inst {
         Instruction::BinOp { dest, op, lhs, rhs, ty } => {
             simplify_binop(*dest, *op, lhs, rhs, *ty, binop_defs, neg_defs)
         }
         Instruction::Cast { dest, src, from_ty, to_ty } => {
-            simplify_cast(*dest, src, *from_ty, *to_ty, cast_defs)
+            simplify_cast(*dest, src, *from_ty, *to_ty, cast_defs, value_types)
         }
         Instruction::GetElementPtr { dest, base, offset, ty } => {
             simplify_gep(*dest, *base, offset, *ty, gep_defs)
@@ -277,6 +291,20 @@ fn try_simplify(
     }
 }
 
+#[cfg(test)]
+fn try_simplify(
+    inst: &Instruction,
+    cast_defs: &[Option<CastDef>],
+    gep_defs: &[Option<GepDef>],
+    cmp_defs: &[Option<CmpDef>],
+    binop_defs: &[Option<BinOpDef>],
+    neg_defs: &[Option<NegDef>],
+    is_boolean: &[bool],
+) -> Option<Instruction> {
+    try_simplify_with_types(inst, cast_defs, gep_defs, cmp_defs, binop_defs,
+                            neg_defs, is_boolean, &[])
+}
+
 /// Simplify a Cast instruction.
 ///
 /// Handles:
@@ -289,10 +317,22 @@ fn simplify_cast(
     from_ty: IrType,
     to_ty: IrType,
     def_map: &[Option<CastDef>],
+    value_types: &[Option<IrType>],
 ) -> Option<Instruction> {
     // Identity cast: same type
     if from_ty == to_ty {
         return Some(Instruction::Copy { dest, src: *src });
+    }
+
+    // Some lowering paths conservatively annotate an integer expression as
+    // coming from the target's evaluation width (typically I64), even though
+    // its defining IR instruction already produced the requested narrow type.
+    // In that case the truncation is semantically an identity and retaining it
+    // creates needless extend/truncate moves and hides fusion opportunities.
+    if let Operand::Value(v) = src {
+        if value_types.get(v.0 as usize).copied().flatten() == Some(to_ty) {
+            return Some(Instruction::Copy { dest, src: *src });
+        }
     }
 
     // Constant folding: cast of a constant => new constant

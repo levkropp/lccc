@@ -11,6 +11,8 @@
 
 pub(crate) mod cfg_simplify;
 pub(crate) mod bit_idioms;
+pub(crate) mod aggregate_copy_forward;
+pub(crate) mod block_layout;
 pub(crate) mod constant_fold;
 pub(crate) mod copy_prop;
 pub(crate) mod dce;
@@ -23,6 +25,7 @@ pub(crate) mod ipcp;
 pub(crate) mod iv_strength_reduce;
 pub(crate) mod licm;
 pub(crate) mod loop_analysis;
+pub(crate) mod loop_memory_promote;
 pub(crate) mod univsr;
 pub(crate) mod narrow;
 mod resolve_asm;
@@ -146,19 +149,30 @@ fn run_gvn_licm_ivsr_shared(
             }
         }
 
-        // Run IVSR with shared analysis.
-        // LICM hoists instructions to preheaders but does not add/remove blocks,
-        // so CFG analysis is still valid.
-        // IVSR and Un-IVSR disabled: IVSR creates pointer IVs that replace
-        // index-based GEP addressing with pointer arithmetic. However, when
-        // the original GEP also uses indexed offsets (e.g., in nested loops
-        // where the outer loop's row base and the inner loop's column offset
-        // interact), the pointer increment compounds with the existing offset,
-        // doubling effective addresses. This causes correctness bugs in matmul
-        // and other multi-dimensional array patterns.
-        // TODO: Fix IVSR to correctly handle GEPs in nested loop contexts
-        // where the base pointer is itself a loop-variant value.
-        let _ = run_ivsr; // suppress unused warning
+        // Run IVSR with shared analysis. The transformation now explicitly
+        // rejects loop-variant GEP bases, avoiding the historical nested-loop
+        // double-offset bug while retaining pointer induction for invariant
+        // array bases.
+        if run_ivsr {
+            let t0 = if time_passes { Some(std::time::Instant::now()) } else { None };
+            // One transformation can expose another independent pointer IV in
+            // the same loop (notably the two source/destination GEPs created by
+            // vectorization). Iterate locally; IVSR changes instructions and
+            // phis but not CFG edges, so the shared analysis remains valid.
+            let mut n = 0;
+            for _ in 0..4 {
+                let round = iv_strength_reduce::ivsr_with_analysis(func, &cfg);
+                n += round;
+                if round == 0 { break; }
+            }
+            if let Some(t0) = t0 {
+                eprintln!("[PASS] iter={} ivsr (func {}): {:.4}s ({} changes)", iter, func.name, t0.elapsed().as_secs_f64(), n);
+            }
+            if n > 0 {
+                ivsr_total += n;
+                if i < changed.len() { changed[i] = true; }
+            }
+        }
     }
 
     if time_passes {
@@ -225,6 +239,7 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str) {
     }
     inline::run(module);
 
+
     // TEMP debug: dump IR right after inlining.
     if std::env::var("LCCC_DUMP_IR_INLINE").is_ok() {
         for func in &module.functions {
@@ -256,6 +271,28 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str) {
     crate::ir::mem2reg::promote_allocas_with_params(module);
     constant_fold::run(module);
     copy_prop::run(module);
+    // Copy forwarding can expose another temporary in a copy chain
+    // (`object -> tmp1 -> tmp2 -> field load`), so run to a small fixed point.
+    for _ in 0..8 {
+        if module.for_each_function(aggregate_copy_forward::run) == 0 { break; }
+    }
+    module.for_each_function(loop_memory_promote::run);
+    // Resolve constant branches exposed by inlining before interprocedural
+    // closed-form folding examines the surviving call sites.
+    for _ in 0..3 {
+        let n = module.for_each_function(cfg_simplify::run_function);
+        constant_fold::run(module);
+        copy_prop::run(module);
+        if n == 0 { break; }
+    }
+    // Recursive closed forms can expose another constant recursive call after
+    // copy propagation, so iterate briefly to a fixed point before TCE rewrites
+    // the recurrence into loop form.
+    for _ in 0..4 {
+        if ipcp::fold_closed_form_recursions(module) == 0 { break; }
+        constant_fold::run(module);
+        copy_prop::run(module);
+    }
     simplify::run(module);
     constant_fold::run(module);
     copy_prop::run(module);
@@ -434,11 +471,16 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
         // running this pass for them turns ordinary scalar loops into a compiler
         // panic instead of preserving the valid scalar program.
         // Pass name for CCC_DISABLE_PASSES: "vectorize"
-        if iter == 0 && target == crate::backend::Target::X86_64
+        if iter == 0 && matches!(target, crate::backend::Target::X86_64 | crate::backend::Target::Aarch64)
             && !disabled.contains("vectorize")
         {
+            let vectorize_fn = if target == crate::backend::Target::Aarch64 {
+                vectorize::vectorize_function_two_wide
+            } else {
+                vectorize::vectorize_function
+            };
             let n = timed_pass!("vectorize",
-                run_on_visited(module, &dirty, &mut changed, vectorize::vectorize_function));
+                run_on_visited(module, &dirty, &mut changed, vectorize_fn));
             total_changes += n;
             total_changes_excl_dce += n;
         }
@@ -460,7 +502,9 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
             total_changes += n;
             total_changes_excl_dce += n;
 
-            let n = timed_pass!("bit_idioms", run_on_visited(module, &dirty, &mut changed, bit_idioms::recognize_function));
+            let enable_bit_reverse = target == crate::backend::Target::Aarch64;
+            let n = timed_pass!("bit_idioms", run_on_visited(module, &dirty, &mut changed,
+                |func| bit_idioms::recognize_function(func, enable_bit_reverse)));
             cur_pass_changes[3] += n;
             total_changes += n;
             total_changes_excl_dce += n;
@@ -615,6 +659,18 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
         // Prepare dirty set for next iteration: only re-visit functions that changed.
         std::mem::swap(&mut dirty, &mut changed);
     }
+
+    // DCE can remove aggregate-copy consumers that previously made forwarding
+    // unsafe (for example a full returned struct whose only surviving use is
+    // one field load). Re-run forwarding before final loop promotion.
+    for _ in 0..8 {
+        if module.for_each_function(aggregate_copy_forward::run) == 0 { break; }
+    }
+    module.for_each_function(dce::eliminate_dead_code);
+    // Run memory-recurrence promotion again after CFG and copy cleanup have
+    // exposed canonical natural loops.
+    module.for_each_function(loop_memory_promote::run);
+    module.for_each_function(loop_memory_promote::mark_f64_add_reduction);
 
     // Phase 11: Dead static function elimination.
     // After all optimizations, remove internal-linkage (static) functions that are

@@ -1,6 +1,11 @@
 # Rust build artifacts
 /target/
+/target-sroa/
 **/*.rs.bk
+
+# Crash dumps
+core
+core.*
 
 # CCC submodule build
 /ccc/target/

@@ -306,6 +306,16 @@ pub fn apply_one_reloc(
             w32(out, fp, insn);
         }
 
+        // ── LDR literal (19-bit offset, e.g. FP constant pool loads) ──
+        R_AARCH64_LD_PREL_LO19 => {
+            let offset = (s as i64).wrapping_add(a).wrapping_sub(p as i64);
+            if fp + 4 > out.len() { return Ok(()); }
+            let mut insn = read_u32(out, fp);
+            let imm19 = ((offset >> 2) as u32) & 0x7ffff;
+            insn = (insn & 0xff00001f) | (imm19 << 5);
+            w32(out, fp, insn);
+        }
+
         // ── Test and branch (14-bit offset) ──
         R_AARCH64_TSTBR14 => {
             let offset = (s as i64).wrapping_add(a).wrapping_sub(p as i64);

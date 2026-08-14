@@ -495,7 +495,7 @@ fn detect_cmp_branch_fusion(block: &BasicBlock, use_counts: &[u32]) -> Option<us
 ///
 /// Returns a set of instruction indices that should be skipped because they
 /// will be handled by the preceding Mul's fused emission.
-fn detect_mul_add_fusions(block: &BasicBlock, use_counts: &[u32]) -> FxHashSet<usize> {
+fn detect_mul_add_fusions(block: &BasicBlock, use_counts: &[u32], fuse_float: bool) -> FxHashSet<usize> {
     let mut skip_set = FxHashSet::default();
 
     for (idx, inst) in block.instructions.iter().enumerate() {
@@ -505,8 +505,8 @@ fn detect_mul_add_fusions(block: &BasicBlock, use_counts: &[u32]) -> FxHashSet<u
             _ => continue,
         };
 
-        // Only fuse integer multiplies (not float, not i128)
-        if mul_ty.is_float() || matches!(mul_ty, IrType::I128 | IrType::U128) {
+        // Float fusion is enabled only when the backend has a native implementation.
+        if (mul_ty.is_float() && !fuse_float) || matches!(mul_ty, IrType::F128 | IrType::I128 | IrType::U128) {
             continue;
         }
 
@@ -548,6 +548,39 @@ fn detect_mul_add_fusions(block: &BasicBlock, use_counts: &[u32]) -> FxHashSet<u
     }
 
     skip_set
+}
+
+/// Find adjacent `shift; logical` pairs that AArch64 can encode as one
+/// shifted-register logical instruction.  Requiring one use makes eliding the
+/// standalone shift safe.
+fn detect_shifted_logical_fusions(block: &BasicBlock, use_counts: &[u32]) -> FxHashSet<usize> {
+    let mut logical_indices = FxHashSet::default();
+    for (idx, pair) in block.instructions.windows(2).enumerate() {
+        let (shift_dest, shift_ty) = match &pair[0] {
+            Instruction::BinOp { dest, op, rhs: Operand::Const(_), ty, .. }
+                if matches!(op, crate::ir::reexports::IrBinOp::Shl
+                    | crate::ir::reexports::IrBinOp::LShr
+                    | crate::ir::reexports::IrBinOp::AShr)
+                    && matches!(ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64) => (dest, ty),
+            _ => continue,
+        };
+        if use_counts.get(shift_dest.0 as usize).copied().unwrap_or(0) != 1 {
+            continue;
+        }
+        let (lhs, rhs, logical_ty) = match &pair[1] {
+            Instruction::BinOp { op, lhs, rhs, ty, .. }
+                if matches!(op, crate::ir::reexports::IrBinOp::And
+                    | crate::ir::reexports::IrBinOp::Or
+                    | crate::ir::reexports::IrBinOp::Xor) => (lhs, rhs, ty),
+            _ => continue,
+        };
+        let uses_shift = matches!(lhs, Operand::Value(v) if v.0 == shift_dest.0)
+            || matches!(rhs, Operand::Value(v) if v.0 == shift_dest.0);
+        if uses_shift && logical_ty == shift_ty {
+            logical_indices.insert(idx + 1);
+        }
+    }
+    logical_indices
 }
 
 /// Generate assembly for a module using the given architecture's codegen.
@@ -981,6 +1014,7 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
                 if matches!(op,
                     crate::ir::intrinsics::IntrinsicOp::FmaF64x4
                     | crate::ir::intrinsics::IntrinsicOp::FmaF64x2
+                    | crate::ir::intrinsics::IntrinsicOp::FmaF64x2Hoisted
                     | crate::ir::intrinsics::IntrinsicOp::VecZeroF64x4
                     | crate::ir::intrinsics::IntrinsicOp::VecZeroF64x2
                     | crate::ir::intrinsics::IntrinsicOp::LoadF64x4
@@ -1054,8 +1088,14 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
         // CondBranch terminator, emit a fused compare-and-conditional-jump
         // instead of materializing the boolean result to a register/stack slot.
         let fuse_idx = detect_cmp_branch_fusion(block, &value_use_counts);
-        let mul_add_fusions = detect_mul_add_fusions(block, &value_use_counts);
+        let mul_add_fusions = detect_mul_add_fusions(block, &value_use_counts, cg.supports_fused_float_mul_add());
+        let shifted_logical_fusions = if cg.supports_shifted_logical() {
+            detect_shifted_logical_fusions(block, &value_use_counts)
+        } else {
+            FxHashSet::default()
+        };
         let mut skip_fused_add = false;
+        let mut skip_fused_logical = false;
         let mi_enabled = cg.is_machinst_enabled();
 
         // Compute per-block use counts for liveness-aware MachInst store-back.
@@ -1093,6 +1133,11 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
                 cg.state().current_program_point += 1;
                 continue;
             }
+            if skip_fused_logical {
+                skip_fused_logical = false;
+                cg.state().current_program_point += 1;
+                continue;
+            }
             // Skip GEP instructions whose offset has been folded into Load/Store.
             if let Instruction::GetElementPtr { dest, base, .. } = inst {
                 if gep_fold_map.contains_key(&dest.0) &&
@@ -1119,7 +1164,7 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
                 if mul_add_fusions.contains(&(idx + 1)) {
                     // Only fuse if the multiply temp is NOT register-allocated.
                     // If it IS registered, the standard register-direct path is better.
-                    if cg.get_phys_reg_for_value(dest.0).is_none() {
+                    if cg.get_phys_reg_for_value(dest.0).is_none() || ty.is_float() {
                         if let Some(Instruction::BinOp { dest: add_dest, lhs: add_lhs, rhs: add_rhs, ty: add_ty, .. }) = block.instructions.get(idx + 1) {
                             let mul_is_lhs = matches!(add_lhs, Operand::Value(v) if v.0 == dest.0);
                             let acc_op = if mul_is_lhs { add_rhs } else { add_lhs };
@@ -1128,6 +1173,23 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
                             cg.state().current_program_point += 1;
                             continue;
                         }
+                    }
+                }
+            }
+
+            if let Instruction::BinOp { dest: shift_dest, op: shift_op, lhs: shift_lhs,
+                                        rhs: shift_amount, ty } = inst {
+                if shifted_logical_fusions.contains(&(idx + 1)) {
+                    if let Some(Instruction::BinOp { dest, op: logical_op, lhs, rhs, .. }) =
+                        block.instructions.get(idx + 1)
+                    {
+                        let shift_is_lhs = matches!(lhs, Operand::Value(v) if v.0 == shift_dest.0);
+                        let other = if shift_is_lhs { rhs } else { lhs };
+                        cg.emit_shifted_logical(shift_dest, *shift_op, shift_lhs, shift_amount,
+                                                *logical_op, other, dest, *ty);
+                        skip_fused_logical = true;
+                        cg.state().current_program_point += 1;
+                        continue;
                     }
                 }
             }

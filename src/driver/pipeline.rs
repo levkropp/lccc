@@ -1113,6 +1113,20 @@ impl Driver {
         eliminate_phis(&mut module);
         if time_phases { eprintln!("[TIME] phi elimination: {:.3}s", t7.elapsed().as_secs_f64()); }
 
+        // Final block layout: optimization passes and phi elimination append
+        // new blocks (vector bodies, trampolines, exit blocks) at the end of
+        // `func.blocks`, which scrambles the linearized order the backend's
+        // liveness/regalloc relies on. Re-layout in reverse post-order so loop
+        // bodies and their exit blocks stay contiguous and loop-carried values
+        // don't falsely span calls.
+        if std::env::var("CCC_NO_BLOCK_RELAYOUT").is_err() {
+            for func in &mut module.functions {
+                if !func.is_declaration {
+                    crate::passes::block_layout::relayout_blocks_rpo(func);
+                }
+            }
+        }
+
         // CRITICAL FIX: Renumber all block labels to ensure global uniqueness across all functions
         // This fixes a bug where optimization passes can create duplicate labels
         {

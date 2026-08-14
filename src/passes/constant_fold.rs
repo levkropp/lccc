@@ -776,6 +776,13 @@ fn fold_unaryop(op: IrUnaryOp, src: i64, ty: IrType) -> Option<i64> {
                 (src as u64).swap_bytes() as i64
             }
         }
+        IrUnaryOp::BitReverse => {
+            if is_32bit {
+                (src as u32).reverse_bits() as i64
+            } else {
+                (src as u64).reverse_bits() as i64
+            }
+        }
         IrUnaryOp::Popcount => {
             if is_32bit {
                 (src as u32).count_ones() as i64
@@ -872,6 +879,8 @@ mod tests {
         assert_eq!(fold_unaryop(IrUnaryOp::Clz, 1, IrType::I32), Some(31));
         // 64-bit CLZ of 1 = 63
         assert_eq!(fold_unaryop(IrUnaryOp::Clz, 1, IrType::I64), Some(63));
+        assert_eq!(fold_unaryop(IrUnaryOp::BitReverse, 0x0000_0001, IrType::U32), Some(0x8000_0000));
+        assert_eq!(fold_unaryop(IrUnaryOp::BitReverse, 0x0123_4567_89ab_cdef, IrType::U64), Some(0xf7b3_d591_e6a2_c480u64 as i64));
     }
 
     #[test]
