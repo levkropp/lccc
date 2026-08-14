@@ -7,13 +7,13 @@ use super::emit::{ArmCodegen, arm_int_cond_code, arm_invert_cond_code};
 impl ArmCodegen {
     pub(super) fn emit_float_cmp_impl(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
         if ty == IrType::F32 {
-            self.float_operand_to_reg(lhs, ty, "s0");
-            self.float_operand_to_reg(rhs, ty, "s1");
-            self.state.emit("    fcmp s0, s1");
+            let l = self.float_operand_reg(lhs, ty, "s0");
+            let r = self.float_operand_reg(rhs, ty, "s1");
+            self.state.emit_fmt(format_args!("    fcmp {}, {}", l, r));
         } else {
-            self.float_operand_to_reg(lhs, ty, "d0");
-            self.float_operand_to_reg(rhs, ty, "d1");
-            self.state.emit("    fcmp d0, d1");
+            let l = self.float_operand_reg(lhs, ty, "d0");
+            let r = self.float_operand_reg(rhs, ty, "d1");
+            self.state.emit_fmt(format_args!("    fcmp {}, {}", l, r));
         }
         let cond = match op {
             IrCmpOp::Eq => "eq",

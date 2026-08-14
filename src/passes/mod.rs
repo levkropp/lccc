@@ -18,6 +18,7 @@ pub(crate) mod copy_prop;
 pub(crate) mod dce;
 mod dead_statics;
 pub(crate) mod div_by_const;
+pub(crate) mod fp_const_hoist;
 pub(crate) mod gvn;
 pub(crate) mod if_convert;
 pub(crate) mod inline;
@@ -671,6 +672,13 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
     // exposed canonical natural loops.
     module.for_each_function(loop_memory_promote::run);
     module.for_each_function(loop_memory_promote::mark_f64_add_reduction);
+
+    // Hoist FP constants used in loop bodies into preheader Copies so they can
+    // stay in FP registers across the loop (AArch64 constant-pool literal loads
+    // otherwise sit in the loop's dependency path every iteration).
+    if !disabled.contains("fpconst") {
+        module.for_each_function(fp_const_hoist::run);
+    }
 
     // Phase 11: Dead static function elimination.
     // After all optimizations, remove internal-linkage (static) functions that are
