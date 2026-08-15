@@ -264,6 +264,25 @@ pub trait ArchCodegen {
         false
     }
 
+    /// Whether this backend supports indexed (register+register) addressing
+    /// for folded value-offset GEPs: `ldr/str [base_reg, idx_reg, lsl #shift]`.
+    /// Returns false by default; AArch64 returns true.
+    fn supports_indexed_addr(&self) -> bool {
+        false
+    }
+
+    /// Emit a load using indexed addressing: dest = [base + (index << shift)].
+    /// Returns false if it cannot be emitted (caller falls back to unfolding).
+    fn emit_load_indexed(&mut self, _dest: &Value, _base: &Value, _index: &Value, _shift: u8, _ty: IrType) -> bool {
+        false
+    }
+
+    /// Emit a store using indexed addressing: [base + (index << shift)] = val.
+    /// Returns false if it cannot be emitted (caller falls back to unfolding).
+    fn emit_store_indexed(&mut self, _val: &Operand, _base: &Value, _index: &Value, _shift: u8, _ty: IrType) -> bool {
+        false
+    }
+
     /// Emit a RIP-relative load from a global symbol (folded GlobalAddr + Load).
     /// Used to fold GlobalAddr + Load into a single `movl symbol(%rip), %eax`
     /// (or appropriate variant). Default: panics.

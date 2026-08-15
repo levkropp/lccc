@@ -1818,6 +1818,13 @@ const ARM_TMP_REGS: [&str; 8] = ["x9", "x10", "x11", "x12", "x13", "x14", "x15",
 impl ArchCodegen for ArmCodegen {
     fn supports_fused_float_mul_add(&self) -> bool { true }
     fn supports_shifted_logical(&self) -> bool { true }
+    fn supports_indexed_addr(&self) -> bool { true }
+    fn emit_load_indexed(&mut self, dest: &Value, base: &Value, index: &Value, shift: u8, ty: IrType) -> bool {
+        self.emit_load_indexed_impl(dest, base, index, shift, ty)
+    }
+    fn emit_store_indexed(&mut self, val: &Operand, base: &Value, index: &Value, shift: u8, ty: IrType) -> bool {
+        self.emit_store_indexed_impl(val, base, index, shift, ty)
+    }
     fn emit_shifted_logical(&mut self, _shift_dest: &Value, shift_op: IrBinOp,
                             shift_lhs: &Operand, shift_amount: &Operand,
                             logical_op: IrBinOp, other: &Operand,
