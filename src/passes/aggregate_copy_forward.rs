@@ -178,6 +178,72 @@ fn pointer_paths(func: &IrFunction) -> FxHashMap<u32, (u32, Vec<(Operand, crate:
 /// Redirect construction of a store-only temporary aggregate into the final
 /// memcpy destination.  This turns `build(tmp); memcpy(dst, tmp)` into
 /// `build(dst)` when every use of `tmp` is a same-block GEP/store or that copy.
+/// Hoist the definition of `dest` (and its movable in-block def chain) to the
+/// top of block `bi`, so redirected uses precede neither their new pointer's
+/// definition nor any intermediate computation. Only pure address/value
+/// computations (GEP/BinOp/Cast/Copy) are moved; anything else aborts the
+/// hoist and the caller rejects the candidate.
+fn try_hoist_def_chain(func: &mut IrFunction, bi: usize, dest: Value) -> bool {
+    // Collect the in-block def chain (dependency order).
+    let mut chain: Vec<usize> = Vec::new(); // instruction indices
+    let mut worklist = vec![dest.0];
+    let mut seen = FxHashSet::default();
+    while let Some(v) = worklist.pop() {
+        if !seen.insert(v) {
+            continue;
+        }
+        let mut def_pos = None;
+        for (di, inst) in func.blocks[bi].instructions.iter().enumerate() {
+            if inst.dest().is_some_and(|d| d.0 == v) {
+                def_pos = Some(di);
+                break;
+            }
+        }
+        let Some(di) = def_pos else { continue }; // defined elsewhere/alloca: available
+        let inst = &func.blocks[bi].instructions[di];
+        let movable = matches!(
+            inst,
+            Instruction::GetElementPtr { .. }
+                | Instruction::BinOp { .. }
+                | Instruction::Cast { .. }
+                | Instruction::Copy { .. }
+        );
+        if !movable {
+            return false;
+        }
+        chain.push(di);
+        let mut ops = Vec::new();
+        inst.for_each_used_value(|u| ops.push(u));
+        for u in ops {
+            worklist.push(u);
+        }
+    }
+    // Remove from the block (descending index order), then reinsert at the top
+    // (after leading Alloca/Phi instructions) in dependency order.
+    chain.sort_unstable();
+    let mut moved = Vec::with_capacity(chain.len());
+    for &di in chain.iter().rev() {
+        moved.push(func.blocks[bi].instructions.remove(di));
+    }
+    moved.reverse();
+    // Keep source_spans aligned if present (drop them; debug info only).
+    let spans_present = !func.blocks[bi].source_spans.is_empty();
+    if spans_present {
+        func.blocks[bi].source_spans.clear();
+    }
+    let mut ins = 0;
+    while ins < func.blocks[bi].instructions.len() {
+        match &func.blocks[bi].instructions[ins] {
+            Instruction::Alloca { .. } | Instruction::Phi { .. } => ins += 1,
+            _ => break,
+        }
+    }
+    for inst in moved.into_iter().rev() {
+        func.blocks[bi].instructions.insert(ins, inst);
+    }
+    true
+}
+
 fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
     let paths = pointer_paths(func);
     let roots: FxHashSet<u32> = paths.iter()
@@ -196,6 +262,68 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
         }
     }
     for root in duplicate { copies.remove(&root); }
+    if std::env::var("CCC_DEBUG_AGG").is_ok() {
+        eprintln!("[AGG] func={} candidates={:?}", func.name, copies.keys().collect::<Vec<_>>());
+    }
+
+    // The memcpy dest must be defined before any use we redirect to it.
+    // A dest computed immediately before the copy (e.g. a GEP for the target
+    // field in a fully-unrolled loop body) would leave redirected stores with
+    // a use-before-def. When the dest's definition is a pure address/value
+    // computation, hoist it (and its def chain) to the top of the block so the
+    // redirect is well-ordered.
+    let mut dest_def_idx: FxHashMap<u32, usize> = FxHashMap::default();
+    for (root, &(bi, _ii, dest)) in &copies {
+        for (di, inst) in func.blocks[bi].instructions.iter().enumerate() {
+            if inst.dest().is_some_and(|d| d.0 == dest.0) {
+                dest_def_idx.insert(*root, di);
+                break;
+            }
+        }
+    }
+    // Candidates whose dest def is late in the block: try to hoist, else drop.
+    {
+        let mut to_fix: Vec<(u32, usize, Value)> = Vec::new();
+        for (root, &(bi, copy_i, dest)) in &copies {
+            if let Some(&di) = dest_def_idx.get(root) {
+                // Any root use before the def in the same block is a problem.
+                let mut earliest_use: Option<usize> = None;
+                for (ii, inst) in func.blocks[bi].instructions.iter().enumerate() {
+                    if ii >= copy_i { break; }
+                    let mut used = Vec::new();
+                    inst.for_each_used_value(|v| used.push(v));
+                    if used.iter().any(|v| paths.get(v).is_some_and(|p| p.0 == *root)) {
+                        earliest_use = Some(ii);
+                        break;
+                    }
+                }
+                if earliest_use.is_some_and(|u| u < di) {
+                    to_fix.push((*root, bi, dest));
+                }
+            }
+        }
+        for (root, bi, dest) in to_fix {
+            if try_hoist_def_chain(func, bi, dest) {
+                // Recompute the copy's index after the hoist.
+                if let Some((new_i, _)) = func.blocks[bi]
+                    .instructions
+                    .iter()
+                    .enumerate()
+                    .find(|(_, inst)| matches!(inst, Instruction::Memcpy { dest: d, .. } if d.0 == dest.0))
+                {
+                    if let Some(entry) = copies.get_mut(&root) {
+                        *entry = (bi, new_i, dest);
+                    }
+                }
+                dest_def_idx.insert(root, 0);
+            } else {
+                if std::env::var("CCC_DEBUG_AGG").is_ok() {
+                    eprintln!("[AGG] func={} root={} dropped: dest def chain not hoistable", func.name, root);
+                }
+                copies.remove(&root);
+            }
+        }
+    }
 
     let mut invalid = FxHashSet::default();
     for (bi, block) in func.blocks.iter().enumerate() {
@@ -217,7 +345,20 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
                 let path_merge = matches!(inst, Instruction::Copy { .. } | Instruction::Phi { .. });
                 let ordered = path_merge || ii <= *copy_i;
                 let located = path_merge || bi == *copy_b;
-                if !allowed || !located || !ordered { invalid.insert(*root); }
+                // A use redirected to dest must come after dest's definition.
+                let after_def = match dest_def_idx.get(root) {
+                    Some(&di) if bi == *copy_b && ii < *copy_i => di < ii,
+                    _ => true,
+                };
+                if !allowed || !located || !ordered || !after_def {
+                    if std::env::var("CCC_DEBUG_AGG").is_ok() {
+                        eprintln!(
+                            "[AGG] invalidate root={} at block={} inst={} allowed={} located={} ordered={} after_def={} inst={:?}",
+                            root, bi, ii, allowed, located, ordered, after_def, inst
+                        );
+                    }
+                    invalid.insert(*root);
+                }
             }
         }
     }
@@ -253,6 +394,9 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
         func.blocks[bi].instructions.remove(ii);
         if !func.blocks[bi].source_spans.is_empty() { func.blocks[bi].source_spans.remove(ii); }
         changes += 1;
+    }
+    if std::env::var("CCC_DEBUG_AGG").is_ok() {
+        eprintln!("[AGG] func={} forwarded_changes={} surviving_candidates={}", func.name, changes, copies.len());
     }
     changes
 }

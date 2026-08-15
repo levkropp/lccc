@@ -33,6 +33,7 @@ pub(crate) mod univsr;
 pub(crate) mod narrow;
 mod resolve_asm;
 pub(crate) mod simplify;
+pub(crate) mod store_load_forward;
 pub(crate) mod loop_unroll;
 pub(crate) mod tail_call_elim;
 pub(crate) mod outline_switch;
@@ -276,8 +277,10 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str) {
     copy_prop::run(module);
     // Copy forwarding can expose another temporary in a copy chain
     // (`object -> tmp1 -> tmp2 -> field load`), so run to a small fixed point.
-    for _ in 0..8 {
-        if module.for_each_function(aggregate_copy_forward::run) == 0 { break; }
+    if std::env::var("CCC_NO_AGG_FORWARD").is_err() {
+        for _ in 0..8 {
+            if module.for_each_function(aggregate_copy_forward::run) == 0 { break; }
+        }
     }
     module.for_each_function(loop_memory_promote::run);
     // Resolve constant branches exposed by inlining before interprocedural
@@ -465,6 +468,19 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
                 run_on_visited(module, &dirty, &mut changed, loop_unroll::unroll_loops));
             total_changes += n;
             total_changes_excl_dce += n;
+            if std::env::var("LCCC_DUMP_IR_UNROLL").is_ok() {
+                for func in &module.functions {
+                    if func.is_declaration { continue; }
+                    eprintln!("=== IR(post-unroll) {} ===", func.name);
+                    for (bi, b) in func.blocks.iter().enumerate() {
+                        eprintln!("  block {} (label {}):", bi, b.label.0);
+                        for inst in &b.instructions {
+                            eprintln!("    {:?}", inst);
+                        }
+                        eprintln!("    term: {:?}", b.terminator);
+                    }
+                }
+            }
         }
 
         // Phase 2b-vec: x86-64 vectorization — iter 0 only, EARLY in pipeline.
@@ -669,8 +685,15 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
     // DCE can remove aggregate-copy consumers that previously made forwarding
     // unsafe (for example a full returned struct whose only surviving use is
     // one field load). Re-run forwarding before final loop promotion.
-    for _ in 0..8 {
-        if module.for_each_function(aggregate_copy_forward::run) == 0 { break; }
+    if std::env::var("CCC_NO_AGG_FORWARD").is_err() {
+        for _ in 0..8 {
+            if module.for_each_function(aggregate_copy_forward::run) == 0 { break; }
+        }
+    }
+    // Forward alloca-field stores to later loads of the same constant-offset
+    // field (turns fully-scalarized aggregate memory traffic into SSA values).
+    for _ in 0..4 {
+        if module.for_each_function(store_load_forward::run) == 0 { break; }
     }
     module.for_each_function(dce::eliminate_dead_code);
     // Run memory-recurrence promotion again after CFG and copy cleanup have
