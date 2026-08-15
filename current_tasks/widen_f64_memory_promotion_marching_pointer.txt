@@ -19,4 +19,21 @@ Plan:
 Risk: aliasing safety — must prove no other store in the loop can reach the
 promoted location (same as existing analysis, extended to affine addresses).
 
+Status: DONE (commit 57ab50aa). The alias blocker was not really the
+1-load/1-store rule but alias precision vs marching stores. Built a linear-form
+engine in loop_memory_promote.rs (resolve_lin_form): pointers resolve to
+root + Sum coeff*iv + konst + march*t; invariant candidate vs marching store
+is disjoint when roots+syms match and the store range marches away. Pass now
+also runs to a fixpoint (all eligible pointers promote per run, not just one).
+
+Result: all three bodies[i].v* j-loop accumulators promote to registers.
+nbody 1.68x -> 1.60x vs GCC; geomean 0.597 -> 0.581. 18/18 byte-identical.
+
+Remaining nbody gap (1.6x): GCC vectorizes (x,y) struct component pairs as
+2xF64 NEON and hoists all i-invariant loads. Ours still re-loads mass_j 3x
+per iteration (GVN load CSE blocked by all-or-nothing clobber tracking),
+reloads dt per iteration, and has no component pairing. Next lever: use the
+LinForm engine for GVN/LICM alias precision (load CSE across non-aliasing
+stores) — broader than nbody (spectral_norm, struct-heavy loops).
+
 Started: 2026-08-15

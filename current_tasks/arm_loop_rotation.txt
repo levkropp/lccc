@@ -22,4 +22,10 @@ Plan:
 
 Expected: broad modest win across arith_loop, sieve, mandelbrot, fannkuch.
 
+Status: DONE (commit e5c70e72). rotate_simple_loops peephole pass on AArch64:
+header-tested loops rotate to bottom-tested (cmp + b.cc at latch, guard kept
+at header). Guards: single backedge, no calls/rets/indirect branches, 0-3 pure
+setup instructions ending in the compare. CCC_NO_LOOP_ROTATE gates it.
+Same-run A/B: arith_loop -10.6%, sieve -6.7%. Geomean 0.607 -> 0.597.
+
 Started: 2026-08-15
