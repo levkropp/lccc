@@ -408,6 +408,9 @@ fn label_name(line: &str) -> Option<&str> {
 /// Run peephole optimization on AArch64 assembly text.
 /// Returns the optimized assembly string.
 pub fn peephole_optimize(asm: String) -> String {
+    if std::env::var("CCC_NO_PEEPHOLE").is_ok() {
+        return asm;
+    }
     let mut lines: Vec<String> = asm.lines().map(String::from).collect();
     let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
     let n = lines.len();

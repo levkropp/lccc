@@ -248,7 +248,20 @@ impl ArmCodegen {
                     return;
                 }
                 // rhs not register-assigned: load it into x0 as scratch.
-                // (lhs is either in its own register or preloaded into dest.)
+                // If lhs is also not register-assigned, its load into dest goes
+                // through x0 too — so lhs must be loaded FIRST, otherwise it
+                // clobbers the rhs already sitting in x0.
+                if lhs_phys.is_none() {
+                    self.operand_to_callee_reg(lhs, dest_phys);
+                    self.operand_to_x0(rhs);
+                    if use_32bit {
+                        self.state.emit_fmt(format_args!("    {} {}, {}, w0", mnemonic, dest_name_32, dest_name_32));
+                    } else {
+                        self.state.emit_fmt(format_args!("    {} {}, {}, x0", mnemonic, dest_name, dest_name));
+                    }
+                    self.state.reg_cache.invalidate_acc();
+                    return;
+                }
                 self.operand_to_x0(rhs);
                 emit3!(|_, is32| if is32 { "w0".to_string() } else { "x0".to_string() });
                 self.state.reg_cache.invalidate_acc();
