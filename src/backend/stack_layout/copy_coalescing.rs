@@ -383,6 +383,10 @@ pub(super) fn build_copy_alias_map(
             }
             let already_aliased: FxHashSet<u32> =
                 raw_aliases.iter().map(|&(a, _)| a).collect();
+            // Only one NEW slot alias per phi dest: two backedge sources sharing
+            // the dest's slot could see each other's writes (unlike register
+            // coalescing, there is no per-source interval conflict check here).
+            let mut claimed_dests: FxHashSet<u32> = FxHashSet::default();
             for (phi_dest, backedge_src) in detect_phi_coalesce_groups(func, liveness) {
                 if std::env::var("CCC_DEBUG_LOOP_PHI").is_ok() {
                     eprintln!(
@@ -414,6 +418,9 @@ pub(super) fn build_copy_alias_map(
                 }
                 if !def_ty_ok.get(&backedge_src).copied().unwrap_or(false) {
                     continue;
+                }
+                if !claimed_dests.insert(phi_dest) {
+                    continue; // a source already claims this dest's slot
                 }
                 raw_aliases.push((backedge_src, phi_dest));
                 phi_web_aliases.insert(backedge_src); // force-overwrite at resolve

@@ -1998,6 +1998,20 @@ impl ArchCodegen for ArmCodegen {
         let is_promoted = self.loop_promoted_f64_values.iter().any(|v| v.0 == dest.0)
             || src_value.is_some_and(|src| self.loop_promoted_f64_values.iter().any(|v| v.0 == src.0));
         if is_promoted {
+            // When FP phi coalescing gave src and dest the same register the
+            // copy is a no-op — skip the d0 round-trip (fmov d0, dN; fmov dN, d0).
+            let dest_fp = self.get_phys_reg_for_value(dest.0).filter(|r| is_arm_fp_phys(*r));
+            let src_fp = src_value
+                .and_then(|v| self.get_phys_reg_for_value(v.0))
+                .filter(|r| is_arm_fp_phys(*r));
+            if let (Some(d), Some(s)) = (dest_fp, src_fp) {
+                if d != s {
+                    self.state.emit_fmt(format_args!(
+                        "    fmov {}, {}", arm_fp_name(d, IrType::F64), arm_fp_name(s, IrType::F64)));
+                    self.state.reg_cache.invalidate_acc();
+                }
+                return;
+            }
             self.float_operand_to_reg(src, IrType::F64, "d0");
             self.store_float_reg(dest, IrType::F64, "d0");
             self.state.reg_cache.invalidate_acc();

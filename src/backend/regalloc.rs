@@ -1502,8 +1502,16 @@ pub(crate) fn detect_phi_coalesce_groups(
     //   - The dest is a multi-def value (phi dest)
     //   - The source is a Value (not a constant)
     //   - The copy is in a block with loop_depth > 0
+    //
+    // A phi dest may have several such copies (loop-entry initialization from
+    // one variable plus the true backedge update, or multiple latches via
+    // `continue`). All pairs are returned: the per-pair safety checks below
+    // plus the consumers' own conflict checks (register assignment overlap,
+    // phi-web interference) make multi-pair coalescing sound. Without this,
+    // the first copy found (often the entry copy) blocked coalescing of the
+    // true backedge copy — e.g. struct_copy's FP accumulator, where the entry
+    // copy (183 <- 182) shadowed the backedge copy (183 <- 74).
     let mut groups: Vec<(u32, u32)> = Vec::new();
-    let mut seen_phi_dests: FxHashSet<u32> = FxHashSet::default();
 
     for (block_idx, block) in func.blocks.iter().enumerate() {
         let depth = liveness.block_loop_depth.get(block_idx).copied().unwrap_or(0);
@@ -1513,7 +1521,7 @@ pub(crate) fn detect_phi_coalesce_groups(
 
         for inst in &block.instructions {
             if let Instruction::Copy { dest, src: Operand::Value(src_val) } = inst {
-                if multi_def.contains(&dest.0) && !seen_phi_dests.contains(&dest.0) {
+                if multi_def.contains(&dest.0) {
                     // Don't coalesce if src is itself a multi-def (swap cycle temporaries)
                     if !multi_def.contains(&src_val.0) {
                         // Safety: don't coalesce if the phi dest is used AFTER
@@ -1603,7 +1611,6 @@ pub(crate) fn detect_phi_coalesce_groups(
                                     dest.0, src_val.0, block_idx);
                             }
                             groups.push((dest.0, src_val.0));
-                            seen_phi_dests.insert(dest.0);
                         } else if std::env::var("CCC_DEBUG_PHI_COALESCE").is_ok() {
                             eprintln!("[PHI_COALESCE] BLOCKED phi_dest=Value({}) with backedge_src=Value({}) in block {} (used_after={}, cross_block={})",
                                 dest.0, src_val.0, block_idx, phi_dest_used_after_src, src_has_cross_block_use);
