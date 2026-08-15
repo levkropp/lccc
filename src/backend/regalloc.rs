@@ -608,6 +608,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 if std::env::var("CCC_DEBUG_VECREG").is_ok() && vector_values.contains(vid) {
                     eprintln!("[VECREG]   assigned v{} -> reg {}", vid, reg.0);
                 }
+                if std::env::var("CCC_DEBUG_FPREG").is_ok() {
+                    eprintln!("[FPREG]   assigned v{} -> reg {} (pool size {})", vid, reg.0, config.xmm_regs.len());
+                }
             }
             for (vid, reg) in xmm_allocator.assignments {
                 assignments.insert(vid, reg);

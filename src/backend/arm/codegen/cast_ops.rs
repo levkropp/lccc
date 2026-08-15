@@ -135,6 +135,30 @@ impl ArmCodegen {
         if crate::backend::f128_softfloat::f128_emit_cast(self, dest, src, from_ty, to_ty) {
             return;
         }
+        // Integer widening (e.g. array-index I32 -> I64) where both source and
+        // dest are register-assigned: extend directly between registers, no
+        // x0 round-trip. This is on the hot path of every indexed access.
+        if let CastKind::IntWiden { .. } = classify_cast(from_ty, to_ty) {
+            let src_phys = self.operand_reg(src).filter(|r| !is_arm_fp_phys(*r));
+            let dest_phys = self.get_phys_reg_for_value(dest.0).filter(|r| !is_arm_fp_phys(*r));
+            if let (Some(sp), Some(dp)) = (src_phys, dest_phys) {
+                let s32 = callee_saved_name_32(sp);
+                let d64 = callee_saved_name(dp);
+                let d32 = callee_saved_name_32(dp);
+                let signed = !from_ty.is_unsigned();
+                match (signed, from_ty) {
+                    (true, IrType::I8) => self.state.emit_fmt(format_args!("    sxtb {}, {}", d64, s32)),
+                    (true, IrType::I16) => self.state.emit_fmt(format_args!("    sxth {}, {}", d64, s32)),
+                    (true, IrType::I32) => self.state.emit_fmt(format_args!("    sxtw {}, {}", d64, s32)),
+                    (false, IrType::U8) => self.state.emit_fmt(format_args!("    and {}, {}, #0xff", d32, s32)),
+                    (false, IrType::U16) => self.state.emit_fmt(format_args!("    and {}, {}, #0xffff", d32, s32)),
+                    (false, IrType::U32) => self.state.emit_fmt(format_args!("    mov {}, {}", d32, s32)),
+                    _ => {}
+                }
+                self.state.reg_cache.invalidate_acc();
+                return;
+            }
+        }
         // Integer-to-float casts whose result has an FP allocation can write
         // that register directly.  The generic accumulator convention would
         // otherwise round-trip through x0 (`scvtf d0; fmov x0,d0; fmov dN,x0`).
