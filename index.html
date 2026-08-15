@@ -24,9 +24,9 @@ title: LCCC — Lev's Claude's C Compiler
   <h1><span class="l">l</span><span class="rest">ccc</span></h1>
   <p class="hero-sub">
     An optimized fork of <a href="https://github.com/anthropics/claudes-c-compiler" style="color:var(--amber)">CCC</a>
-    — Claude's C Compiler — with a two-pass linear-scan register allocator,
-    tail-call elimination, phi-copy stack coalescing, loop unrolling, and
-    FP intrinsic lowering, targeting x86-64, AArch64, RISC-V 64, and i686.
+    — Claude's C Compiler — with a linear-scan register allocator, hot-loop register steal,
+    phi coalescing for registers and stack slots, SIMD auto-vectorization (AVX2 · NEON),
+    and recursion-to-iteration transforms. Targets x86-64, AArch64, RISC-V 64, and i686.
   </p>
   <div class="hero-actions">
     <a class="btn btn-primary" href="/lccc/docs/getting-started">Get Started</a>
@@ -44,12 +44,12 @@ title: LCCC — Lev's Claude's C Compiler
         </tr>
       </thead>
       <tbody>
-        <tr><td><code>arith_loop</code></td><td>0.139s</td><td>0.088s</td><td class="slower">1.6×</td></tr>
-        <tr><td><code>sieve</code></td><td>0.073s</td><td>0.047s</td><td class="slower">1.6×</td></tr>
-        <tr><td><code>qsort</code></td><td>0.137s</td><td>0.105s</td><td class="slower">1.3×</td></tr>
-        <tr><td><code>fib(40)</code></td><td class="faster">0.000s</td><td>0.146s</td><td class="faster">478× faster</td></tr>
-        <tr><td><code>matmul</code></td><td>0.010s</td><td>0.006s</td><td class="slower">1.8×</td></tr>
-        <tr><td><code>tce_sum</code></td><td class="faster">0.008s</td><td>0.008s</td><td class="faster">≈equal</td></tr>
+        <tr><td><code>arith_loop</code></td><td>0.045s</td><td>0.031s</td><td class="slower">1.47×</td></tr>
+        <tr><td><code>matmul</code></td><td class="faster">0.0029s</td><td>0.0029s</td><td class="faster">1.01× parity</td></tr>
+        <tr><td><code>spectral_norm</code></td><td>0.175s</td><td>0.137s</td><td class="slower">1.28×</td></tr>
+        <tr><td><code>fib(40)</code></td><td class="faster">0.000s</td><td>0.094s</td><td class="faster">~500× faster</td></tr>
+        <tr><td><code>bitops</code></td><td class="faster">0.103s</td><td>0.172s</td><td class="faster">1.7× faster</td></tr>
+        <tr><td><code>fannkuch</code></td><td>3.82s</td><td>1.97s</td><td class="slower">1.94×</td></tr>
       </tbody>
     </table>
   </div>
@@ -67,9 +67,9 @@ title: LCCC — Lev's Claude's C Compiler
 <span class="c-dim">│</span>   <span class="c-dim">│</span>  <span class="c-teal">optimizer</span>: GVN · LICM · IPCP · DCE · const-fold · inline        <span class="c-dim">│</span>
 <span class="c-dim">│</span>   <span class="c-dim">▼</span>                                                                   <span class="c-dim">│</span>
 <span class="c-dim">│</span>  <span class="c-em">Optimized IR</span>                                                        <span class="c-dim">│</span>
-<span class="c-dim">│</span>   <span class="c-dim">│</span>  <span class="c-amb">regalloc</span> <span class="c-dim">(LCCC)</span>: two-pass linear scan over live intervals         <span class="c-dim">│</span>
-<span class="c-dim">│</span>   <span class="c-dim">│</span>    <span class="c-dim">pass 1:</span> <span class="c-amb">callee-saved</span> <span class="c-dim">↔ all eligible values</span>                   <span class="c-dim">│</span>
-<span class="c-dim">│</span>   <span class="c-dim">│</span>    <span class="c-dim">pass 2:</span> <span class="c-teal">caller-saved</span> <span class="c-dim">↔ non-call-spanning unallocated values</span>   <span class="c-dim">│</span>
+<span class="c-dim">│</span>   <span class="c-dim">│</span>  <span class="c-amb">regalloc</span> <span class="c-dim">(LCCC)</span>: linear scan over live intervals                  <span class="c-dim">│</span>
+<span class="c-dim">│</span>   <span class="c-dim">│</span>    <span class="c-dim">pools:</span> <span class="c-amb">callee-saved</span> <span class="c-dim">·</span> <span class="c-teal">caller-saved</span> <span class="c-dim">·</span> <span class="c-amb">FP/SIMD</span>                    <span class="c-dim">│</span>
+<span class="c-dim">│</span>   <span class="c-dim">│</span>    <span class="c-dim">+ post-scan steal for hot loop-carried values</span>               <span class="c-dim">│</span>
 <span class="c-dim">│</span>   <span class="c-dim">▼</span>                                                                   <span class="c-dim">│</span>
 <span class="c-dim">│</span>  <span class="c-em">Machine code</span>  <span class="c-dim">x86-64 · AArch64 · RISC-V 64 · i686</span>                 <span class="c-dim">│</span>
 <span class="c-dim">│</span>   <span class="c-dim">│</span>  <span class="c-teal">standalone assembler + linker</span> <span class="c-dim">(no external toolchain)</span>           <span class="c-dim">│</span>
@@ -94,7 +94,7 @@ title: LCCC — Lev's Claude's C Compiler
     <div class="card">
       <div class="card-icon">⚡</div>
       <h3>Linear-scan register allocator</h3>
-      <p>Two-pass allocation: callee-saved for all eligible values, then caller-saved for non-call-spanning remainder. Priority-weighted by loop depth.</p>
+      <p>Callee-saved, caller-saved, and FP/SIMD pools over live intervals — plus a post-scan steal that gives hot loop-carried values registers won by cold early starters.</p>
     </div>
     <div class="card">
       <div class="card-icon">🔩</div>
@@ -104,12 +104,12 @@ title: LCCC — Lev's Claude's C Compiler
     <div class="card">
       <div class="card-icon">🏗</div>
       <h3>Four architectures</h3>
-      <p>x86-64, AArch64, RISC-V 64, i686. The same allocator improvements apply everywhere — architecture-agnostic <code>PhysReg</code> abstraction.</p>
+      <p>x86-64, AArch64, RISC-V 64, i686. Architecture-agnostic <code>PhysReg</code> allocation; per-target SIMD (AVX2, NEON) and peephole pipelines.</p>
     </div>
     <div class="card">
       <div class="card-icon">🔭</div>
-      <h3>518 tests passing</h3>
-      <p>518 unit tests pass. Correctness-first — all four phases (linear scan, TCE, phi-copy coalescing, loop unrolling) maintain byte-identical output to GCC.</p>
+      <h3>536 tests passing</h3>
+      <p>536 unit tests, 18/18 benchmark outputs byte-identical to GCC, and the SQLite amalgamation (260K lines) compiles and runs correctly.</p>
     </div>
   </div>
 </section>
@@ -118,37 +118,35 @@ title: LCCC — Lev's Claude's C Compiler
 
 <!-- ── Allocator ─────────────────────────────────────────────────────────── -->
 <section id="allocator">
-  <div class="section-label">Phases 2–4</div>
-  <h2>Linear scan · tail-call elim · phi-copy coalescing · loop unrolling · FP intrinsics</h2>
+  <div class="section-label">Register allocation</div>
+  <h2>Linear scan · register steal · phi coalescing · NEON/AVX2 vectorization</h2>
   <p>
-    The old CCC allocator uses three greedy phases. LCCC replaces the allocation
-    core with a proper linear scan (Phase 2), adds tail-call-to-loop conversion (Phase 3a),
-    eliminates redundant phi-copy stack slots in loop backedges (Phase 3b),
-    and Phase 4 adds loop unrolling and FP intrinsic lowering.
+    The old CCC allocator uses three greedy phases over a conservative eligibility whitelist.
+    LCCC replaces the allocation core with a linear scan over live intervals, rebalances hot
+    loop-carried values into registers after the scan (a conflict-safe steal, since in-scan
+    eviction miscompiles), and coalesces loop-backedge copies onto the phi dest's register —
+    or its stack slot when both are spilled, deleting the per-iteration load+store shuffle.
   </p>
 
   <div class="code-block">
-    <div class="code-block-header">regalloc — Phase 1: callee-saved linear scan</div>
-    <pre><span class="cm">// All eligible IR values compete for callee-saved registers.</span>
-<span class="cm">// Safe across calls; better coverage than old "call-spanning only" Phase 1.</span>
-<span class="kw">let</span> phase1_intervals = filter_eligible_intervals(&amp;liveness, &amp;eligible);
-<span class="kw">let</span> phase1_ranges    = build_live_ranges(&amp;phase1_intervals, &amp;liveness.block_loop_depth, func);
-<span class="kw">let mut</span> allocator    = LinearScanAllocator::new(phase1_ranges, config.available_regs.clone());
-allocator.run();   <span class="cm">// expire → find_free → evict-or-spill</span></pre>
+    <div class="code-block-header">regalloc — post-scan steal for hot loop-carried values</div>
+    <pre><span class="cm">// The scan assigns registers in start order, so cold function-spanning values</span>
+<span class="cm">// (array bases, globals) win every callee-saved register. For each hot</span>
+<span class="cm">// loop-carried phi value the scan MISSED:</span>
+<span class="kw">for</span> &(vid, hot_count) <span class="kw">in</span> &amp;candidates {
+    <span class="cm">// pick the register whose CONFLICTING holders are coldest…</span>
+    <span class="cm">// …and fully deallocate them to the stack. Whole-interval dealloc,</span>
+    <span class="cm">// never range splitting — safe where in-scan eviction was not.</span>
+    assignments.insert(vid, stolen_reg);
+}</pre>
   </div>
 
   <div class="code-block">
-    <div class="code-block-header">regalloc — Phase 2: caller-saved linear scan</div>
-    <pre><span class="cm">// Unallocated, non-call-spanning values get caller-saved registers.</span>
-<span class="cm">// Caller-saved regs are destroyed by calls, so we must not assign them</span>
-<span class="cm">// to values that cross call boundaries.</span>
-<span class="kw">let</span> phase2_intervals = liveness.intervals.iter()
-    .filter(|iv| eligible.contains(&amp;iv.value_id))
-    .filter(|iv| !assignments.contains_key(&amp;iv.value_id))
-    .filter(|iv| !spans_any_call(iv, call_points))
-    .collect();
-<span class="kw">let mut</span> caller_alloc = LinearScanAllocator::new(phase2_ranges, config.caller_saved_regs.clone());
-caller_alloc.run();</pre>
+    <div class="code-block-header">stack layout — loop-backedge slot coalescing</div>
+    <pre><span class="cm">// v_old = copy v_new  (backedge). If the phi-coalesce detector proves</span>
+<span class="cm">// v_old is dead after v_new is defined, v_new borrows v_old's slot:</span>
+<span class="cm">// the copy becomes a same-slot no-op — no ldr+str per iteration.</span>
+raw_aliases.push((backedge_src, phi_dest));  <span class="cm">// certified by detect_phi_coalesce_groups</span></pre>
   </div>
 </section>
 
@@ -157,10 +155,10 @@ caller_alloc.run();</pre>
 <!-- ── Benchmarks ────────────────────────────────────────────────────────── -->
 <section id="benchmarks">
   <div class="section-label">Performance</div>
-  <h2>Benchmark results — LCCC vs CCC vs GCC -O2</h2>
+  <h2>Benchmark results — LCCC vs GCC -O2 (AArch64)</h2>
   <p>
-    Best-of-5 wall-clock time. All outputs are identical. Run with
-    <code>python3 lccc-improvements/benchmarks/bench.py --reps 5</code>.
+    Best-of-5 wall-clock time. All 18 outputs are byte-identical to GCC. Run with
+    <code>python3 tests/benchmark/run_benchmarks.py --reps 5</code>.
   </p>
 
   <div class="table-wrap">
@@ -170,83 +168,69 @@ caller_alloc.run();</pre>
           <th>Benchmark</th>
           <th>Description</th>
           <th>LCCC</th>
-          <th>CCC</th>
           <th>GCC -O2</th>
-          <th>LCCC vs CCC</th>
           <th>LCCC vs GCC</th>
         </tr>
       </thead>
       <tbody>
         <tr>
           <td><code>arith_loop</code></td>
-          <td>32-var arithmetic, 10M iters</td>
-          <td class="faster">0.103s</td>
-          <td>0.146s</td>
-          <td class="baseline">0.068s</td>
-          <td class="faster">+42% faster</td>
-          <td class="slower">1.50×</td>
-        </tr>
-        <tr>
-          <td><code>sieve</code></td>
-          <td>Primes to 10M</td>
-          <td class="faster">0.036s</td>
+          <td>32-var arithmetic, register pressure</td>
           <td>0.045s</td>
-          <td class="baseline">0.024s</td>
-          <td class="faster">+25% faster</td>
-          <td class="slower">1.50×</td>
-        </tr>
-        <tr>
-          <td><code>qsort</code></td>
-          <td>Sort 1M integers</td>
-          <td>0.096s</td>
-          <td>0.095s</td>
-          <td class="baseline">0.087s</td>
-          <td class="slower">≈equal</td>
-          <td class="slower">1.10×</td>
-        </tr>
-        <tr>
-          <td><code>fib(40)</code></td>
-          <td>Recursive Fibonacci</td>
-          <td>0.352s</td>
-          <td>0.354s</td>
-          <td class="baseline">0.096s</td>
-          <td class="slower">≈equal</td>
-          <td class="slower">3.68×</td>
+          <td class="baseline">0.031s</td>
+          <td class="slower">1.47×</td>
         </tr>
         <tr>
           <td><code>matmul</code></td>
           <td>256×256 double matrix multiply</td>
-          <td class="faster">0.020s</td>
-          <td>0.029s</td>
-          <td class="baseline">0.004s</td>
-          <td class="faster">+45% faster</td>
-          <td class="slower">4.86×</td>
+          <td class="faster">0.0029s</td>
+          <td class="baseline">0.0029s</td>
+          <td class="faster">1.01× parity</td>
         </tr>
         <tr>
-          <td><code>tce_sum</code></td>
-          <td>Tail-recursive sum(10M)</td>
-          <td class="faster">0.008s</td>
-          <td>1.09s</td>
-          <td class="baseline">0.008s</td>
-          <td class="faster">139× faster</td>
-          <td class="slower">≈equal</td>
+          <td><code>spectral_norm</code></td>
+          <td>FP dense loops</td>
+          <td>0.175s</td>
+          <td class="baseline">0.137s</td>
+          <td class="slower">1.28×</td>
+        </tr>
+        <tr>
+          <td><code>fib(40)</code></td>
+          <td>Recursive Fibonacci</td>
+          <td class="faster">0.000s</td>
+          <td class="baseline">0.094s</td>
+          <td class="faster">~500× faster</td>
+        </tr>
+        <tr>
+          <td><code>bitops</code></td>
+          <td>popcount / clz / bit reverse</td>
+          <td class="faster">0.103s</td>
+          <td class="baseline">0.172s</td>
+          <td class="faster">1.7× faster</td>
+        </tr>
+        <tr>
+          <td><code>fannkuch</code></td>
+          <td>Fannkuch-Redux permutations</td>
+          <td>3.82s</td>
+          <td class="baseline">1.97s</td>
+          <td class="slower">1.94×</td>
         </tr>
       </tbody>
     </table>
   </div>
 
   <p style="margin-top:1rem">
-    The largest gains are on register-pressure code (linear scan + phi-copy coalescing),
-    tail-recursive code (TCE), and matrix multiply (FP intrinsic lowering, Phase 4).
-    The remaining matmul gap is GCC's AVX2 auto-vectorization — a Phase 5 target.
-    See the <a href="/lccc/docs/roadmap">roadmap</a> for what's next.
+    Across the full 18-benchmark suite LCCC is at <strong>~1.34× of GCC -O2</strong>
+    (0.64× geomean including the two ~500× recursion-to-iteration wins), with
+    <code>matmul</code> at parity and <code>bitops</code> faster than GCC.
+    Full table and per-optimization analysis on the
+    <a href="/lccc/docs/benchmarks">benchmarks page</a>.
   </p>
 
   <div class="badges">
-    <span class="badge badge-amber">✓ all outputs match GCC</span>
-    <span class="badge badge-teal">518 unit tests passing</span>
-    <span class="badge badge-gray">GCC 15.2.0 · Ubuntu</span>
-    <span class="badge badge-gray">x86-64 · -O2</span>
+    <span class="badge badge-amber">✓ 18/18 outputs match GCC</span>
+    <span class="badge badge-teal">536 unit tests passing</span>
+    <span class="badge badge-gray">GCC -O2 · AArch64 Linux</span>
   </div>
 </section>
 
@@ -255,33 +239,33 @@ caller_alloc.run();</pre>
 <!-- ── Updates ──────────────────────────────────────────────────────────── -->
 <section id="updates">
   <div class="section-label">Latest</div>
-  <h2>What's new in Phase 10</h2>
+  <h2>What's new</h2>
   <p>
-    Phase 12 brings LCCC within <strong>1.3–1.6× of GCC -O2</strong> across all benchmarks,
-    and <strong>478× faster than GCC</strong> on recursive Fibonacci — with constant-immediate
-    stores, SIB address folding, accumulator ALU+store folding, and a register
-    allocator loop-depth priority fix.
+    Recent work on the AArch64 backend moved the suite geomean from 0.86× to
+    <strong>0.64× of GCC -O2</strong> — including a register steal for hot loop values,
+    loop-backedge stack-slot coalescing, and NEON/F64 loop promotion — plus several
+    latent miscompile fixes found along the way.
   </p>
   <div class="cards">
     <div class="card">
-      <div class="card-icon">🔁</div>
-      <h3>Binary recursion → iteration</h3>
-      <p>Detects <code>f(n) = f(n-1) + f(n-2)</code> and converts exponential O(2^n) recursion to O(n) iterative loop. <code>fib(40)</code>: 0.001 s vs GCC's 0.194 s.</p>
+      <div class="card-icon">🎯</div>
+      <h3>Register steal</h3>
+      <p>Hot inner-loop-carried values (IVs, accumulators, carried pointers) take registers from provably colder scan winners — whole-interval deallocation, never range splitting. fannkuch 2.69× → 1.94×.</p>
+    </div>
+    <div class="card">
+      <div class="card-icon">🧩</div>
+      <h3>Loop-backedge slot coalescing</h3>
+      <p>A spilled loop variable's update shares the variable's own stack slot, deleting the per-iteration <code>ldr</code>+<code>str</code> shuffle. arith_loop 2.09× → 1.47×.</p>
     </div>
     <div class="card">
       <div class="card-icon">🧮</div>
-      <h3>AVX2 FMA3 vectorization</h3>
-      <p>MatMul inner loop uses <code>vfmadd231pd</code> — fused multiply-add in a single instruction. Correct innermost-loop detection, SIB addressing, remainder loops.</p>
+      <h3>NEON + F64 loop promotion</h3>
+      <p>Register-resident F64x2/I32x4 vector ops, <code>fmadd</code> fusion, FP constant hoisting, and loop accumulators promoted into d24–d31. matmul at parity with GCC -O2.</p>
     </div>
     <div class="card">
-      <div class="card-icon">📊</div>
-      <h3>XMM register allocation</h3>
-      <p>F64 values allocated to xmm2–xmm7, freeing GPR pressure. Combined with frame pointer omission, this gives the allocator up to 17 usable registers.</p>
-    </div>
-    <div class="card">
-      <div class="card-icon">🔗</div>
-      <h3>Cross-block store forwarding</h3>
-      <p>Callee-saved register mappings preserved across loop headers. Copy propagation flows through conditional jumps. Eliminates redundant stack traffic.</p>
+      <div class="card-icon">🔁</div>
+      <h3>Binary recursion → iteration</h3>
+      <p>Detects <code>f(n) = f(n-1) + f(n-2)</code> and converts exponential O(2ⁿ) recursion to an O(n) iterative loop. <code>fib(40)</code> and <code>ackermann(3,11)</code>: ~500× faster than GCC.</p>
     </div>
   </div>
   <p style="margin-top:1rem">
@@ -305,7 +289,7 @@ caller_alloc.run();</pre>
         <h4>Clone the repo</h4>
         <div class="code-block">
           <div class="code-block-header">shell</div>
-          <pre>git clone --recurse-submodules https://github.com/levkropp/lccc.git
+          <pre>git clone https://github.com/levkropp/lccc.git
 cd lccc</pre>
         </div>
       </div>
@@ -317,8 +301,8 @@ cd lccc</pre>
         <div class="code-block">
           <div class="code-block-header">shell</div>
           <pre>cargo build --release
-<span class="cm"># Binary at target/release/ccc (x86-64)</span>
-<span class="cm"># Also: ccc-arm, ccc-riscv, ccc-i686</span></pre>
+<span class="cm"># Binary at target/release/lccc (target picked by host/argv[0])</span>
+<span class="cm"># Also: lccc-x86, lccc-arm, lccc-riscv, lccc-i686</span></pre>
         </div>
       </div>
     </div>
@@ -328,8 +312,8 @@ cd lccc</pre>
         <h4>Compile a C program</h4>
         <div class="code-block">
           <div class="code-block-header">shell</div>
-          <pre>GCC_INC=<span class="st">"-I/usr/lib/gcc/x86_64-linux-gnu/$(gcc -dumpversion)/include"</span>
-./target/release/ccc <span class="kw">$GCC_INC</span> -O2 -o hello hello.c
+          <pre>GCC_INC=<span class="st">"-I$(gcc -print-file-name=include)"</span>
+./target/release/lccc <span class="kw">$GCC_INC</span> -O2 -o hello hello.c
 ./hello</pre>
         </div>
       </div>
@@ -340,7 +324,7 @@ cd lccc</pre>
         <h4>Run the benchmark suite</h4>
         <div class="code-block">
           <div class="code-block-header">shell</div>
-          <pre>python3 lccc-improvements/benchmarks/bench.py --reps 5 --md results.md</pre>
+          <pre>python3 tests/benchmark/run_benchmarks.py --reps 5</pre>
         </div>
       </div>
     </div>
@@ -348,7 +332,7 @@ cd lccc</pre>
 
   <div class="badges" style="margin-top:2rem">
     <span class="badge badge-amber">Rust stable 2021</span>
-    <span class="badge badge-teal">Linux · x86-64 host</span>
+    <span class="badge badge-teal">Linux · macOS hosts</span>
     <span class="badge badge-gray">MIT OR Apache-2.0 OR BSD-2-Clause</span>
   </div>
 </section>

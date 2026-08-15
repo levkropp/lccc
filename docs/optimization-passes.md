@@ -98,16 +98,16 @@ Replaces `idiv`/`div` instructions (20–90 cycle latency on modern CPUs) with m
 For debugging, individual passes can be disabled:
 
 ```bash
-CCC_DISABLE_PASSES="gvn,licm" ./target/release/ccc input.c -o output
-CCC_DISABLE_PASSES="all"      ./target/release/ccc input.c -o output
+CCC_DISABLE_PASSES="gvn,licm" ./target/release/lccc input.c -o output
+CCC_DISABLE_PASSES="all"      ./target/release/lccc input.c -o output
 ```
 
-Pass names: `cfg`, `copyprop`, `narrow`, `simplify`, `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `inline`, `ivsr`, `divconst`.
+Pass names: `cfg`, `copyprop`, `narrow`, `simplify`, `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `inline`, `ivsr`, `divconst`, `tce`, `unroll`, `vectorize`.
 
 Timing data is available via:
 
 ```bash
-CCC_TIME_PASSES=1 ./target/release/ccc input.c -o output 2>&1 | grep PASS
+CCC_TIME_PASSES=1 ./target/release/lccc input.c -o output 2>&1 | grep PASS
 ```
 
 ## LCCC-Specific Passes
@@ -143,15 +143,15 @@ TCE runs once after inlining, before the main optimization loop, so that LICM, I
 
 This is a backend optimization in `src/backend/stack_layout/copy_coalescing.rs`, not a pass in the traditional sense. It runs during stack layout, before code generation.
 
-When CCC's phi elimination lowers SSA phi nodes to Copy instructions, it creates separate stack slots for the phi destination and its backedge update value. For a 32-variable loop, this generates ~20 redundant stack-to-stack `movq` pairs per iteration.
+When CCC's phi elimination lowers SSA phi nodes to Copy instructions, it creates separate stack slots for the phi destination and its backedge update value. For a 32-variable loop, this generates a stack-to-stack copy pair per spilled variable per iteration.
 
-LCCC detects the phi-copy pattern — where the source is defined and killed in the backedge block — and aliases the source to use the phi destination's wider-live slot. The Copy becomes a same-slot no-op and is dropped by `generate_copy`.
+LCCC aliases the backedge update into the phi destination's slot whenever the phi-coalesce detector proves the old value is dead after the update is defined — including the common constant-initializer case, which the earlier sole-use analysis never covered. The Copy becomes a same-slot no-op and is dropped by `generate_copy`.
 
-**Result:** `arith_loop` (32 variables): 550 → 507 assembly lines; 0.124s → 0.104s.
+**Result (AArch64):** `arith_loop`: 2.09× → 1.47× vs GCC (22 instructions/iteration eliminated); also lifts fannkuch and spectral_norm.
 
 ## LCCC-Specific: Reduction Vectorization
 
-**Added in Phase 8** — LCCC detects and transforms reduction loops into AVX2/SSE2 SIMD operations.
+**Added in Phase 8** — LCCC detects and transforms reduction loops into SIMD operations (AVX2/SSE2 on x86-64, NEON on AArch64).
 
 ### What Gets Vectorized
 
