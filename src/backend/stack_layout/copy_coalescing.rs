@@ -14,7 +14,7 @@ use crate::ir::reexports::{
 };
 use crate::common::types::IrType;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::backend::regalloc::PhysReg;
+use crate::backend::regalloc::{detect_phi_coalesce_groups, PhysReg};
 use crate::backend::liveness::{
     for_each_operand_in_instruction, for_each_value_use_in_instruction,
     for_each_operand_in_terminator,
@@ -28,6 +28,10 @@ use crate::backend::liveness::{
 /// problem in phi parallel copy groups).
 /// Returns `(copy_alias, phi_web_aliases)` where phi_web_aliases contains value IDs
 /// that were coalesced via phi-web analysis and need force-overwrite in resolve_copy_aliases.
+/// The third element, `loop_phi_aliases`, contains phi-web aliases certified by
+/// `detect_phi_coalesce_groups` (loop-backedge copies); those skip the generic
+/// def/last-use interference check in resolve_copy_aliases because the detector
+/// already proved the phi dest is dead after the backedge source's definition.
 pub(super) fn build_copy_alias_map(
     func: &IrFunction,
     def_block: &FxHashMap<u32, usize>,
@@ -35,7 +39,7 @@ pub(super) fn build_copy_alias_map(
     reg_assigned: &FxHashMap<u32, PhysReg>,
     use_blocks_map: &FxHashMap<u32, Vec<usize>>,
     cached_liveness: &Option<crate::backend::liveness::LivenessResult>,
-) -> (FxHashMap<u32, u32>, FxHashSet<u32>) {
+) -> (FxHashMap<u32, u32>, FxHashSet<u32>, FxHashSet<u32>) {
     // Count uses of each value across all instructions.
     let mut use_count: FxHashMap<u32, u32> = FxHashMap::default();
     for block in &func.blocks {
@@ -333,6 +337,91 @@ pub(super) fn build_copy_alias_map(
         }
     }
 
+    // ── Loop-backedge phi slot coalescing ─────────────────────────────────
+    //
+    // The phi-web phase above only fires for dests with 2+ Value sources, so a
+    // loop-carried variable with a constant initializer (const-init Copy plus
+    // one backedge Copy) is never coalesced: its backedge Copy `v_old <- v_new`
+    // survives as a ldr+str slot-to-slot copy per iteration for every spilled
+    // loop-carried value (e.g. 10 such pairs per iteration in arith_loop).
+    //
+    // detect_phi_coalesce_groups proves the phi dest is not used after the
+    // backedge source is defined, which is precisely the condition that makes
+    // slot sharing sound: v_new may write the shared slot as early as its own
+    // definition, and any later read of the slot (next iteration, or after the
+    // loop) is meant to observe the updated value. Both values must be
+    // stack-homed (register-assigned values are handled by register coalescing)
+    // and the source must be an integer/pointer-typed def (i128/f128/vector
+    // slots are 16/32 bytes and FP copies use different load/store paths).
+    let mut loop_phi_aliases: FxHashSet<u32> = FxHashSet::default();
+    if std::env::var("CCC_NO_LOOP_PHI_SLOT").is_err() {
+        if let Some(liveness) = cached_liveness {
+            // Type of each single-def source, for the integer/pointer check.
+            let mut def_ty_ok: FxHashMap<u32, bool> = FxHashMap::default();
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    let (d, ok) = match inst {
+                        Instruction::BinOp { dest, ty, .. }
+                        | Instruction::UnaryOp { dest, ty, .. }
+                        | Instruction::Load { dest, ty, .. }
+                        | Instruction::Select { dest, ty, .. } => {
+                            (dest.0, !ty.is_float() && !ty.is_128bit() && !ty.is_long_double())
+                        }
+                        Instruction::Cmp { dest, .. }
+                        | Instruction::GetElementPtr { dest, .. } => (dest.0, true),
+                        Instruction::Cast { dest, to_ty, from_ty, .. } => (
+                            dest.0,
+                            !to_ty.is_float()
+                                && !to_ty.is_128bit()
+                                && !from_ty.is_float()
+                                && !from_ty.is_128bit(),
+                        ),
+                        _ => continue,
+                    };
+                    def_ty_ok.insert(d, ok);
+                }
+            }
+            let already_aliased: FxHashSet<u32> =
+                raw_aliases.iter().map(|&(a, _)| a).collect();
+            for (phi_dest, backedge_src) in detect_phi_coalesce_groups(func, liveness) {
+                if std::env::var("CCC_DEBUG_LOOP_PHI").is_ok() {
+                    eprintln!(
+                        "[LOOP_PHI] func={} pair dest=v{} src=v{} dest_reg={} src_reg={} aliased={} ty_ok={}",
+                        func.name,
+                        phi_dest,
+                        backedge_src,
+                        reg_assigned.contains_key(&phi_dest),
+                        reg_assigned.contains_key(&backedge_src),
+                        already_aliased.contains(&backedge_src),
+                        def_ty_ok.get(&backedge_src).copied().unwrap_or(false)
+                    );
+                }
+                if reg_assigned.contains_key(&phi_dest) || reg_assigned.contains_key(&backedge_src) {
+                    continue;
+                }
+                if already_aliased.contains(&backedge_src) {
+                    // Already aliased by an earlier phase, but the generic
+                    // interference check at resolve time conservatively rejects
+                    // it (the phi dest is used again on later iterations).
+                    // The detector's proof is stronger, so certify the bypass —
+                    // but only for integer/pointer sources (i128/f128/vector
+                    // values have 16/32-byte slots and must never share an
+                    // 8-byte slot).
+                    if def_ty_ok.get(&backedge_src).copied().unwrap_or(false) {
+                        loop_phi_aliases.insert(backedge_src);
+                    }
+                    continue;
+                }
+                if !def_ty_ok.get(&backedge_src).copied().unwrap_or(false) {
+                    continue;
+                }
+                raw_aliases.push((backedge_src, phi_dest));
+                phi_web_aliases.insert(backedge_src); // force-overwrite at resolve
+                loop_phi_aliases.insert(backedge_src); // skip generic interference check
+            }
+        }
+    }
+
     // Build alias map with transitive resolution: follow chains to find root.
     // Safety limit on chain depth guards against pathological cycles.
     const MAX_ALIAS_CHAIN_DEPTH: usize = 100;
@@ -378,8 +467,11 @@ pub(super) fn build_copy_alias_map(
     if !asm_output_ptrs.is_empty() {
         copy_alias.retain(|dest_id, _| !asm_output_ptrs.contains(dest_id));
     }
+    // A filtered-out alias must not survive in the certified sets.
+    loop_phi_aliases.retain(|v| copy_alias.contains_key(v));
+    phi_web_aliases.retain(|v| copy_alias.contains_key(v));
 
-    (copy_alias, phi_web_aliases)
+    (copy_alias, phi_web_aliases, loop_phi_aliases)
 }
 
 /// Identify values that can skip stack slot allocation because they are

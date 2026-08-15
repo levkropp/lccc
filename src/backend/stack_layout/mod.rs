@@ -99,6 +99,9 @@ struct StackLayoutContext {
     copy_alias: FxHashMap<u32, u32>,
     /// Values aliased via phi-web coalescing (must force-overwrite in resolve_copy_aliases).
     phi_web_aliases: FxHashSet<u32>,
+    /// Phi-web aliases certified by detect_phi_coalesce_groups (loop-backedge
+    /// copies): skip the generic interference check in resolve_copy_aliases.
+    loop_phi_aliases: FxHashSet<u32>,
     /// All value IDs referenced as operands in the function body.
     used_values: FxHashSet<u32>,
     /// Dead parameter allocas (unused params, skip slot allocation).
@@ -299,7 +302,13 @@ pub fn calculate_stack_space_common(
     // Phase 6: Resolve copy aliases (propagate slots from root to aliased values).
     // Uses liveness information to avoid sharing slots between values with
     // overlapping lifetimes (which would corrupt one of the values).
-    slot_assignment::resolve_copy_aliases(state, &ctx.copy_alias, &ctx.phi_web_aliases, func);
+    slot_assignment::resolve_copy_aliases(
+        state,
+        &ctx.copy_alias,
+        &ctx.phi_web_aliases,
+        &ctx.loop_phi_aliases,
+        func,
+    );
 
     // Phase 7: Propagate wide-value status through Copy chains (32-bit targets only).
     slot_assignment::propagate_wide_values(state, func, &ctx.copy_alias);
@@ -359,7 +368,7 @@ fn build_layout_context(
     };
 
     // Copy coalescing analysis.
-    let (copy_alias, phi_web_aliases) = copy_coalescing::build_copy_alias_map(
+    let (copy_alias, phi_web_aliases, loop_phi_aliases) = copy_coalescing::build_copy_alias_map(
         func, &def_block, &multi_def_values, reg_assigned, &use_blocks_map,
         cached_liveness,
     );
@@ -457,6 +466,7 @@ fn build_layout_context(
         multi_def_values,
         copy_alias,
         phi_web_aliases,
+        loop_phi_aliases,
         used_values,
         dead_param_allocas,
         coalescable_allocas,

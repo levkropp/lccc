@@ -927,6 +927,7 @@ pub(super) fn resolve_copy_aliases(
     state: &mut crate::backend::state::CodegenState,
     copy_alias: &FxHashMap<u32, u32>,
     phi_web_aliases: &FxHashSet<u32>,
+    loop_phi_aliases: &FxHashSet<u32>,
     func: &crate::ir::reexports::IrFunction,
 ) {
     // Build liveness intervals for interference checking.
@@ -958,8 +959,10 @@ pub(super) fn resolve_copy_aliases(
     for (&dest_id, &root_id) in copy_alias {
         // For phi-web coalesced values, force-overwrite the existing slot with
         // the root's slot. These values were checked for interference during
-        // phi-web analysis and are safe to share.
-        if !phi_web_aliases.contains(&dest_id) {
+        // phi-web analysis and are safe to share. Loop-backedge phi aliases are
+        // likewise certified (by detect_phi_coalesce_groups) and must also
+        // overwrite the Tier-3 slot the backedge source already received.
+        if !phi_web_aliases.contains(&dest_id) && !loop_phi_aliases.contains(&dest_id) {
             // For non-phi-web aliases, skip values that already have slots.
             if state.value_locations.contains_key(&dest_id) {
                 continue;
@@ -979,10 +982,23 @@ pub(super) fn resolve_copy_aliases(
 
         // Liveness-based interference check for copy alias coalescing.
         if let Some(&slot) = state.value_locations.get(&root_id) {
-            let dest_def = def_point.get(&dest_id).copied().unwrap_or(u32::MAX);
-            let root_last = last_use.get(&root_id).copied().unwrap_or(0);
-            if dest_def <= root_last {
-                continue; // Root still live when dest is defined
+            // Loop-backedge phi aliases are certified by
+            // detect_phi_coalesce_groups: the phi dest (root) is provably dead
+            // after the backedge source (dest) is defined, so the generic
+            // def/last-use check — which conservatively rejects them because
+            // the phi dest is used again on later iterations — does not apply.
+            if std::env::var("CCC_DEBUG_LOOP_PHI").is_ok() && loop_phi_aliases.contains(&dest_id) {
+                eprintln!(
+                    "[LOOP_PHI-RESOLVE] dest=v{} root=v{} slot={} certified",
+                    dest_id, root_id, slot.0
+                );
+            }
+            if !loop_phi_aliases.contains(&dest_id) {
+                let dest_def = def_point.get(&dest_id).copied().unwrap_or(u32::MAX);
+                let root_last = last_use.get(&root_id).copied().unwrap_or(0);
+                if dest_def <= root_last {
+                    continue; // Root still live when dest is defined
+                }
             }
             state.value_locations.insert(dest_id, slot);
         } else {

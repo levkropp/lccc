@@ -439,6 +439,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             if assignments.contains_key(&vid) {
                 continue; // the scan already housed this hot value
             }
+            if std::env::var("CCC_DEBUG_LOOP_PIN").is_ok() {
+                eprintln!("[LOOP_PIN] func={} candidate v{} (use {}) MISSED by scan", func.name, vid, hot_count);
+            }
             // Choose the register whose CONFLICTING holders are coldest.
             // Every holder whose live interval overlaps the hot value must be
             // fully deallocated back to the stack for the steal to be sound;
@@ -1398,7 +1401,10 @@ fn count_value_uses_in_loop(
 /// becomes a no-op, eliminating a register-to-register move or stack round-trip.
 ///
 /// Returns a list of (phi_dest, backedge_src) pairs that should share a register.
-fn detect_phi_coalesce_groups(
+///
+/// Also used by stack-layout copy coalescing: the same proof (phi dest not used
+/// after the backedge source is defined) makes sharing a *stack slot* safe.
+pub(crate) fn detect_phi_coalesce_groups(
     func: &IrFunction,
     liveness: &LivenessResult,
 ) -> Vec<(u32, u32)> {
