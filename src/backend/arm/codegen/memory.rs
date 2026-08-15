@@ -1,6 +1,6 @@
 //! ArmCodegen: memory operations (load, store, memcpy, GEP, stack).
 
-use crate::ir::reexports::{Operand, Value};
+use crate::ir::reexports::{IrConst, Operand, Value};
 use crate::common::types::IrType;
 use crate::backend::state::{StackSlot, SlotAddr};
 use crate::backend::traits::ArchCodegen;
@@ -113,6 +113,25 @@ impl ArmCodegen {
                 return true;
             }
         }
+        // Constant-zero integer stores go through the zero register —
+        // no per-iteration `mov x0, #0` materialization (sieve's marking loop).
+        if let Operand::Const(c) = val {
+            let is_zero = matches!(c, IrConst::Zero)
+                || matches!(c, IrConst::I8(0) | IrConst::I16(0) | IrConst::I32(0) | IrConst::I64(0));
+            if is_zero {
+                let (instr, zr) = match ty {
+                    IrType::I8 | IrType::U8 => ("strb", "wzr"),
+                    IrType::I16 | IrType::U16 => ("strh", "wzr"),
+                    IrType::I32 | IrType::U32 => ("str", "wzr"),
+                    IrType::I64 | IrType::U64 | IrType::Ptr => ("str", "xzr"),
+                    _ => ("", ""),
+                };
+                if !instr.is_empty() {
+                    self.state.emit_fmt(format_args!("    {} {}, {}", instr, zr, addr));
+                    return true;
+                }
+            }
+        }
         // General path: materialize the value, then store.
         self.operand_to_x0(val);
         match ty {
@@ -199,6 +218,42 @@ impl ArmCodegen {
         if ty == IrType::F128 {
             crate::backend::f128_softfloat::f128_emit_store_with_offset(self, val, base, offset);
             return;
+        }
+        // Integer constant-zero stores use the zero register — no x0
+        // materialization (`mov x0, #0` per store in e.g. sieve's marking loop).
+        if let Operand::Const(c) = val {
+            let is_zero = matches!(c, IrConst::Zero)
+                || matches!(c, IrConst::I8(0) | IrConst::I16(0) | IrConst::I32(0) | IrConst::I64(0));
+            if is_zero {
+                let width_ok = matches!(ty,
+                    IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 |
+                    IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64 | IrType::Ptr);
+                if width_ok {
+                    if let Some(addr) = self.state.resolve_slot_addr(base.0) {
+                        let zr = if matches!(ty, IrType::I64 | IrType::U64 | IrType::Ptr) { "xzr" } else { "wzr" };
+                        let store_instr = self.store_instr_for_type_impl(ty);
+                        match addr {
+                            SlotAddr::OverAligned(slot, id) => {
+                                self.emit_alloca_aligned_addr_impl(slot, id);
+                                self.emit_add_offset_to_addr_reg_impl(offset);
+                                self.state.emit_fmt(format_args!("    {} {}, [x9]", store_instr, zr));
+                            }
+                            SlotAddr::Direct(slot) => {
+                                let folded_slot = StackSlot(slot.0 + offset);
+                                self.emit_store_to_sp(zr, folded_slot.0, store_instr);
+                            }
+                            SlotAddr::Indirect(slot) => {
+                                self.emit_load_ptr_from_slot_impl(slot, base.0);
+                                if offset != 0 {
+                                    self.emit_add_offset_to_addr_reg_impl(offset);
+                                }
+                                self.state.emit_fmt(format_args!("    {} {}, [x9]", store_instr, zr));
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
         }
         // FP value with a register assignment: store the d/s register directly,
         // folding the constant offset into the addressing mode when encodable.
