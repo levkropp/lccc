@@ -501,11 +501,13 @@ impl ArmCodegen {
                         self.operand_to_x0(&args[0]);
                         self.state.emit("    mov x10, x0");
                     }
-                    self.state.emit_fmt(format_args!("    ldr q0, [{}]", addr));
                     if let Some(name) = self.assigned_vector_reg(d.0) {
+                        // Load directly into the assigned register (no copy).
                         self.state.vector_values.insert(d.0);
-                        self.state.emit_fmt(format_args!("    mov {}.16b, v0.16b", name));
+                        let qname = name.replacen('v', "q", 1);
+                        self.state.emit_fmt(format_args!("    ldr {}, [{}]", qname, addr));
                     } else {
+                        self.state.emit_fmt(format_args!("    ldr q0, [{}]", addr));
                         self.store_vector_value_128(d, "q0");
                     }
                 }
