@@ -586,7 +586,7 @@ fn count_value_uses(func: &IrFunction) -> Vec<u32> {
 /// Detect if a block's last instruction is a Cmp whose result is only used
 /// by the block's CondBranch terminator. Returns the index of the Cmp if
 /// fusion is possible, None otherwise.
-fn detect_cmp_branch_fusion(block: &BasicBlock, use_counts: &[u32]) -> Option<usize> {
+fn detect_cmp_branch_fusion(block: &BasicBlock, use_counts: &[u32], fuse_fp: bool) -> Option<(usize, Option<usize>)> {
     // Terminator must be a CondBranch
     let (cond, _, _) = match &block.terminator {
         Terminator::CondBranch { cond, true_label, false_label } => (cond, true_label, false_label),
@@ -599,36 +599,70 @@ fn detect_cmp_branch_fusion(block: &BasicBlock, use_counts: &[u32]) -> Option<us
         _ => return None,
     };
 
-    // Find the last instruction that is a Cmp producing this value
-    let last_idx = block.instructions.len().checked_sub(1)?;
-    let last_inst = &block.instructions[last_idx];
-
-    let (dest, _op, _lhs, _rhs, ty) = match last_inst {
-        Instruction::Cmp { dest, op, lhs, rhs, ty } => (dest, op, lhs, rhs, ty),
+    // Locate the Cmp feeding the branch, plus an optional dead trailing Copy
+    // to skip (common after phi-web lowering: Cmp ; Copy ; CondBranch).
+    let n = block.instructions.len();
+    if n == 0 {
+        return None;
+    }
+    let (cmp_idx, dead_copy_idx) = match &block.instructions[n - 1] {
+        // Common case: the Cmp is the last instruction.
+        Instruction::Cmp { dest, .. } if dest.0 == cond_val.0 => (n - 1, None),
+        _ if n >= 2 => {
+            let (cmp_dest, copy_idx) = match &block.instructions[n - 2] {
+                Instruction::Cmp { dest, .. } => (dest.0, n - 1),
+                _ => return None,
+            };
+            let Instruction::Copy { dest: cd, src: Operand::Value(cs) } = &block.instructions[copy_idx]
+            else {
+                return None;
+            };
+            if cs.0 != cmp_dest {
+                return None;
+            }
+            let cmp_uses = use_counts.get(cmp_dest as usize).copied().unwrap_or(u32::MAX);
+            if cond_val.0 == cmp_dest {
+                // Branch reads the Cmp directly; the Copy must be dead.
+                if use_counts.get(cd.0 as usize).copied().unwrap_or(0) != 0 || cmp_uses != 2 {
+                    return None;
+                }
+            } else if cond_val.0 == cd.0 {
+                // Branch reads the Copy; the Cmp must feed only the Copy.
+                if use_counts.get(cd.0 as usize).copied().unwrap_or(u32::MAX) != 1 || cmp_uses != 1 {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+            (n - 2, Some(copy_idx))
+        }
         _ => return None,
     };
 
-    // The Cmp dest must be the same as the CondBranch cond
-    if dest.0 != cond_val.0 {
-        return None;
-    }
+    let (_, ty) = match &block.instructions[cmp_idx] {
+        Instruction::Cmp { dest, ty, .. } => (dest, ty),
+        _ => return None,
+    };
 
-    // Don't fuse wide-int or float comparisons (they have special codegen paths).
+    // Don't fuse wide-int comparisons (they have special codegen paths).
+    // FP comparisons only on backends with a fused FP compare-and-branch.
     // On 32-bit targets, also exclude I64/U64: the fused compare-and-branch
     // uses 32-bit cmpl which only tests the low half of a 64-bit value.
-    if is_wide_int_type(*ty) || ty.is_float() {
+    if is_wide_int_type(*ty) || (ty.is_float() && !fuse_fp) {
         return None;
     }
     if crate::common::types::target_is_32bit() && matches!(ty, IrType::I64 | IrType::U64) {
         return None;
     }
 
-    // The Cmp result must be used exactly once (by the CondBranch terminator)
-    if (cond_val.0 as usize) < use_counts.len() && use_counts[cond_val.0 as usize] == 1 {
-        Some(last_idx)
-    } else {
-        None
+    // For the simple case the Cmp result must be used exactly once (by the
+    // CondBranch terminator). The dead-Copy case carries its own counts above.
+    if dead_copy_idx.is_none()
+        && !((cond_val.0 as usize) < use_counts.len() && use_counts[cond_val.0 as usize] == 1)
+    {
+        return None;
     }
+    Some((cmp_idx, dead_copy_idx))
 }
 
 /// Detect multiply-add fusion opportunities within a block.
@@ -1241,7 +1275,7 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
         // If the last instruction is a Cmp whose result is only used by the
         // CondBranch terminator, emit a fused compare-and-conditional-jump
         // instead of materializing the boolean result to a register/stack slot.
-        let fuse_idx = detect_cmp_branch_fusion(block, &value_use_counts);
+        let fuse_idx = detect_cmp_branch_fusion(block, &value_use_counts, cg.supports_fused_fp_cmp_branch());
         let mul_add_fusions = detect_mul_add_fusions(block, &value_use_counts, cg.supports_fused_float_mul_add());
         let shifted_logical_fusions = if cg.supports_shifted_logical() {
             detect_shifted_logical_fusions(block, &value_use_counts)
@@ -1276,8 +1310,12 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
         }
 
         for (idx, inst) in block.instructions.iter().enumerate() {
-            if Some(idx) == fuse_idx {
+            if Some(idx) == fuse_idx.map(|f| f.0) {
                 // Skip this Cmp -- it will be emitted fused with the terminator
+                continue;
+            }
+            if fuse_idx.and_then(|f| f.1) == Some(idx) {
+                // Skip the dead Copy between the Cmp and the fused branch.
                 continue;
             }
             // Skip the Add that was already emitted as part of a fused Mul-Add.
@@ -1376,7 +1414,7 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
         // Flush MachInst buffer at end of block (before terminator)
         cg.flush_machinst();
 
-        if let Some(fi) = fuse_idx {
+        if let Some((fi, _)) = fuse_idx {
             // Emit fused compare-and-branch: cmp + jCC directly
             if let Instruction::Cmp { dest: _, op, lhs, rhs, ty } = &block.instructions[fi] {
                 if let Terminator::CondBranch { cond: _, true_label, false_label } = &block.terminator {

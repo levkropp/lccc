@@ -1847,6 +1847,7 @@ impl ArchCodegen for ArmCodegen {
     fn supports_fused_float_mul_add(&self) -> bool { true }
     fn supports_shifted_logical(&self) -> bool { true }
     fn supports_indexed_addr(&self) -> bool { true }
+    fn supports_fused_fp_cmp_branch(&self) -> bool { true }
     fn emit_load_indexed(&mut self, dest: &Value, base: &Value, index: &Value, shift: u8, ty: IrType) -> bool {
         self.emit_load_indexed_impl(dest, base, index, shift, ty)
     }

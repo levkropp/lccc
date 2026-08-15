@@ -47,6 +47,33 @@ impl ArmCodegen {
         true_label: &str,
         false_label: &str,
     ) {
+        if ty.is_float() {
+            // fcmp + conditional branch — no cset boolean materialization.
+            // Condition codes match emit_float_cmp_impl exactly, so branching
+            // on flags is identical to branching on the materialized boolean.
+            let (l, r) = if ty == IrType::F32 {
+                (self.float_operand_reg(lhs, ty, "s0"), self.float_operand_reg(rhs, ty, "s1"))
+            } else {
+                (self.float_operand_reg(lhs, ty, "d0"), self.float_operand_reg(rhs, ty, "d1"))
+            };
+            self.state.emit_fmt(format_args!("    fcmp {}, {}", l, r));
+            let cond = match op {
+                IrCmpOp::Eq => "eq",
+                IrCmpOp::Ne => "ne",
+                IrCmpOp::Slt | IrCmpOp::Ult => "mi",
+                IrCmpOp::Sle | IrCmpOp::Ule => "ls",
+                IrCmpOp::Sgt | IrCmpOp::Ugt => "gt",
+                IrCmpOp::Sge | IrCmpOp::Uge => "ge",
+            };
+            let inv_cc = arm_invert_cond_code(cond);
+            let skip = self.state.fresh_label("skip");
+            self.state.emit_fmt(format_args!("    b.{} {}", inv_cc, skip));
+            self.state.emit_fmt(format_args!("    b {}", true_label));
+            self.state.emit_fmt(format_args!("{}:", skip));
+            self.state.emit_fmt(format_args!("    b {}", false_label));
+            self.state.reg_cache.invalidate_all();
+            return;
+        }
         self.emit_int_cmp_insn(lhs, rhs, ty);
         let cc = arm_int_cond_code(op);
         let inv_cc = arm_invert_cond_code(cc);

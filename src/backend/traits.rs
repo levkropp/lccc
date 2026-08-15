@@ -271,6 +271,13 @@ pub trait ArchCodegen {
         false
     }
 
+    /// Whether `emit_fused_cmp_branch_blocks` handles floating-point compares
+    /// (fcmp + b.cc without materializing a cset boolean). Default false;
+    /// AArch64 returns true.
+    fn supports_fused_fp_cmp_branch(&self) -> bool {
+        false
+    }
+
     /// Emit a load using indexed addressing: dest = [base + (index << shift)].
     /// Returns false if it cannot be emitted (caller falls back to unfolding).
     fn emit_load_indexed(&mut self, _dest: &Value, _base: &Value, _index: &Value, _shift: u8, _ty: IrType) -> bool {
