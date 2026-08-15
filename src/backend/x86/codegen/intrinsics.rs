@@ -1132,6 +1132,11 @@ impl X86Codegen {
             IntrinsicOp::VecZeroI64x2 => {
                 // AArch64-only widening reduction intrinsics.
             }
+            IntrinsicOp::VecMulI32x4 | IntrinsicOp::VecBroadcastI32x4 |
+            IntrinsicOp::VecStoreI32x4 => {
+                // AArch64-only map-loop vectorization intrinsics (the map
+                // transform is gated to AArch64, so these are never emitted here).
+            }
         }
     }
 

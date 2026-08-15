@@ -443,8 +443,10 @@ impl I686Codegen {
             IntrinsicOp::VecZeroF64x4 | IntrinsicOp::VecZeroF64x2 | IntrinsicOp::VecZeroI32x8 | IntrinsicOp::VecZeroI32x4 |
             IntrinsicOp::VecLoadWidenI32ToI64x2 | IntrinsicOp::VecAddI64x2 |
             IntrinsicOp::VecMulI64x2 | IntrinsicOp::VecHorizontalAddI64x2 |
-            IntrinsicOp::VecZeroI64x2 => {
-                // These are x86-64-specific register-based vector operations
+            IntrinsicOp::VecZeroI64x2 |
+            IntrinsicOp::VecMulI32x4 | IntrinsicOp::VecBroadcastI32x4 |
+            IntrinsicOp::VecStoreI32x4 => {
+                // These are x86-64/AArch64-specific register-based vector operations
                 unimplemented!("Register-based vector intrinsics not implemented for i686");
             }
         }

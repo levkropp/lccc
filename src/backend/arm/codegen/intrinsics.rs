@@ -474,14 +474,15 @@ impl ArmCodegen {
             }
 
             IntrinsicOp::VecAddF64x2 | IntrinsicOp::VecMulF64x2
-            | IntrinsicOp::VecAddI32x4 => {
+            | IntrinsicOp::VecAddI32x4 | IntrinsicOp::VecMulI32x4 => {
                 if let Some(d) = dest {
                     let a = self.load_vector_value_128(&args[0], "q0");
                     let b = self.load_vector_value_128(&args[1], "q1");
                     let (mnemonic, suffix) = match op {
                         IntrinsicOp::VecAddF64x2 => ("fadd", "2d"),
                         IntrinsicOp::VecMulF64x2 => ("fmul", "2d"),
-                        _ => ("add", "4s"),
+                        IntrinsicOp::VecAddI32x4 => ("add", "4s"),
+                        _ => ("mul", "4s"),
                     };
                     if let Some(name) = self.assigned_vector_reg(d.0) {
                         self.state.vector_values.insert(d.0);
@@ -490,6 +491,33 @@ impl ArmCodegen {
                         self.state.emit_fmt(format_args!("    {} v0.{}, {}.{}, {}.{}", mnemonic, suffix, a, suffix, b, suffix));
                         self.store_vector_value_128(d, "q0");
                     }
+                }
+            }
+
+            IntrinsicOp::VecBroadcastI32x4 => {
+                if let Some(d) = dest {
+                    self.operand_to_x0(&args[0]);
+                    if let Some(name) = self.assigned_vector_reg(d.0) {
+                        self.state.vector_values.insert(d.0);
+                        self.state.emit_fmt(format_args!("    dup {}.4s, w0", name));
+                    } else {
+                        self.state.emit("    dup v0.4s, w0");
+                        self.store_vector_value_128(d, "q0");
+                    }
+                }
+            }
+
+            IntrinsicOp::VecStoreI32x4 => {
+                // Store a 4×I32 vector to dest_ptr.
+                if let Some(ptr) = dest_ptr {
+                    let src = self.load_vector_value_128(&args[0], "q0");
+                    let base_phys = self.operand_reg(&Operand::Value(*ptr)).filter(|r| !is_arm_fp_phys(*r));
+                    let addr = base_phys.map(callee_saved_name).unwrap_or("x10");
+                    if base_phys.is_none() {
+                        self.operand_to_x0(&Operand::Value(*ptr));
+                        self.state.emit("    mov x10, x0");
+                    }
+                    self.state.emit_fmt(format_args!("    str {}, [{}]", src.replacen('v', "q", 1), addr));
                 }
             }
 

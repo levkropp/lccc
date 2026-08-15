@@ -195,6 +195,15 @@ pub enum IntrinsicOp {
     /// Vector add: %dest_vec = %src1_vec + %src2_vec - SSE2 4×I32
     /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
     VecAddI32x4,
+    /// Vector multiply: %dest_vec = %src1_vec * %src2_vec - 4×I32
+    /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
+    VecMulI32x4,
+    /// Broadcast a scalar I32 to all 4 lanes: %dest_vec = {x, x, x, x}
+    /// args[0] = scalar I32 value; dest = result vector
+    VecBroadcastI32x4,
+    /// Vector store: store 4×I32 vector to memory.
+    /// dest_ptr = destination pointer; args[0] = source vector value.
+    VecStoreI32x4,
     /// Load two signed I32 lanes and widen to two I64 lanes.
     VecLoadWidenI32ToI64x2,
     VecAddI64x2,
@@ -405,6 +414,7 @@ impl IntrinsicOp {
             | IntrinsicOp::VecLoadWidenI32ToI64x2
             | IntrinsicOp::VecAddI64x2 | IntrinsicOp::VecMulI64x2
             | IntrinsicOp::VecZeroI64x2
+            | IntrinsicOp::VecMulI32x4 | IntrinsicOp::VecBroadcastI32x4
         )
     }
 }
