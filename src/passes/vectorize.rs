@@ -3712,43 +3712,49 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
 
     // Step 2: Scale array indexing by vector width
     for &block_idx in &pattern.loop_blocks {
-        let block = &func.blocks[block_idx];
-
-        // Find GEP instructions that match our arrays
-        for (inst_idx, inst) in block.instructions.iter().enumerate() {
+        // Collect all GEP positions matching our arrays first (a dot product
+        // has both array GEPs in the same body block, so we must not stop at
+        // the first one).
+        let mut matches: Vec<usize> = Vec::new();
+        for (inst_idx, inst) in func.blocks[block_idx].instructions.iter().enumerate() {
             if let Instruction::GetElementPtr { dest, offset, .. } = inst {
-                // Check if this is one of our array GEPs
-                if *dest == pattern.array_a_gep || Some(*dest) == pattern.array_b_gep {
-                    if let Operand::Value(offset_val) = offset {
-                        // Insert multiply before GEP: offset' = offset * vec_width
-                        let mul_dest = Value(next_val_id);
-                        next_val_id += 1;
-
-                        let mul_inst = Instruction::BinOp {
-                            dest: mul_dest,
-                            op: IrBinOp::Mul,
-                            lhs: Operand::Value(*offset_val),
-                            rhs: Operand::Const(IrConst::I64(vec_width as i64)),
-                            ty: IrType::I64,
-                        };
-
-                        // Insert mul before GEP
-                        let block = &mut func.blocks[block_idx];
-                        block.instructions.insert(inst_idx, mul_inst);
-                        changes += 1;
-
-                        // Update GEP offset (now at inst_idx + 1)
-                        if let Instruction::GetElementPtr { offset, .. } = &mut block.instructions[inst_idx + 1] {
-                            *offset = Operand::Value(mul_dest);
-                        }
-
-                        if debug {
-                            eprintln!("[VEC-RED]   Scaled GEP offset by {}", vec_width);
-                        }
-
-                        break; // Only process first GEP per block
-                    }
+                if (*dest == pattern.array_a_gep || Some(*dest) == pattern.array_b_gep)
+                    && matches!(offset, Operand::Value(_))
+                {
+                    matches.push(inst_idx);
                 }
+            }
+        }
+        // Insert from last to first so earlier positions stay valid.
+        for &inst_idx in matches.iter().rev() {
+            let offset_val = match &func.blocks[block_idx].instructions[inst_idx] {
+                Instruction::GetElementPtr { offset: Operand::Value(v), .. } => *v,
+                _ => unreachable!(),
+            };
+            // Insert multiply before GEP: offset' = offset * vec_width
+            let mul_dest = Value(next_val_id);
+            next_val_id += 1;
+
+            let mul_inst = Instruction::BinOp {
+                dest: mul_dest,
+                op: IrBinOp::Mul,
+                lhs: Operand::Value(offset_val),
+                rhs: Operand::Const(IrConst::I64(vec_width as i64)),
+                ty: IrType::I64,
+            };
+
+            // Insert mul before GEP
+            let block = &mut func.blocks[block_idx];
+            block.instructions.insert(inst_idx, mul_inst);
+            changes += 1;
+
+            // Update GEP offset (now at inst_idx + 1)
+            if let Instruction::GetElementPtr { offset, .. } = &mut block.instructions[inst_idx + 1] {
+                *offset = Operand::Value(mul_dest);
+            }
+
+            if debug {
+                eprintln!("[VEC-RED]   Scaled GEP offset by {}", vec_width);
             }
         }
     }

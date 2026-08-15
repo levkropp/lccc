@@ -441,16 +441,81 @@ impl ArmCodegen {
                 if let Some(d) = dest { self.store_x0_to(d); }
             }
 
-            // Register-based vector intrinsics (x86-specific, not implemented for ARM)
-            IntrinsicOp::VecLoadF64x4 | IntrinsicOp::VecLoadF64x2 | IntrinsicOp::VecLoadI32x8 | IntrinsicOp::VecLoadI32x4 |
-            IntrinsicOp::VecAddF64x4 | IntrinsicOp::VecAddF64x2 | IntrinsicOp::VecMulF64x4 | IntrinsicOp::VecMulF64x2 |
-            IntrinsicOp::VecAddI32x8 | IntrinsicOp::VecAddI32x4 |
-            IntrinsicOp::VecHorizontalAddF64x4 | IntrinsicOp::VecHorizontalAddF64x2 |
-            IntrinsicOp::VecHorizontalAddI32x8 | IntrinsicOp::VecHorizontalAddI32x4 |
-            IntrinsicOp::VecZeroF64x4 | IntrinsicOp::VecZeroF64x2 | IntrinsicOp::VecZeroI32x8 | IntrinsicOp::VecZeroI32x4 => {
-                // These are x86-specific register-based vector operations
-                // ARM would use NEON intrinsics differently
-                unimplemented!("Register-based vector intrinsics not implemented for ARM");
+            // Register-based vector operations (NEON 128-bit).
+            // Two-wide F64 (2×.2d) and four-wide I32 (4×.4s) for reductions.
+            IntrinsicOp::VecLoadF64x2 | IntrinsicOp::VecLoadI32x4 => {
+                if let Some(d) = dest {
+                    let base_phys = self.operand_reg(&args[0]).filter(|r| !is_arm_fp_phys(*r));
+                    let addr = base_phys.map(callee_saved_name).unwrap_or("x10");
+                    if base_phys.is_none() {
+                        self.operand_to_x0(&args[0]);
+                        self.state.emit("    mov x10, x0");
+                    }
+                    self.state.emit_fmt(format_args!("    ldr q0, [{}]", addr));
+                    if let Some(name) = self.assigned_vector_reg(d.0) {
+                        self.state.vector_values.insert(d.0);
+                        self.state.emit_fmt(format_args!("    mov {}.16b, v0.16b", name));
+                    } else {
+                        self.store_vector_value_128(d, "q0");
+                    }
+                }
+            }
+
+            IntrinsicOp::VecZeroF64x2 | IntrinsicOp::VecZeroI32x4 => {
+                if let Some(d) = dest {
+                    if let Some(name) = self.assigned_vector_reg(d.0) {
+                        self.state.vector_values.insert(d.0);
+                        self.state.emit_fmt(format_args!("    eor {0}.16b, {0}.16b, {0}.16b", name));
+                    } else {
+                        self.state.emit("    eor v0.16b, v0.16b, v0.16b");
+                        self.store_vector_value_128(d, "q0");
+                    }
+                }
+            }
+
+            IntrinsicOp::VecAddF64x2 | IntrinsicOp::VecMulF64x2
+            | IntrinsicOp::VecAddI32x4 => {
+                if let Some(d) = dest {
+                    let a = self.load_vector_value_128(&args[0], "q0");
+                    let b = self.load_vector_value_128(&args[1], "q1");
+                    let (mnemonic, suffix) = match op {
+                        IntrinsicOp::VecAddF64x2 => ("fadd", "2d"),
+                        IntrinsicOp::VecMulF64x2 => ("fmul", "2d"),
+                        _ => ("add", "4s"),
+                    };
+                    if let Some(name) = self.assigned_vector_reg(d.0) {
+                        self.state.vector_values.insert(d.0);
+                        self.state.emit_fmt(format_args!("    {} {}.{}, {}.{}, {}.{}", mnemonic, name, suffix, a, suffix, b, suffix));
+                    } else {
+                        self.state.emit_fmt(format_args!("    {} v0.{}, {}.{}, {}.{}", mnemonic, suffix, a, suffix, b, suffix));
+                        self.store_vector_value_128(d, "q0");
+                    }
+                }
+            }
+
+            IntrinsicOp::VecHorizontalAddF64x2 => {
+                let a = self.load_vector_value_128(&args[0], "q0");
+                self.state.emit_fmt(format_args!("    faddp d0, {}.2d", a));
+                if let Some(d) = dest {
+                    self.store_float_reg(d, IrType::F64, "d0");
+                }
+            }
+
+            IntrinsicOp::VecHorizontalAddI32x4 => {
+                let a = self.load_vector_value_128(&args[0], "q0");
+                self.state.emit_fmt(format_args!("    addv s0, {}.4s", a));
+                self.state.emit("    fmov w0, s0");
+                if let Some(d) = dest { self.store_x0_to(d); }
+            }
+
+            // Not-yet-implemented register-based vector intrinsics for ARM.
+            IntrinsicOp::VecLoadF64x4 | IntrinsicOp::VecLoadI32x8 |
+            IntrinsicOp::VecAddF64x4 | IntrinsicOp::VecMulF64x4 |
+            IntrinsicOp::VecAddI32x8 |
+            IntrinsicOp::VecHorizontalAddF64x4 |
+            IntrinsicOp::VecHorizontalAddI32x8 |
+            IntrinsicOp::VecZeroF64x4 | IntrinsicOp::VecZeroI32x8 => {
+                unimplemented!("4-wide/AVX vector intrinsics not implemented for ARM");
             }
         }
     }

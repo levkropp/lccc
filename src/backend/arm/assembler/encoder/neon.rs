@@ -431,8 +431,8 @@ pub(crate) fn encode_neon_addv(operands: &[Operand]) -> Result<EncodeResult, Str
     let (q, size) = neon_arr_to_q_size(&arr_n)?;
 
     // ADDV: 0 Q 0 01110 size 11000 11011 10 Rn Rd
-    let word = (q << 30) | (0b001110 << 24) | (size << 22) | (0b11000 << 17)
-        | (0b110111 << 10) | (rn << 5) | rd;
+    let word = (q << 30) | (0b01110 << 24) | (size << 22) | (0b11000 << 17)
+        | (0b11011 << 12) | (0b10 << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
