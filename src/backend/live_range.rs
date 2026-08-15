@@ -316,9 +316,10 @@ impl LinearScanAllocator {
             });
         } else {
             // No free register — spill the incoming range to stack.
-            // We do NOT evict active intervals: evicting a loop-carried
-            // value's register mid-scan proved unsafe (miscompilations where
-            // an evicted accumulator's later reads saw a clobbered register).
+            // We do NOT evict active intervals: evicting a colder interval's
+            // register mid-scan proved unsafe (miscompiled loop-carried
+            // accumulators via interaction with slot assignment). A proper
+            // fix needs live-range splitting, not eviction.
             self.allocate_spill_slot(range.value_id);
         }
     }
