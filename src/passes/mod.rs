@@ -696,6 +696,19 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
         if module.for_each_function(store_load_forward::run) == 0 { break; }
     }
     module.for_each_function(dce::eliminate_dead_code);
+    if std::env::var("LCCC_DUMP_IR_PROMOTE").is_ok() {
+        for func in &module.functions {
+            if func.is_declaration { continue; }
+            eprintln!("=== IR(pre-promote) {} ===", func.name);
+            for (bi, b) in func.blocks.iter().enumerate() {
+                eprintln!("  block {} (label {}):", bi, b.label.0);
+                for inst in &b.instructions {
+                    eprintln!("    {:?}", inst);
+                }
+                eprintln!("    term: {:?}", b.terminator);
+            }
+        }
+    }
     // Run memory-recurrence promotion again after CFG and copy cleanup have
     // exposed canonical natural loops.
     module.for_each_function(loop_memory_promote::run);

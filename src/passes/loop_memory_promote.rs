@@ -62,7 +62,336 @@ fn disjoint(paths: &FxHashMap<u32, Path>, a: Value, a_ty: IrType, b: Value, b_ty
     ae <= pb.offset || be <= pa.offset
 }
 
+/// Follow GEP/Copy/Add-const chains, accumulating a constant byte offset.
+/// Returns the root value id and accumulated offset.
+fn resolve_ptr_chain(func: &IrFunction, start: Value) -> Option<(u32, i64)> {
+    let mut cur = start;
+    let mut off: i64 = 0;
+    for _ in 0..64 {
+        let mut next = None;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if inst.dest() != Some(cur) { continue; }
+                next = match inst {
+                    Instruction::GetElementPtr { base, offset: Operand::Const(c), .. } => {
+                        c.to_i64().map(|k| (base, k))
+                    }
+                    Instruction::Copy { src: Operand::Value(src), .. } => Some((src, 0)),
+                    Instruction::BinOp { op: crate::ir::reexports::IrBinOp::Add, lhs, rhs, .. } => {
+                        match (lhs, rhs) {
+                            (Operand::Value(v), Operand::Const(c))
+                            | (Operand::Const(c), Operand::Value(v)) => {
+                                c.to_i64().map(|k| (v, k))
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                break;
+            }
+            if next.is_some() { break; }
+        }
+        match next {
+            Some((base, k)) => {
+                off = off.checked_add(k)?;
+                cur = *base;
+            }
+            None => return Some((cur.0, off)),
+        }
+    }
+    None
+}
+
+/// A linear pointer form within the loop being analyzed:
+///   address = root_base + S coeff*iv + konst + march*t
+/// where `t` counts iterations of the current loop, and `syms` are
+/// loop-invariant terms keyed by (outer) phi value id, sorted by id.
+/// All arithmetic on byte offsets is checked; we bail out on overflow.
+#[derive(Clone, PartialEq, Eq)]
+struct LinForm {
+    root: u64,
+    syms: Vec<(u32, i64)>,
+    konst: i64,
+    march: i64,
+}
+
+/// A stable identity for a pointer root: global by name, alloca/param by id.
+fn root_id(func: &IrFunction, v: Value) -> u64 {
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if inst.dest() == Some(v) {
+                return match inst {
+                    Instruction::GlobalAddr { name, .. } => {
+                        let mut h = 0xcbf29ce484222325u64;
+                        for b in name.as_bytes() {
+                            h = (h ^ *b as u64).wrapping_mul(0x100000001b3);
+                        }
+                        h
+                    }
+                    Instruction::Alloca { .. } => 0x1_0000_0000 + v.0 as u64,
+                    Instruction::ParamRef { param_idx, .. } => 0x2_0000_0000 + *param_idx as u64,
+                    _ => 0x3_0000_0000 + v.0 as u64,
+                };
+            }
+        }
+    }
+    0x3_0000_0000 + v.0 as u64
+}
+
+/// Find the single definition of a value.
+fn find_def<'a>(func: &'a IrFunction, v: Value) -> Option<&'a Instruction> {
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if inst.dest() == Some(v) {
+                return Some(inst);
+            }
+        }
+    }
+    None
+}
+
+/// Identify a simple striding phi `phi [init, phi + const]` (step via
+/// GEP/add/copy chains). Returns (init_operand, stride), identified by FORM.
+fn striding_phi(func: &IrFunction, phi_v: Value) -> Option<(Operand, i64)> {
+    let Instruction::Phi { incoming, .. } = find_def(func, phi_v)? else { return None };
+    if incoming.len() != 2 { return None; }
+    let mut init = None;
+    let mut stride = 0i64;
+    for (op, _) in incoming {
+        if let Operand::Value(v) = op {
+            if let Some((root, off)) = resolve_ptr_chain(func, *v) {
+                if root == phi_v.0 && off != 0 {
+                    stride = off;
+                    continue;
+                }
+            }
+        }
+        if init.is_some() { return None; } // two non-step incomings: bail
+        init = Some(*op);
+    }
+    if stride == 0 { return None; }
+    Some((init?, stride))
+}
+
+/// Resolve a value to a linear form relative to the current loop. Phis in the
+/// current loop header become the marching term t; outer-loop phis are either
+/// opaque symbolic terms (integer IVs) or expanded through a lockstep IV
+/// (marching pointers). Other in-body definitions reject the resolution.
+fn resolve_lin_form(
+    func: &IrFunction,
+    lp_body: &FxHashSet<usize>,
+    def_block: &FxHashMap<u32, usize>,
+    cur_header: usize,
+    v: Value,
+    fuel: u8,
+) -> Option<LinForm> {
+    if fuel == 0 { return None; }
+    let fuel = fuel - 1;
+    let inst = find_def(func, v)?;
+    let def_bi = def_block.get(&v.0).copied().unwrap_or(usize::MAX);
+    let debug = std::env::var("CCC_DEBUG_PROMOTE").is_ok();
+
+    if def_bi == cur_header {
+        // Current-loop phi: the marching variable. value = init + stride*t
+        // for both pointer and integer phis.
+        if matches!(inst, Instruction::Phi { .. }) {
+            let (init_op, stride) = striding_phi(func, v)?;
+            let mut f = match init_op {
+                Operand::Value(init_v) => {
+                    resolve_lin_form(func, lp_body, def_block, cur_header, init_v, fuel)?
+                }
+                Operand::Const(c) => LinForm { root: 0, syms: vec![], konst: c.to_i64()?, march: 0 },
+            };
+            f.march = f.march.checked_add(stride)?;
+            return Some(f);
+        }
+        return None;
+    }
+
+    match inst {
+        // Pure structural chains resolve soundly wherever they sit in the
+        // loop: their value is always the same function of phi/inv parts.
+        Instruction::Copy { src: Operand::Value(src), .. } => {
+            resolve_lin_form(func, lp_body, def_block, cur_header, *src, fuel)
+        }
+        Instruction::Cast { src: Operand::Value(src), from_ty, to_ty, .. }
+            if from_ty.size() <= to_ty.size() =>
+        {
+            resolve_lin_form(func, lp_body, def_block, cur_header, *src, fuel)
+        }
+        Instruction::GetElementPtr { base, offset, .. } => {
+            let mut f = resolve_lin_form(func, lp_body, def_block, cur_header, *base, fuel)?;
+            match offset {
+                Operand::Const(c) => {
+                    f.konst = f.konst.checked_add(c.to_i64()?)?;
+                }
+                Operand::Value(ov) => {
+                    let g = resolve_lin_form(func, lp_body, def_block, cur_header, *ov, fuel)?;
+                    f = merge_forms(f, g)?;
+                }
+            }
+            Some(f)
+        }
+        Instruction::BinOp { op: crate::ir::reexports::IrBinOp::Add, lhs, rhs, .. } => {
+            match (lhs, rhs) {
+                (Operand::Value(a), Operand::Value(b)) => {
+                    let fa = resolve_lin_form(func, lp_body, def_block, cur_header, *a, fuel)?;
+                    let fb = resolve_lin_form(func, lp_body, def_block, cur_header, *b, fuel)?;
+                    merge_forms(fa, fb)
+                }
+                (Operand::Value(a), Operand::Const(c)) | (Operand::Const(c), Operand::Value(a)) => {
+                    let mut fa = resolve_lin_form(func, lp_body, def_block, cur_header, *a, fuel)?;
+                    fa.konst = fa.konst.checked_add(c.to_i64()?)?;
+                    Some(fa)
+                }
+                _ => None,
+            }
+        }
+        Instruction::BinOp { op: crate::ir::reexports::IrBinOp::Mul, lhs, rhs, .. } => {
+            let (val_op, c) = match (lhs, rhs) {
+                (Operand::Value(a), Operand::Const(c)) | (Operand::Const(c), Operand::Value(a)) => {
+                    (*a, c.to_i64()?)
+                }
+                _ => return None,
+            };
+            let mut f = resolve_lin_form(func, lp_body, def_block, cur_header, val_op, fuel)?;
+            if f.root != 0 { return None; } // scaling a pointer: not an address component
+            f.konst = f.konst.checked_mul(c)?;
+            f.march = f.march.checked_mul(c)?;
+            for s in f.syms.iter_mut() {
+                s.1 = s.1.checked_mul(c)?;
+            }
+            Some(f)
+        }
+        Instruction::Phi { ty, .. } => {
+            // A phi inside the analyzed loop but outside its header belongs to
+            // a nested loop: its value varies within one iteration — bail.
+            if lp_body.contains(&def_bi) { return None; }
+            // Phi of an OUTER loop (loop-invariant here).
+            if *ty != crate::common::types::IrType::Ptr {
+                // Integer outer phi: usable as an opaque symbolic term if it
+                // is a simple striding IV; otherwise an opaque root.
+                if striding_phi(func, v).is_some() {
+                    return Some(LinForm { root: 0, syms: vec![(v.0, 1)], konst: 0, march: 0 });
+                }
+                return Some(LinForm { root: root_id(func, v), syms: vec![], konst: 0, march: 0 });
+            }
+            // Pointer outer phi: expand via a lockstep integer IV in the same
+            // (outer) header: P = init + (S/S1)*(IV - IV_init).
+            let (init_op, stride) = striding_phi(func, v)?;
+            let Operand::Value(init_v) = init_op else { return None };
+            let outer_header = def_bi;
+            let mut iv_sym = None;
+            for binst in &func.blocks[outer_header].instructions {
+                let Instruction::Phi { dest, ty: ity, .. } = binst else { continue };
+                if *ity == crate::common::types::IrType::Ptr { continue; }
+                let Some((iv_init_op, iv_stride)) = striding_phi(func, *dest) else { continue };
+                let Operand::Const(ivc) = iv_init_op else { continue };
+                let Some(iv_c0) = ivc.to_i64() else { continue };
+                if iv_stride == 0 || stride % iv_stride != 0 { continue; }
+                iv_sym = Some((dest.0, stride / iv_stride, iv_c0));
+                break;
+            }
+            let (iv_id, ratio, iv_c0) = iv_sym?;
+            let mut f = resolve_lin_form(func, lp_body, def_block, cur_header, init_v, fuel)?;
+            if f.march != 0 { return None; }
+            // += ratio * (IV - iv_c0)
+            f.konst = f.konst.checked_sub(ratio.checked_mul(iv_c0)?)?;
+            match f.syms.iter_mut().find(|s| s.0 == iv_id) {
+                Some(s) => s.1 = s.1.checked_add(ratio)?,
+                None => f.syms.push((iv_id, ratio)),
+            }
+            f.syms.sort_by_key(|s| s.0);
+            Some(f)
+        }
+        _ => {
+            // Opaque root: only loop-invariant defs qualify.
+            if lp_body.contains(&def_bi) { return None; }
+            Some(LinForm { root: root_id(func, v), syms: vec![], konst: 0, march: 0 })
+        }
+    }
+}
+
+/// Merge two linear forms (at most one may carry a root); used for GEP
+/// base+offset and pointer arithmetic addition.
+fn merge_forms(mut a: LinForm, b: LinForm) -> Option<LinForm> {
+    if a.root != 0 && b.root != 0 { return None; }
+    if b.root != 0 { a.root = b.root; }
+    a.konst = a.konst.checked_add(b.konst)?;
+    a.march = a.march.checked_add(b.march)?;
+    for (id, c) in b.syms {
+        match a.syms.iter_mut().find(|s| s.0 == id) {
+            Some(s) => s.1 = s.1.checked_add(c)?,
+            None => a.syms.push((id, c)),
+        }
+    }
+    a.syms.sort_by_key(|s| s.0);
+    a.syms.retain(|s| s.1 != 0);
+    Some(a)
+}
+
+/// Prove that the loop-invariant address `cand` never aliases `store` in any
+/// iteration of the loop, using linear forms: both addresses are expressed as
+/// root + coeff*iv + konst + march*t; with identical roots and symbolic
+/// parts, a store marching away from the invariant candidate never reaches it.
+/// Example: `bodies[i].vx` vs stores to `bodies[j].vx`, j marching +56 from
+/// i+1: forms are bodies+56*iv+24 and bodies+56*iv+80+56*t — disjoint.
+fn affine_disjoint(
+    func: &IrFunction,
+    lp_body: &FxHashSet<usize>,
+    def_block: &FxHashMap<u32, usize>,
+    header_idx: usize,
+    cand: Value,
+    cand_ty: IrType,
+    store: Value,
+    store_ty: IrType,
+) -> bool {
+    // Candidate must be loop-invariant.
+    if def_block.get(&cand.0).is_some_and(|b| lp_body.contains(b)) { return false; }
+    let debug = std::env::var("CCC_DEBUG_PROMOTE").is_ok();
+    let cf = resolve_lin_form(func, lp_body, def_block, header_idx, cand, 32);
+    let sf = resolve_lin_form(func, lp_body, def_block, header_idx, store, 32);
+    if debug {
+        eprintln!("[AFFINE] cand={} -> {:?}; store={} -> {:?}",
+            cand.0, cf.as_ref().map(|f| (f.root, &f.syms, f.konst, f.march)),
+            store.0, sf.as_ref().map(|f| (f.root, &f.syms, f.konst, f.march)));
+    }
+    let (Some(cf), Some(sf)) = (cf, sf) else { return false };
+    if cf.root == 0 || cf.root != sf.root { return false; }
+
+    let (cand_sz, store_sz) = (byte_size(cand_ty), byte_size(store_ty));
+    if sf.march == 0 && cf.march == 0 {
+        // Both invariant: plain constant range separation.
+        if cf.syms != sf.syms { return false; }
+        return cf.konst + cand_sz <= sf.konst || sf.konst + store_sz <= cf.konst;
+    }
+    if cf.march != 0 { return false; } // candidate itself marches
+    if cf.syms != sf.syms { return false; }
+    if sf.march > 0 {
+        // Store range starts at or above the candidate's top and marches up.
+        sf.konst >= cf.konst + cand_sz
+    } else {
+        // Store range ends at or below the candidate's bottom and marches down.
+        sf.konst + store_sz <= cf.konst
+    }
+}
+
 pub(crate) fn run(func: &mut IrFunction) -> usize {
+    // Promote one pointer at a time, rescanning after each success: index
+    // bookkeeping stays simple and already-promoted loops no longer match.
+    // Each promotion strictly reduces the loop's memory-op count, so this
+    // terminates quickly.
+    let mut total = 0;
+    for _ in 0..64 {
+        let n = run_once(func);
+        if n == 0 { break; }
+        total += n;
+    }
+    total
+}
+
+fn run_once(func: &mut IrFunction) -> usize {
     let cfg = CfgAnalysis::build(func);
     let loops = loop_analysis::merge_loops_by_header(loop_analysis::find_natural_loops(
         cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom));
@@ -122,10 +451,20 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
             for (&other_ptr, other_stores) in &stores {
                 if other_ptr == ptr_id { continue; }
                 for (_, _, _, other_ty) in other_stores {
-                    if !disjoint(&paths, ptr, load_ty, Value(other_ptr), *other_ty) { alias = true; }
+                    let other = Value(other_ptr);
+                    if !disjoint(&paths, ptr, load_ty, other, *other_ty)
+                        && !affine_disjoint(func, &lp.body, &def_block, lp.header,
+                                            ptr, load_ty, other, *other_ty)
+                    {
+                        alias = true;
+                    }
                 }
             }
             if alias { continue; }
+            if std::env::var("CCC_DEBUG_PROMOTE").is_ok() {
+                eprintln!("[PROMOTE] func={} loop header={} ptr=Value({}) ty={:?}",
+                    func.name, lp.header, ptr_id, load_ty);
+            }
 
             let init = Value(func.next_value_id); func.next_value_id += 1;
             let phi = Value(func.next_value_id); func.next_value_id += 1;
