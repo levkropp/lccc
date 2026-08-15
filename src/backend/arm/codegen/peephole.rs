@@ -427,6 +427,7 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= eliminate_adjacent_store_load(&mut lines, &mut kinds, n);
         changed |= eliminate_redundant_branches(&lines, &mut kinds, n);
         changed |= eliminate_self_moves(&mut kinds, n);
+        changed |= eliminate_redundant_sxtw(&mut lines, &mut kinds, n);
         changed |= eliminate_move_chains(&mut lines, &mut kinds, n);
         changed |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
         changed |= propagate_address_aliases(&mut lines, &mut kinds, n);
@@ -458,6 +459,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_adjacent_store_load(&mut lines, &mut kinds, n);
             changed2 |= eliminate_redundant_branches(&lines, &mut kinds, n);
             changed2 |= eliminate_self_moves(&mut kinds, n);
+            changed2 |= eliminate_redundant_sxtw(&mut lines, &mut kinds, n);
             changed2 |= eliminate_move_chains(&mut lines, &mut kinds, n);
             changed2 |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
             changed2 |= propagate_address_aliases(&mut lines, &mut kinds, n);
@@ -842,6 +844,92 @@ fn eliminate_self_moves(kinds: &mut [LineKind], n: usize) -> bool {
                 // so it is NOT a true no-op and must be preserved.
                 kinds[i] = LineKind::Nop;
                 changed = true;
+            }
+        }
+    }
+    changed
+}
+
+// ── Pass 3b: Redundant sign-extension elimination ───────────────────────────
+//
+// Pattern: `sxtw xD, wS` where xS already holds a sign-extended value (written
+// by `ldrsw`, an earlier `sxtw`, or a 64-bit mov of an extended register).
+// The sxtw recomputes what is already true — replace with `mov xD, xS`
+// (or drop entirely when D == S). Common after `ldrsw x0, [..]; mov xR, x0`
+// feeding an I32→I64 cast (e.g. dot_product's per-load sxtw).
+//
+// A register stops being known-extended on any write: w-writes zero the upper
+// bits, x-writes of unknown provenance clobber conservatively. All tracking is
+// cleared at labels, branches, and calls.
+
+fn eliminate_redundant_sxtw(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut extended = [false; 33];
+    extended[32] = true; // xzr is always "extended" (sxtw xD, wzr ≡ mov xD, xzr)
+    let mut changed = false;
+    for i in 0..n {
+        match kinds[i] {
+            // Control-flow barriers: nothing is known across them.
+            LineKind::Label | LineKind::Branch | LineKind::CondBranch
+            | LineKind::CmpBranch | LineKind::Call | LineKind::Ret => {
+                extended = [false; 33];
+                extended[32] = true;
+            }
+            // Unknown/memory kinds may clobber registers — except ldrsw with
+            // non-sp addressing (classifies as MemOther), which CREATES a
+            // sign-extended register.
+            LineKind::MemOther | LineKind::Other | LineKind::LoadsbReg | LineKind::LoadPairSp => {
+                let t = lines[i].trim();
+                let mut ldrsw_dst: Option<u8> = None;
+                if let Some(rest) = t.strip_prefix("ldrsw ") {
+                    if let Some((reg_str, _)) = rest.split_once(',') {
+                        let r = parse_reg(reg_str.trim());
+                        if r != REG_NONE && r < 32 {
+                            ldrsw_dst = Some(r);
+                        }
+                    }
+                }
+                extended = [false; 33];
+                extended[32] = true;
+                if let Some(r) = ldrsw_dst {
+                    extended[r as usize] = true;
+                }
+            }
+            LineKind::LoadswSp { reg, .. } => {
+                if reg < 32 {
+                    extended[reg as usize] = true;
+                }
+            }
+            LineKind::Sxtw { dst, src } => {
+                if extended[src as usize] {
+                    if dst == src {
+                        kinds[i] = LineKind::Nop;
+                    } else {
+                        lines[i] = format!("    mov {}, {}", xreg_name(dst), xreg_name(src));
+                        kinds[i] = LineKind::Move { dst, src, is_32bit: false };
+                    }
+                    changed = true;
+                }
+                // Whether redundant or not, the sxtw result is sign-extended.
+                if dst < 32 {
+                    extended[dst as usize] = true;
+                }
+            }
+            LineKind::Move { dst, src, is_32bit } => {
+                if is_32bit {
+                    // mov wN, wM zero-extends into xN — NOT a sign extension.
+                    if dst < 32 {
+                        extended[dst as usize] = false;
+                    }
+                } else if dst < 32 {
+                    extended[dst as usize] = extended[src as usize];
+                }
+            }
+            _ => {
+                if let Some(dst) = written_gp_register(&lines[i], kinds[i]) {
+                    if dst < 32 {
+                        extended[dst as usize] = false;
+                    }
+                }
             }
         }
     }
