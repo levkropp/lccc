@@ -420,6 +420,7 @@ pub fn peephole_optimize(asm: String) -> String {
     }
 
     // Phase 1: Iterative local passes (up to 8 rounds)
+    let rotate = std::env::var("CCC_NO_LOOP_ROTATE").is_err();
     let mut changed = true;
     let mut rounds = 0;
     while changed && rounds < 8 {
@@ -433,6 +434,9 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= propagate_address_aliases(&mut lines, &mut kinds, n);
         changed |= fold_destructive_pointer_updates(&mut lines, &mut kinds, n);
         changed |= fuse_branch_over_branch(&mut lines, &mut kinds, n);
+        if rotate {
+            changed |= rotate_simple_loops(&mut lines, &mut kinds, n);
+        }
         rounds += 1;
     }
 
@@ -1320,6 +1324,169 @@ fn extract_sp_offset(line: &str) -> Option<i32> {
     }
     None
 }
+
+/// Loop rotation: convert header-tested loops into bottom-tested loops.
+///
+/// ```text
+/// .Lhdr:                      .Lhdr:                 (guard, runs once)
+///     cmp a, b                    cmp a, b
+///     b.cc .Lbody                 b.cc .Lbody
+/// .Lskip:                       .Lskip:
+///     b .Lexit                    b .Lexit
+/// .Lbody:            →          .Lbody:
+///     <body>                      <body>
+///     b .Lhdr                     cmp a, b           (duplicated test)
+///                                 b.cc .Lbody        (one branch per iteration)
+///                                 b .Lskip           (taken once, on exit)
+/// ```
+///
+/// Saves one unconditional branch per iteration. Sound because every register
+/// the header test reads is live throughout the loop (it is read again next
+/// iteration), so it is never clobbered by unrelated assignments, and loop
+/// phis have already been updated to the next iteration's value at the latch
+/// (backedge phi copies are emitted at the end of the latch, before the
+/// backedge branch this pass replaces).
+fn rotate_simple_loops(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for i in 0..n {
+        if kinds[i] != LineKind::Branch {
+            continue;
+        }
+        let Some(header_target) = branch_target(lines[i].trim_start()) else {
+            continue;
+        };
+        // Find the header label earlier in the text (a backward branch).
+        let header_label = format!("{}:", header_target);
+        let mut header_pos = None;
+        for l in 0..i {
+            if kinds[l] == LineKind::Label && lines[l].trim() == header_label {
+                header_pos = Some(l);
+                break;
+            }
+        }
+        let Some(h) = header_pos else { continue; };
+
+        // Single backedge only: this must be the one and only `b .Lhdr`.
+        let backedge_count = (0..n)
+            .filter(|&j| kinds[j] == LineKind::Branch
+                && branch_target(lines[j].trim_start()) == Some(header_target))
+            .count();
+        if backedge_count != 1 {
+            continue;
+        }
+
+        // No calls, returns, or indirect branches inside the loop.
+        let mut bad = false;
+        for j in h..=i {
+            match kinds[j] {
+                LineKind::Ret | LineKind::Call | LineKind::CmpBranch => {
+                    bad = true;
+                    break;
+                }
+                _ => {
+                    let t = lines[j].trim_start();
+                    if t.starts_with("br ") || t.starts_with("blr ") {
+                        bad = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if bad {
+            continue;
+        }
+
+        // Collect the header setup: pure, flag-preserving instructions after
+        // the label, ending in a Compare, followed by a conditional branch.
+        let mut setup: Vec<usize> = Vec::new();
+        let mut pos = h + 1;
+        let mut cj = None;
+        while pos < i {
+            if kinds[pos] == LineKind::Nop {
+                pos += 1;
+                continue;
+            }
+            match kinds[pos] {
+                LineKind::CondBranch => {
+                    cj = Some(pos);
+                    break;
+                }
+                LineKind::Compare
+                | LineKind::Move { .. }
+                | LineKind::MoveImm { .. }
+                | LineKind::MoveWide { .. }
+                | LineKind::Sxtw { .. }
+                | LineKind::LoadSp { .. }
+                | LineKind::LoadswSp { .. }
+                | LineKind::LoadPairSp { .. } => {
+                    setup.push(pos);
+                    if setup.len() > 3 {
+                        break;
+                    }
+                    pos += 1;
+                }
+                _ => break,
+            }
+        }
+        let Some(cj_pos) = cj else { continue };
+        if setup.is_empty() || setup.len() > 3 {
+            continue;
+        }
+        // The compare must be the last setup instruction: it sets the flags
+        // the conditional branch consumes (moves/loads don't touch flags).
+        if kinds[*setup.last().unwrap()] != LineKind::Compare {
+            continue;
+        }
+
+        // The conditional branch gives the loop-back condition and body target.
+        let Some((cc, body_target)) = cond_branch_parts(lines[cj_pos].trim_start()) else {
+            continue;
+        };
+        // The body target must be a label inside the loop, after the cond branch.
+        let body_label = format!("{}:", body_target);
+        let body_found = ((cj_pos + 1)..=i).any(|l| {
+            kinds[l] == LineKind::Label && lines[l].trim() == body_label
+        });
+        if !body_found {
+            continue;
+        }
+
+        // The exit target is the first label after the cond branch: the
+        // not-taken path of the header guard (typically the .Lskip trampoline
+        // or the exit block itself).
+        let mut exit_target = None;
+        for l in (cj_pos + 1)..n {
+            if kinds[l] == LineKind::Nop {
+                continue;
+            }
+            if kinds[l] == LineKind::Label {
+                exit_target = label_name(lines[l].trim());
+            }
+            break;
+        }
+        let Some(exit_lbl) = exit_target else { continue };
+        if exit_lbl == body_target || exit_lbl == header_target {
+            continue;
+        }
+
+        // Build the rotated latch: setup copy + cond branch to body + exit.
+        let mut repl = String::new();
+        for &s in &setup {
+            repl.push_str(&lines[s]);
+            repl.push('\n');
+        }
+        repl.push_str(&format!("    b.{} {}", cc, body_target));
+        repl.push('\n');
+        repl.push_str(&format!("    b {}", exit_lbl));
+        lines[i] = repl;
+        // The slot now holds a multi-line sequence; keep branch passes from
+        // re-examining it (its embedded branches are final).
+        kinds[i] = LineKind::Other;
+        changed = true;
+    }
+    changed
+}
+
 
 #[cfg(test)]
 mod tests {

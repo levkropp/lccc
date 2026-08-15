@@ -20,4 +20,21 @@ Benchmark: tests/benchmark loop_patterns (sum_array, dot_product, scale_add,
 cond_sum). Validate with run_benchmarks.py --only loop_patterns --reps 5 plus
 full 18/18 byte-identical and cargo test --release.
 
+Status: DONE (committed 36e6cb18 + 7588ff31). loop_patterns 1.86x -> 1.28x.
+
+- sum_array: 4-wide via VecSadalpI32x4 (sadalp) — now BEATS GCC (0.43x fn-level).
+- dot_product: (long)a[i]*b[i] matched (cast-of-load mul operands), 4-wide
+  smlal/smlal2 into two 2xI64 accumulators — beats GCC (0.66x fn-level).
+- scale_add: map vectorization 4-wide (dup scale/offset, mul/add, str q),
+  alias-gated to provably distinct global/alloca bases. Remainder loop handles
+  N%4. GCC -O2 does not vectorize it; we win fn-level.
+- sum_positive/find_max: NOT vectorized (conditional). Instead: if-conversion
+  now fires (arm reloads of pred-loaded addresses rewritten to copies) and
+  AArch64 fuses cmp+select (csel, no cset). ~parity with GCC scalar csel.
+- Fixed assembler bug: saddlp/uaddlp/sadalp/uadalp took size from the dest
+  arrangement (reserved encoding -> SIGILL); now from the source arrangement.
+
+Remaining upside: loop rotation (2 branches/iter -> 1) helps all these loops;
+VM timing noise is ±10-20%, so micro-comparisons need same-run A/B.
+
 Started: 2026-08-15
