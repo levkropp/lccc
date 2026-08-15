@@ -760,6 +760,11 @@ pub trait ArchCodegen {
                 }
             });
             if let Some(off) = const_offset {
+                // Register-direct path: base and dest both register-assigned —
+                // emit a single add/sub with no accumulator round-trip.
+                if self.emit_gep_reg_const(dest, base, off) {
+                    return;
+                }
                 if let Some(addr) = self.state_ref().resolve_slot_addr(base.0) {
                     match addr {
                         SlotAddr::OverAligned(slot, id) => {
@@ -816,6 +821,13 @@ pub trait ArchCodegen {
         // Default fallback: lea slot(%rbp) to secondary, load offset to acc, add.
         self.emit_slot_addr_to_secondary(slot, true, 0);
         self.emit_gep_add_const_to_acc_from_secondary(offset);
+    }
+
+    /// Register-direct GEP hook: base and dest both live in registers and the
+    /// offset is a constant. Backends that can emit a single add/sub override
+    /// this and return true. Default: not handled (falls back to slot paths).
+    fn emit_gep_reg_const(&mut self, _dest: &Value, _base: &Value, _offset: i64) -> bool {
+        false
     }
 
     /// Emit optimized GEP for Indirect base + constant offset.

@@ -74,7 +74,10 @@ pub(super) fn callee_saved_name_32(reg: PhysReg) -> &'static str {
 }
 
 pub(super) fn is_arm_fp_phys(reg: PhysReg) -> bool {
-    (40..=55).contains(&reg.0)
+    // 40..=55 map to v16..v31 (d16..d31); 32..=38 map to d8..d14 — the
+    // callee-saved FP registers (d15/v15 is scratch in the FMA intrinsic path,
+    // so it is not allocated).
+    (32..=38).contains(&reg.0) || (40..=55).contains(&reg.0)
 }
 
 pub(super) fn arm_fp_name(reg: PhysReg, ty: IrType) -> String {
@@ -186,6 +189,11 @@ pub struct ArmCodegen {
     pub(super) used_callee_saved: Vec<PhysReg>,
     /// SP offset where callee-saved registers are stored.
     pub(super) callee_save_offset: i64,
+    /// Which callee-saved FP registers (d8-d14, allocator IDs 32-38) are
+    /// actually used by the FP allocator (for save/restore).
+    pub(super) used_fp_callee_saved: Vec<PhysReg>,
+    /// SP offset where callee-saved FP registers are stored.
+    pub(super) fp_callee_save_offset: i64,
     /// For large stack frames: reserved for future x19 frame base optimization.
     /// Currently always None (optimization disabled due to correctness issue).
     pub(super) frame_base_offset: Option<i64>,
@@ -212,6 +220,8 @@ impl ArmCodegen {
             loop_promoted_f64_values: Vec::new(),
             used_callee_saved: Vec::new(),
             callee_save_offset: 0,
+            used_fp_callee_saved: Vec::new(),
+            fp_callee_save_offset: 0,
             frame_base_offset: None,
             general_regs_only: false,
         }
@@ -557,6 +567,24 @@ impl ArmCodegen {
             let r = callee_saved_name(used_regs[i]);
             let offset = base + (i as i64) * 8;
             self.emit_load_from_sp(r, offset, "ldr");
+        }
+
+        // Restore callee-saved FP registers (d8-d14).
+        let used_fp = self.used_fp_callee_saved.clone();
+        let fp_base = self.fp_callee_save_offset;
+        let m = used_fp.len();
+        let mut j = 0;
+        while j + 1 < m {
+            let r1 = format!("d{}", used_fp[j].0 - 24);
+            let r2 = format!("d{}", used_fp[j + 1].0 - 24);
+            let offset = fp_base + (j as i64) * 8;
+            self.emit_ldp_from_sp(&r1, &r2, offset);
+            j += 2;
+        }
+        if j < m {
+            let r = format!("d{}", used_fp[j].0 - 24);
+            let offset = fp_base + (j as i64) * 8;
+            self.emit_load_from_sp(&r, offset, "ldr");
         }
     }
 
@@ -2056,6 +2084,26 @@ impl ArchCodegen for ArmCodegen {
     fn emit_save_acc(&mut self) { self.state.emit("    mov x1, x0"); }
     fn emit_add_secondary_to_acc(&mut self) { self.state.emit("    add x0, x1, x0"); }
     fn emit_gep_add_const_to_acc(&mut self, offset: i64) { if offset != 0 { self.emit_add_imm_to_acc_impl(offset); } }
+
+    /// Register-direct GEP: `add dest_reg, base_reg, #imm` with no accumulator
+    /// round-trip. Covers the pointer-marching pattern in every array/struct
+    /// loop (`p += stride`), which otherwise costs mov+add+mov per iteration.
+    fn emit_gep_reg_const(&mut self, dest: &Value, base: &Value, offset: i64) -> bool {
+        let base_reg = self.get_phys_reg_for_value(base.0).filter(|r| !is_arm_fp_phys(*r));
+        let dest_reg = self.get_phys_reg_for_value(dest.0).filter(|r| !is_arm_fp_phys(*r));
+        let (Some(br), Some(dr)) = (base_reg, dest_reg) else { return false };
+        let b = callee_saved_name(br);
+        let d = callee_saved_name(dr);
+        if (0..=4095).contains(&offset) {
+            self.state.emit_fmt(format_args!("    add {}, {}, #{}", d, b, offset));
+        } else if offset < 0 && (-offset) <= 4095 {
+            self.state.emit_fmt(format_args!("    sub {}, {}, #{}", d, b, -offset));
+        } else {
+            return false;
+        }
+        self.state.reg_cache.invalidate_acc();
+        true
+    }
     fn emit_acc_to_secondary(&mut self) { self.state.emit("    mov x1, x0"); }
     fn emit_reg_to_acc(&mut self, reg: PhysReg) {
         self.state.emit_fmt(format_args!("    mov x0, {}", callee_saved_name(reg)));

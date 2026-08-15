@@ -79,6 +79,20 @@ impl ArmCodegen {
             false,
         );
 
+        // Callee-saved FP registers (d8-d14, allocator IDs 32-38) assigned by
+        // the FP scan must be preserved by the prologue/epilogue.
+        self.used_fp_callee_saved = {
+            let mut v: Vec<PhysReg> = self
+                .reg_assignments
+                .values()
+                .copied()
+                .filter(|r| (32..=38).contains(&r.0))
+                .collect();
+            v.sort_by_key(|r| r.0);
+            v.dedup();
+            v
+        };
+
         let mut space = calculate_stack_space_common(&mut self.state, func, 16, |space, alloc_size, align| {
             let effective_align = if align > 0 { align.max(8) } else { 8 };
             let slot = (space + effective_align - 1) & !(effective_align - 1);
@@ -127,6 +141,13 @@ impl ArmCodegen {
             space += save_count * 8;
         }
 
+        let fp_save_count = self.used_fp_callee_saved.len() as i64;
+        if fp_save_count > 0 {
+            space = (space + 7) & !7;
+            self.fp_callee_save_offset = space;
+            space += fp_save_count * 8;
+        }
+
         space
     }
 
@@ -159,6 +180,24 @@ impl ArmCodegen {
             let r = callee_saved_name(used_regs[i]);
             let offset = base + (i as i64) * 8;
             self.emit_store_to_sp(r, offset, "str");
+        }
+
+        // Save callee-saved FP registers (d8-d14) used by the FP allocator.
+        let used_fp = self.used_fp_callee_saved.clone();
+        let fp_base = self.fp_callee_save_offset;
+        let m = used_fp.len();
+        let mut j = 0;
+        while j + 1 < m {
+            let r1 = format!("d{}", used_fp[j].0 - 24);
+            let r2 = format!("d{}", used_fp[j + 1].0 - 24);
+            let offset = fp_base + (j as i64) * 8;
+            self.emit_stp_to_sp(&r1, &r2, offset);
+            j += 2;
+        }
+        if j < m {
+            let r = format!("d{}", used_fp[j].0 - 24);
+            let offset = fp_base + (j as i64) * 8;
+            self.emit_store_to_sp(&r, offset, "str");
         }
     }
 

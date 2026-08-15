@@ -770,8 +770,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // chain (e.g. `fmadd d16, .., d16` instead of fmadd into a temp + fmov).
     if arm_fp_pool {
         for &(phi_dest, backedge_src) in &all_phi_pairs {
-            let d_reg = assignments.get(&phi_dest).copied().filter(|r| (40..=55).contains(&r.0));
-            let s_reg = assignments.get(&backedge_src).copied().filter(|r| (40..=55).contains(&r.0));
+            let d_reg = assignments.get(&phi_dest).copied().filter(|r| (32..=38).contains(&r.0) || (40..=55).contains(&r.0));
+            let s_reg = assignments.get(&backedge_src).copied().filter(|r| (32..=38).contains(&r.0) || (40..=55).contains(&r.0));
             let (Some(d), Some(s)) = (d_reg, s_reg) else { continue };
             if d == s {
                 continue;

@@ -37,17 +37,25 @@ pub fn run_regalloc_and_merge_clobbers(
     } else if available_regs.iter().any(|r| r.0 == 28) {
         // AArch64: v16-v23 are caller-saved SIMD/FP registers.  Keep their
         // allocator IDs disjoint from x0-x30; the ARM emitter maps 40..47 to
-        // d16..d23.  The generic FP allocator only assigns values that do not
-        // span calls, so no save/restore sequence is required.
+        // d16..d23.
         //
         // When the function has no loop-promoted F64 values, the dedicated
         // d24..d31 promotion pool (allocator IDs 48..55) is unused, so open it
         // up to the general scan — FP-heavy loops easily keep 8+ values live.
-        if func.loop_promoted_f64_values.is_empty() {
+        let mut regs: Vec<PhysReg> = if func.loop_promoted_f64_values.is_empty() {
             (40..=55).map(PhysReg).collect()
         } else {
             (40..=47).map(PhysReg).collect()
+        };
+        // d8..d14 (allocator IDs 32..38) are the callee-saved FP registers.
+        // They are appended last so the cheaper caller-saved pool fills first;
+        // the prologue saves only the ones actually assigned. d15/v15 stays
+        // reserved (scratch in the FMA intrinsic path). CCC_NO_FP_CALLEE_SAVED
+        // disables for A/B.
+        if std::env::var("CCC_NO_FP_CALLEE_SAVED").is_err() {
+            regs.extend((32..=38).map(PhysReg));
         }
+        regs
     } else {
         Vec::new()
     };
