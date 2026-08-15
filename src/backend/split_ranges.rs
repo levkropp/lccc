@@ -9,7 +9,196 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{IrType, AddressSpace};
 use crate::ir::reexports::*;
 use crate::ir::analysis;
+use crate::passes::loop_analysis;
 use std::collections::VecDeque;
+
+/// Check whether block `a` is dominated by block `b` (walk a's idom chain to b).
+fn dominated_by(idom: &[usize], a: usize, b: usize) -> bool {
+    let mut cur = a;
+    for _ in 0..idom.len() + 1 {
+        if cur == b { return true; }
+        if cur >= idom.len() { return false; }
+        let next = idom[cur];
+        if next == cur || next == usize::MAX { return false; }
+        cur = next;
+    }
+    false
+}
+
+/// Live-range splitting at loop boundaries.
+///
+/// When a value is live across a hot inner loop but never used inside it,
+/// it occupies a register for the whole loop while contributing nothing.
+/// This splits such values: spill to a stack slot right before the loop and
+/// reload into a fresh value right after, freeing the register for the loop.
+///
+/// The spill slot is a *volatile* alloca (never mem2reg-promoted), so the
+/// store/reload is a real memory round-trip — that is what actually shortens
+/// the value's live range (mem2reg would forward and collapse the split).
+pub fn split_loop_transparent_ranges(func: &mut IrFunction, max_splits: usize) -> usize {
+    if func.blocks.len() < 2 || max_splits == 0 { return 0; }
+    let debug = std::env::var("CCC_DEBUG_SPLIT").is_ok();
+
+    let label_map = analysis::build_label_map(func);
+    let (preds, succs) = analysis::build_cfg(func, &label_map);
+    let idom = analysis::compute_dominators(func.blocks.len(), &preds, &succs);
+    let loops = loop_analysis::find_natural_loops(func.blocks.len(), &preds, &succs, &idom);
+    if loops.is_empty() { return 0; }
+
+    // Process innermost loops first (smallest bodies = innermost).
+    let mut sorted_loops = loops;
+    sorted_loops.sort_by_key(|l| l.body.len());
+
+    let mut next_val = func.next_value_id;
+    let mut splits = 0;
+
+    for lp in &sorted_loops {
+        if splits >= max_splits { break; }
+        let header = lp.header;
+        let body = &lp.body;
+
+        // Preheader: single predecessor of the header outside the loop.
+        let Some(preheader) = loop_analysis::find_preheader(header, body, &preds) else { continue };
+
+        // Exit: the single successor outside the loop.
+        let mut exit_block = None;
+        for &bi in body.iter() {
+            for &s in succs.row(bi) {
+                let s = s as usize;
+                if !body.contains(&s) {
+                    if exit_block == Some(s) { continue; }
+                    if exit_block.is_some() { exit_block = None; break; }
+                    exit_block = Some(s);
+                }
+            }
+            if exit_block.is_none() { break; }
+        }
+        let Some(exit_block) = exit_block else { continue };
+
+        // The preheader must dominate the header's loop (so a store there is
+        // always executed before the loop) and the exit must be dominated by
+        // nothing inside the loop... we require the exit to dominate all
+        // replaced uses, checked per-use below.
+
+        // Collect values used inside the loop.
+        let mut used_in_loop: FxHashSet<u32> = FxHashSet::default();
+        for &bi in body.iter() {
+            for inst in &func.blocks[bi].instructions {
+                super::liveness::for_each_value_use_in_instruction(inst, |v| {
+                    used_in_loop.insert(v.0);
+                });
+            }
+            super::liveness::for_each_operand_in_terminator(&func.blocks[bi].terminator, |op| {
+                if let Operand::Value(v) = op { used_in_loop.insert(v.0); }
+            });
+        }
+
+        // Candidate values: defined before the loop, not used inside it, and
+        // used in blocks dominated by the exit block (so the reload covers them).
+        // Collect def block and use blocks per value.
+        let mut def_block: FxHashMap<u32, usize> = FxHashMap::default();
+        let mut use_blocks: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
+        for (bi, block) in func.blocks.iter().enumerate() {
+            for inst in &block.instructions {
+                if let Some(d) = inst.dest() {
+                    def_block.entry(d.0).or_insert(bi);
+                }
+                super::liveness::for_each_value_use_in_instruction(inst, |v| {
+                    use_blocks.entry(v.0).or_default().push(bi);
+                });
+            }
+            super::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
+                if let Operand::Value(v) = op { use_blocks.entry(v.0).or_default().push(bi); }
+            });
+        }
+
+        // Evaluate each value not used in the loop.
+        let mut candidates: Vec<u32> = Vec::new();
+        for (&vid, &defb) in &def_block {
+            if used_in_loop.contains(&vid) { continue; }
+            // Must be defined before the loop: def block dominates the preheader
+            // (or is the preheader / earlier). This guarantees the store reads a
+            // defined value.
+            if !dominated_by(&idom, preheader, defb) { continue; }
+            // Must be used in at least one block dominated by the exit block.
+            let uses = match use_blocks.get(&vid) { Some(u) => u, None => continue };
+            let post_uses: Vec<usize> = uses.iter().copied()
+                .filter(|&ub| !body.contains(&ub) && dominated_by(&idom, ub, exit_block))
+                .collect();
+            if post_uses.is_empty() { continue; }
+            // All uses outside the loop must be dominated by the exit (otherwise
+            // the value stays live across the loop for the uncovered uses and
+            // the split buys nothing).
+            let all_covered = uses.iter().all(|&ub| {
+                body.contains(&ub) == false && dominated_by(&idom, ub, exit_block)
+            });
+            if !all_covered { continue; }
+            // Type must be a simple scalar/pointer (not float/128-bit).
+            let Some(ty) = find_value_type(func, vid) else { continue };
+            if ty.is_float() || ty.is_long_double() || ty.is_128bit() { continue; }
+            candidates.push(vid);
+        }
+
+        // Limit splits per loop to avoid blowing up the frame.
+        for &vid in candidates.iter().take(4) {
+            if splits >= max_splits { break; }
+            if debug {
+                eprintln!("[SPLIT-LOOP] func {} loop header {}: split value {} at exit block {}",
+                    func.name, header, vid, exit_block);
+            }
+
+            // Volatile alloca as the spill slot (never promoted).
+            let alloca_val = Value(next_val); next_val += 1;
+            let ty = find_value_type(func, vid).unwrap();
+            let insert_pos = func.blocks[0].instructions.iter()
+                .position(|i| !matches!(i, Instruction::Alloca { .. }))
+                .unwrap_or(func.blocks[0].instructions.len());
+            func.blocks[0].instructions.insert(insert_pos, Instruction::Alloca {
+                dest: alloca_val, ty, size: ty.size(), align: 0, volatile: true,
+            });
+            func.blocks[0].source_spans.clear();
+
+            // Store V right before the loop, at the end of the preheader.
+            {
+                let block = &mut func.blocks[preheader];
+                block.instructions.push(Instruction::Store {
+                    val: Operand::Value(Value(vid)), ptr: alloca_val,
+                    ty, seg_override: AddressSpace::Default,
+                });
+                block.source_spans.clear();
+            }
+
+            // Load a fresh value at the start of the exit block.
+            let new_val = Value(next_val); next_val += 1;
+            {
+                let block = &mut func.blocks[exit_block];
+                block.instructions.insert(0, Instruction::Load {
+                    dest: new_val, ptr: alloca_val,
+                    ty, seg_override: AddressSpace::Default,
+                });
+                block.source_spans.clear();
+            }
+
+            // Replace uses of V with V_new in blocks dominated by the exit block.
+            let mut map: FxHashMap<u32, u32> = FxHashMap::default();
+            map.insert(vid, new_val.0);
+            for (bi, block) in func.blocks.iter_mut().enumerate() {
+                if body.contains(&bi) { continue; }
+                if !dominated_by(&idom, bi, exit_block) { continue; }
+                for inst in &mut block.instructions {
+                    crate::passes::tail_call_elim::replace_values_in_inst(inst, &map);
+                }
+            }
+            // Also the exit block's own terminator (after the load at index 0).
+            splits += 1;
+        }
+    }
+
+    if splits > 0 {
+        func.next_value_id = next_val;
+    }
+    splits
+}
 
 pub fn split_call_spanning_ranges(func: &mut IrFunction, max_splits: usize) -> usize {
     if func.blocks.is_empty() || max_splits == 0 { return 0; }

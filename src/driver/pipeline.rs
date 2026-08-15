@@ -1096,6 +1096,20 @@ impl Driver {
                     if n > 0 { did_split = true; }
                 }
             }
+            // Loop-transparent splitting (spill values live across a hot loop
+            // but unused inside it). NOTE: measured as a net loss on the
+            // benchmark suite — the store/reload round-trips cost more than the
+            // freed registers save, because the values competing for registers
+            // in hot loops are the in-loop ones (bases/IVs), which can't be
+            // transparent-split. Kept opt-in for reference.
+            if std::env::var("CCC_LOOP_SPLIT").is_ok() {
+                for func in &mut module.functions {
+                    if !func.is_declaration && !func.blocks.is_empty() {
+                        let n = crate::backend::split_ranges::split_loop_transparent_ranges(func, max_splits);
+                        if n > 0 { did_split = true; }
+                    }
+                }
+            }
             // Run cleanup passes on split IR: copy propagation + DCE
             // to eliminate redundant Store/Load → Copy chains from mem2reg
             if did_split {
