@@ -26,7 +26,7 @@
 use super::live_range::{self, LinearScanAllocator};
 use super::liveness::{
     compute_live_intervals, for_each_operand_in_instruction, for_each_operand_in_terminator,
-    LiveInterval, LivenessResult,
+    for_each_value_use_in_instruction, LiveInterval, LivenessResult,
 };
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
@@ -260,6 +260,12 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     *use_count.entry(v.0).or_insert(0) += weight;
                 }
             });
+            // Pointer/base uses (Store.ptr, Load.ptr, GEP.base, memcpy endpoints)
+            // are direct Value references, not Operands. Count them too so a
+            // loop-carried pointer ranks by its true temperature instead of 0.
+            for_each_value_use_in_instruction(inst, |v| {
+                *use_count.entry(v.0).or_insert(0) += weight;
+            });
         }
         for_each_operand_in_terminator(&block.terminator, |op| {
             if let Operand::Value(v) = op {
@@ -354,6 +360,133 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     allocator.run();
 
     let mut assignments = allocator.assignments;
+
+    // --- Post-scan rebalance: steal registers for hot loop-carried values ---
+    //
+    // The linear scan processes ranges in start order and never evicts, so
+    // cold function-spanning values (array bases, globals, prologue pointers)
+    // win every callee-saved register simply by starting first, leaving hot
+    // inner-loop-carried phi values (IVs, accumulators, carried pointers)
+    // stack-homed (e.g. fannkuch's flip loop, arith_loop).
+    //
+    // For each hot loop-carried phi dest the scan MISSED, pick the register
+    // whose conflicting holders (live interval overlaps the hot value's) have
+    // the coldest total use count, and fully deallocate those holders back to
+    // the stack. This is safe where eviction inside the scan was not: an
+    // evicted holder is deallocated for its ENTIRE interval — indistinguishable
+    // from never having been assigned, so the default stack path handles all
+    // its uses — and every remaining holder is provably non-overlapping with
+    // the hot value. No live range is ever split, and when the scan already
+    // housed every hot value (e.g. spectral_norm) the rebalance is a no-op.
+    //
+    // AArch64-only: relies on the wide callee-saved GPR pool.
+    // CCC_NO_LOOP_PIN disables; CCC_LOOP_PIN=N caps steals per function (default 2).
+    if std::env::var("CCC_NO_LOOP_PIN").is_err()
+        && config.xmm_regs.first().is_some_and(|r| r.0 == 40)
+        && !all_phi_pairs.is_empty()
+    {
+        let k: usize = std::env::var("CCC_LOOP_PIN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2);
+        // Values whose register assignment the phi-coalesce propagation below
+        // depends on; stealing from them would defeat coalescing.
+        let phi_pair_values: FxHashSet<u32> = phi_coalesce
+            .iter()
+            .flat_map(|&(d, s)| [d, s])
+            .collect();
+        // Rank loop-carried phi dests by loop-weighted use count (uses inside
+        // a loop at depth D contribute 10^D, so hot inner-loop values sort first).
+        let mut candidates: Vec<(u32, u64)> = all_phi_pairs
+            .iter()
+            .map(|&(phi_dest, _)| phi_dest)
+            .filter(|v| eligible.contains(v))
+            .filter(|v| {
+                liveness
+                    .intervals
+                    .iter()
+                    .any(|iv| iv.value_id == *v && iv.end > iv.start)
+            })
+            .map(|v| (v, use_count.get(&v).copied().unwrap_or(0)))
+            .filter(|&(_, count)| count >= 10) // at least one in-loop use
+            .collect();
+        candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        candidates.dedup_by_key(|&mut (v, _)| v);
+
+        // All live-interval segments per value; conflict checks must consider
+        // every segment, not just the first.
+        let mut segs_of: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
+        for iv in &liveness.intervals {
+            segs_of.entry(iv.value_id).or_default().push((iv.start, iv.end));
+        }
+        let overlaps = |a: u32, b: u32| -> bool {
+            let (Some(sa), Some(sb)) = (segs_of.get(&a), segs_of.get(&b)) else {
+                return false;
+            };
+            sa.iter().any(|&(s1, e1)| sb.iter().any(|&(s2, e2)| s1 < e2 && s2 < e1))
+        };
+        // Current register holders, updated as steals happen.
+        let mut holders_by_reg: FxHashMap<u8, Vec<u32>> = FxHashMap::default();
+        for (&v, &r) in &assignments {
+            holders_by_reg.entry(r.0).or_default().push(v);
+        }
+
+        let mut steals = 0;
+        for &(vid, hot_count) in &candidates {
+            if steals >= k {
+                break;
+            }
+            if assignments.contains_key(&vid) {
+                continue; // the scan already housed this hot value
+            }
+            // Choose the register whose CONFLICTING holders are coldest.
+            // Every holder whose live interval overlaps the hot value must be
+            // fully deallocated back to the stack for the steal to be sound;
+            // non-conflicting holders keep timesharing the register. Registers
+            // holding phi-coalesce participants are left alone so backedge
+            // coalescing stays intact. A steal is only taken when the total
+            // evicted use count is strictly colder than the hot value.
+            let mut best: Option<(u8, Vec<u32>, u64)> = None;
+            for (&reg_id, holders) in &holders_by_reg {
+                if holders.iter().any(|h| phi_pair_values.contains(h)) {
+                    continue;
+                }
+                let evict: Vec<u32> = holders
+                    .iter()
+                    .copied()
+                    .filter(|&h| overlaps(h, vid))
+                    .collect();
+                let cost: u64 = evict
+                    .iter()
+                    .map(|h| use_count.get(h).copied().unwrap_or(0))
+                    .sum();
+                if cost >= hot_count {
+                    continue; // not profitable
+                }
+                if best.as_ref().map_or(true, |&(_, _, c)| cost < c) {
+                    best = Some((reg_id, evict, cost));
+                }
+            }
+            if let Some((reg_id, evict, cost)) = best {
+                if std::env::var("CCC_DEBUG_LOOP_PIN").is_ok() {
+                    eprintln!(
+                        "[LOOP_PIN] func={} v{} (use {}) takes reg {}, evicting {:?} (use {})",
+                        func.name, vid, hot_count, reg_id, evict, cost
+                    );
+                }
+                for v in &evict {
+                    assignments.remove(v);
+                    if let Some(h) = holders_by_reg.get_mut(&reg_id) {
+                        h.retain(|x| x != v);
+                    }
+                }
+                assignments.insert(vid, PhysReg(reg_id));
+                holders_by_reg.entry(reg_id).or_default().push(vid);
+                steals += 1;
+            }
+        }
+    }
+
     let mut used_regs_set: FxHashSet<u8> = FxHashSet::default();
     for &reg in assignments.values() {
         used_regs_set.insert(reg.0);
