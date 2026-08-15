@@ -665,6 +665,74 @@ fn detect_cmp_branch_fusion(block: &BasicBlock, use_counts: &[u32], fuse_fp: boo
     Some((cmp_idx, dead_copy_idx))
 }
 
+/// Detect compare-and-select fusion opportunities within a block.
+///
+/// Finds `Select` instructions whose condition is an integer Cmp result used
+/// nowhere else (optionally through one dead Copy), e.g. what if-conversion
+/// produces for `if (a > 0) s += a`. Fusing skips the cset materialization
+/// and emits compare + conditional-select directly.
+///
+/// Returns one entry per fusable Select: (select_idx, cmp_idx, dead_copy_idx).
+/// The cmp_idx/dead_copy_idx instructions are skipped by the caller.
+fn detect_cmp_select_fusion(
+    block: &BasicBlock,
+    use_counts: &[u32],
+) -> Vec<(usize, usize, Option<usize>)> {
+    let uses = |v: u32| -> u32 { use_counts.get(v as usize).copied().unwrap_or(u32::MAX) };
+    let mut out = Vec::new();
+    for (sel_idx, inst) in block.instructions.iter().enumerate() {
+        let Instruction::Select { cond: Operand::Value(cond_v), ty: sel_ty, .. } = inst else {
+            continue;
+        };
+        if sel_ty.is_long_double() || sel_ty.is_128bit() {
+            continue;
+        }
+        // Find the defining Cmp of the select condition, either directly or
+        // through one Copy (SSA means at most one definition exists).
+        let mut cmp_idx = None;
+        let mut copy_idx = None;
+        for (j, prev) in block.instructions[..sel_idx].iter().enumerate() {
+            match prev {
+                Instruction::Cmp { dest, .. } if dest.0 == cond_v.0 => {
+                    cmp_idx = Some(j);
+                    copy_idx = None;
+                }
+                Instruction::Copy { dest, src: Operand::Value(src) } if dest.0 == cond_v.0 => {
+                    for (k, prev2) in block.instructions[..j].iter().enumerate() {
+                        if let Instruction::Cmp { dest: cd, .. } = prev2 {
+                            if cd.0 == src.0 {
+                                cmp_idx = Some(k);
+                                copy_idx = Some(j);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(ci) = cmp_idx else { continue };
+        let Instruction::Cmp { dest: cmp_dest, ty: cmp_ty, .. } = &block.instructions[ci] else {
+            continue;
+        };
+        // Integer comparisons only: FP compares need fcmp and a different
+        // condition-code mapping.
+        if cmp_ty.is_float() || cmp_ty.is_long_double() || cmp_ty.is_128bit() {
+            continue;
+        }
+        // The cmp result must feed only the select (directly, or via the copy).
+        if copy_idx.is_some() {
+            if uses(cmp_dest.0) != 1 || uses(cond_v.0) != 1 {
+                continue;
+            }
+        } else if uses(cmp_dest.0) != 1 {
+            continue;
+        }
+        out.push((sel_idx, ci, copy_idx));
+    }
+    out
+}
+
+
 /// Detect multiply-add fusion opportunities within a block.
 ///
 /// Finds `BinOp::Mul` instructions whose result is used exactly once as an
@@ -1277,6 +1345,11 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
         // instead of materializing the boolean result to a register/stack slot.
         let fuse_idx = detect_cmp_branch_fusion(block, &value_use_counts, cg.supports_fused_fp_cmp_branch());
         let mul_add_fusions = detect_mul_add_fusions(block, &value_use_counts, cg.supports_fused_float_mul_add());
+        let cmp_select_fusions = if cg.supports_fused_cmp_select() {
+            detect_cmp_select_fusion(block, &value_use_counts)
+        } else {
+            Vec::new()
+        };
         let shifted_logical_fusions = if cg.supports_shifted_logical() {
             detect_shifted_logical_fusions(block, &value_use_counts)
         } else {
@@ -1316,6 +1389,12 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
             }
             if fuse_idx.and_then(|f| f.1) == Some(idx) {
                 // Skip the dead Copy between the Cmp and the fused branch.
+                continue;
+            }
+            if cmp_select_fusions.iter().any(|&(_, ci, copy_i)| ci == idx || copy_i == Some(idx)) {
+                // Skip the Cmp (and dead Copy) folded into a fused
+                // compare-and-select emitted at the Select below.
+                cg.state().current_program_point += 1;
                 continue;
             }
             // Skip the Add that was already emitted as part of a fused Mul-Add.
@@ -1393,6 +1472,19 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
                         cg.state().current_program_point += 1;
                         continue;
                     }
+                }
+            }
+
+            // Fused compare-and-select: the Cmp feeding this Select was skipped
+            // above; emit compare + conditional-select directly.
+            if let Some(&(_, ci, _)) = cmp_select_fusions.iter().find(|&&(si, _, _)| si == idx) {
+                if let (Instruction::Select { dest, true_val, false_val, ty: sel_ty, .. },
+                        Instruction::Cmp { op, lhs, rhs, ty: cmp_ty, .. }) =
+                    (inst, &block.instructions[ci])
+                {
+                    cg.emit_fused_cmp_select(*op, lhs, rhs, *cmp_ty, true_val, false_val, dest, *sel_ty);
+                    cg.state().current_program_point += 1;
+                    continue;
                 }
             }
 

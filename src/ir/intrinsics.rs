@@ -209,6 +209,16 @@ pub enum IntrinsicOp {
     VecAddI64x2,
     VecMulI64x2,
 
+    /// NEON sadalp: sign-extend 4×I32 lanes and accumulate adjacent pairs into
+    /// a 2×I64 accumulator: dest = args[0] + pairwise_sums(args[1]).
+    /// Integer addition is associative, so this matches sequential scalar order.
+    VecSadalpI32x4,
+    /// NEON smlal (low half): dest = args[0] + widen_mul(low2(args[1]), low2(args[2]))
+    /// where args[1]/args[2] are 4×I32 vectors and the accumulator is 2×I64.
+    VecSmlalLoI32x4,
+    /// NEON smlal2 (high half): same as VecSmlalLoI32x4 but for lanes 2-3.
+    VecSmlalHiI32x4,
+
     /// Horizontal reduction: %scalar = horizontal_add(%vec) - AVX2 4×F64 → F64
     /// args[0] = source vector value; dest = scalar F64 result
     VecHorizontalAddF64x4,
@@ -415,6 +425,8 @@ impl IntrinsicOp {
             | IntrinsicOp::VecAddI64x2 | IntrinsicOp::VecMulI64x2
             | IntrinsicOp::VecZeroI64x2
             | IntrinsicOp::VecMulI32x4 | IntrinsicOp::VecBroadcastI32x4
+            | IntrinsicOp::VecSadalpI32x4
+            | IntrinsicOp::VecSmlalLoI32x4 | IntrinsicOp::VecSmlalHiI32x4
         )
     }
 }

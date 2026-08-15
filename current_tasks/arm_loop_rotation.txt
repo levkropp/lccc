@@ -1,0 +1,25 @@
+ARM loop rotation: bottom-test loops to get one branch per iteration.
+
+Our ARM loops are header-tested: a conditional branch at the top plus an
+unconditional branch back at the bottom = 2 branches per iteration. GCC
+rotates loops so the body ends in a single conditional branch back to the top
+(with a pre-header guard branch for the zero-trip case).
+
+There is no ARM peephole rotation today. x86 has one to crib from:
+src/backend/x86/codegen/peephole/passes/local_patterns.rs:3016.
+
+Plan:
+1. Study the x86 rotation pass and the ARM peephole pipeline
+   (src/backend/arm/codegen/peephole/).
+2. Implement ARM loop rotation for simple natural loops: header has only
+   phis + compare + conditional branch; latch ends with unconditional branch
+   to header. Clone the test into the pre-header (guard), make the latch
+   conditionally branch to the body top.
+3. Mind the backend landmines: blocks must be spliced in text order
+   (liveness/regalloc compute intervals in emission order); do not append
+   cloned blocks at the end.
+4. Gate behind CCC_ env toggle for A/B, benchmark full suite, commit.
+
+Expected: broad modest win across arith_loop, sieve, mandelbrot, fannkuch.
+
+Started: 2026-08-15

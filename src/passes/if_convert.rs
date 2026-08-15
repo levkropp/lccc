@@ -47,7 +47,7 @@ use crate::ir::reexports::{
     Value,
 };
 use crate::ir::analysis;
-use crate::common::types::IrType;
+use crate::common::types::{AddressSpace, IrType};
 use crate::common::fx_hash::FxHashMap;
 
 /// Run if-conversion on a single function.
@@ -71,6 +71,135 @@ pub(crate) fn if_convert_function(func: &mut IrFunction) -> usize {
     total
 }
 
+/// Rewrite loads in single-predecessor arm blocks that re-load an address the
+/// branch predecessor already loads. The arm always executes immediately after
+/// the pred on any path that reaches it, so when both blocks are free of
+/// memory writes the pred's identical load produces exactly the value the arm
+/// load would see; replacing it with a Copy eliminates a redundant memory
+/// access and often makes the arm side-effect-free enough for if-conversion
+/// (e.g. `if (a[i] > 0) s += a[i]` reloading `a[i]` in the then-arm).
+fn rewrite_covered_arm_loads(
+    func: &mut IrFunction,
+    label_to_idx: &FxHashMap<BlockId, usize>,
+    preds: &analysis::FlatAdj,
+) -> usize {
+    /// Free of memory writes and other externally visible effects.
+    /// Loads are fine (they don't change memory). Conservative: intrinsics,
+    /// calls, stores, atomics, allocas are all treated as barriers.
+    fn is_pure(inst: &Instruction) -> bool {
+        matches!(
+            inst,
+            Instruction::Load { .. }
+                | Instruction::BinOp { .. }
+                | Instruction::UnaryOp { .. }
+                | Instruction::Cmp { .. }
+                | Instruction::Cast { .. }
+                | Instruction::Copy { .. }
+                | Instruction::GetElementPtr { .. }
+                | Instruction::GlobalAddr { .. }
+                | Instruction::Select { .. }
+                | Instruction::Phi { .. }
+        )
+    }
+
+    let mut rewrites = 0;
+    let debug = std::env::var("CCC_DEBUG_IFCONV").is_ok();
+
+    // Resolve pointer copies to their root value: `p = q; load [p]` loads the
+    // same address as `load [q]`. SSA guarantees the root dominates both uses.
+    let mut copy_of: FxHashMap<Value, Value> = FxHashMap::default();
+    for b in &func.blocks {
+        for i in &b.instructions {
+            if let Instruction::Copy { dest, src: Operand::Value(src) } = i {
+                copy_of.insert(*dest, *src);
+            }
+        }
+    }
+    let resolve = |v: &Value| -> Value {
+        let mut cur = *v;
+        for _ in 0..64 {
+            match copy_of.get(&cur) {
+                Some(&next) if next != cur => cur = next,
+                _ => break,
+            }
+        }
+        cur
+    };
+
+    for pred_idx in 0..func.blocks.len() {
+        let (true_label, false_label) = match &func.blocks[pred_idx].terminator {
+            Terminator::CondBranch { true_label, false_label, .. } => (*true_label, *false_label),
+            _ => continue,
+        };
+        // The pred must not write memory between its load and the arm.
+        if !func.blocks[pred_idx].instructions.iter().all(is_pure) {
+            continue;
+        }
+        // Collect the pred's loads: (ptr, ty, seg) -> dest. Linear-scan Vec;
+        // preds hold only a handful of loads.
+        let mut pred_loads: Vec<(Value, IrType, AddressSpace, Value)> = Vec::new();
+        for inst in &func.blocks[pred_idx].instructions {
+            if let Instruction::Load { dest, ptr, ty, seg_override } = inst {
+                let root = resolve(ptr);
+                // On a duplicate, keep the last load (same value either way).
+                if let Some(entry) = pred_loads.iter_mut().find(|(p, t, s, _)| {
+                    *p == root && *t == *ty && *s == *seg_override
+                }) {
+                    entry.3 = *dest;
+                } else {
+                    pred_loads.push((root, *ty, *seg_override, *dest));
+                }
+            }
+        }
+        if pred_loads.is_empty() {
+            continue;
+        }
+        for label in [true_label, false_label] {
+            let Some(&arm_idx) = label_to_idx.get(&label) else { continue };
+            if arm_idx == pred_idx {
+                continue;
+            }
+            // The arm must be reached only from this pred, and must not write
+            // memory before (or after) its loads.
+            if preds.len(arm_idx) != 1 || preds.row(arm_idx)[0] as usize != pred_idx {
+                continue;
+            }
+            if !func.blocks[arm_idx].instructions.iter().all(is_pure) {
+                continue;
+            }
+            // Collect rewrites first (immutable), then apply.
+            let mut pending: Vec<(usize, Value, Value)> = Vec::new();
+            for (inst_pos, inst) in func.blocks[arm_idx].instructions.iter().enumerate() {
+                if let Instruction::Load { dest, ptr, ty, seg_override } = inst {
+                    let root = resolve(ptr);
+                    if let Some((_, _, _, covering)) = pred_loads.iter().find(|(p, t, s, _)| {
+                        *p == root && *t == *ty && *s == *seg_override
+                    }) {
+                        pending.push((inst_pos, *dest, *covering));
+                    } else if debug {
+                        eprintln!("[IFCONV] arm block {} load ptr={} ty={:?} not covered by pred loads {:?}",
+                            arm_idx, ptr.0, ty,
+                            pred_loads.iter().map(|(p, t, _, d)| (p.0, *t, d.0)).collect::<Vec<_>>());
+                        for b in &func.blocks {
+                            for i in &b.instructions {
+                                if i.dest() == Some(*ptr) || pred_loads.iter().any(|(p, ..)| i.dest() == Some(*p)) {
+                                    eprintln!("[IFCONV]   def: {:?}", i);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for (inst_pos, dest, covering) in pending {
+                func.blocks[arm_idx].instructions[inst_pos] =
+                    Instruction::Copy { dest, src: Operand::Value(covering) };
+                rewrites += 1;
+            }
+        }
+    }
+    rewrites
+}
+
 /// Single pass of if-conversion. Returns number of diamonds converted.
 fn if_convert_once(func: &mut IrFunction) -> usize {
     let num_blocks = func.blocks.len();
@@ -81,6 +210,11 @@ fn if_convert_once(func: &mut IrFunction) -> usize {
     // Build CFG
     let label_to_idx = analysis::build_label_map(func);
     let (preds, _succs) = analysis::build_cfg(func, &label_to_idx);
+
+    // Eliminate arm-block reloads of addresses the branch pred already loads;
+    // this both removes redundant memory traffic and unblocks diamond/triangle
+    // detection below (loads make arms fail the side-effect-free check).
+    let rewrites = rewrite_covered_arm_loads(func, &label_to_idx, &preds);
 
     // Collect diamond candidates
     let mut diamonds: Vec<DiamondInfo> = Vec::new();
@@ -95,7 +229,7 @@ fn if_convert_once(func: &mut IrFunction) -> usize {
 
 
     if diamonds.is_empty() {
-        return 0;
+        return rewrites;
     }
 
     // Apply conversions. Track modified blocks to avoid applying overlapping diamonds
@@ -124,7 +258,7 @@ fn if_convert_once(func: &mut IrFunction) -> usize {
     // (they'll have no instructions and just an unconditional branch)
     // This is handled by the CFG simplification pass that runs after us.
 
-    converted
+    converted + rewrites
 }
 
 /// Information about a detected diamond pattern.

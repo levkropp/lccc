@@ -441,6 +441,56 @@ impl ArmCodegen {
                 if let Some(d) = dest { self.store_x0_to(d); }
             }
 
+            // NEON sadalp: accumulate sign-extended adjacent pairs of a 4×I32
+            // vector into a 2×I64 accumulator (one instruction per 4 elements).
+            IntrinsicOp::VecSadalpI32x4 => {
+                if let Some(d) = dest {
+                    let acc = self.load_vector_value_128(&args[0], "q0");
+                    let src = self.load_vector_value_128(&args[1], "q1");
+                    if let Some(name) = self.assigned_vector_reg(d.0) {
+                        self.state.vector_values.insert(d.0);
+                        if name != acc {
+                            self.state.emit_fmt(format_args!("    mov {}.16b, {}.16b", name, acc));
+                        }
+                        self.state.emit_fmt(format_args!("    sadalp {}.2d, {}.4s", name, src));
+                    } else {
+                        if acc != "v0" {
+                            self.state.emit_fmt(format_args!("    mov v0.16b, {}.16b", acc));
+                        }
+                        self.state.emit_fmt(format_args!("    sadalp v0.2d, {}.4s", src));
+                        self.store_vector_value_128(d, "q0");
+                    }
+                }
+            }
+
+            // NEON smlal/smlal2: accumulate sign-extended products of the low
+            // (2s) or high (4s) halves of two 4×I32 vectors into a 2×I64 acc.
+            IntrinsicOp::VecSmlalLoI32x4 | IntrinsicOp::VecSmlalHiI32x4 => {
+                if let Some(d) = dest {
+                    let acc = self.load_vector_value_128(&args[0], "q0");
+                    let a = self.load_vector_value_128(&args[1], "q1");
+                    let b = self.load_vector_value_128(&args[2], "q2");
+                    let (mnemonic, suffix) = if *op == IntrinsicOp::VecSmlalLoI32x4 {
+                        ("smlal", "2s")
+                    } else {
+                        ("smlal2", "4s")
+                    };
+                    if let Some(name) = self.assigned_vector_reg(d.0) {
+                        self.state.vector_values.insert(d.0);
+                        if name != acc {
+                            self.state.emit_fmt(format_args!("    mov {}.16b, {}.16b", name, acc));
+                        }
+                        self.state.emit_fmt(format_args!("    {} {}.2d, {}.{}, {}.{}", mnemonic, name, a, suffix, b, suffix));
+                    } else {
+                        if acc != "v0" {
+                            self.state.emit_fmt(format_args!("    mov v0.16b, {}.16b", acc));
+                        }
+                        self.state.emit_fmt(format_args!("    {} v0.2d, {}.{}, {}.{}", mnemonic, a, suffix, b, suffix));
+                        self.store_vector_value_128(d, "q0");
+                    }
+                }
+            }
+
             // Register-based vector operations (NEON 128-bit).
             // Two-wide F64 (2×.2d) and four-wide I32 (4×.4s) for reductions.
             IntrinsicOp::VecLoadF64x2 | IntrinsicOp::VecLoadI32x4 => {

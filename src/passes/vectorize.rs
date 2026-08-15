@@ -87,10 +87,10 @@ use crate::passes::loop_analysis;
 
 /// Run SSE2 vectorization on a function with precomputed CFG analysis.
 pub(crate) fn vectorize_with_analysis(func: &mut IrFunction, cfg: &CfgAnalysis) -> usize {
-    vectorize_with_analysis_mode(func, cfg, false)
+    vectorize_with_analysis_mode(func, cfg, false, false)
 }
 
-fn vectorize_with_analysis_mode(func: &mut IrFunction, cfg: &CfgAnalysis, force_two_wide: bool) -> usize {
+fn vectorize_with_analysis_mode(func: &mut IrFunction, cfg: &CfgAnalysis, force_two_wide: bool, neon: bool) -> usize {
     let num_blocks = func.blocks.len();
     let loops = loop_analysis::find_natural_loops(
         num_blocks,
@@ -157,7 +157,7 @@ fn vectorize_with_analysis_mode(func: &mut IrFunction, cfg: &CfgAnalysis, force_
                 }
                 total_changes += transform_to_fma_f64x4(func, &pattern);
             }
-        } else if let Some(red_pattern) = analyze_reduction_pattern(func, loop_info, cfg, force_two_wide) {
+        } else if let Some(red_pattern) = analyze_reduction_pattern(func, loop_info, cfg, force_two_wide, neon) {
             // Try reduction pattern vectorization (sum += arr[i], sum += a[i] * b[i], etc.)
             let use_sse2 = force_two_wide || std::env::var("LCCC_FORCE_SSE2").is_ok();
 
@@ -165,7 +165,7 @@ fn vectorize_with_analysis_mode(func: &mut IrFunction, cfg: &CfgAnalysis, force_
                 if debug {
                     eprintln!("[VEC] Reduction pattern matched! Transforming to SSE2 2-wide");
                 }
-                total_changes += transform_reduction_sse2(func, &red_pattern);
+                total_changes += transform_reduction_sse2(func, &red_pattern, neon);
             } else {
                 if debug {
                     eprintln!("[VEC] Reduction pattern matched! Transforming to AVX2 4-wide");
@@ -681,11 +681,14 @@ fn analyze_loop_pattern(
 }
 
 /// Analyze a loop to detect vectorizable reduction patterns (sum += arr[i], sum += a[i] * b[i]).
+/// `neon` enables AArch64-only forms: i32→i64 dot products whose multiply
+/// operands are sign-extension casts of i32 loads (lowered to smlal/smlal2).
 fn analyze_reduction_pattern(
     func: &IrFunction,
     loop_info: &loop_analysis::NaturalLoop,
     _cfg: &CfgAnalysis,
     allow_widening_i32: bool,
+    neon: bool,
 ) -> Option<ReductionPattern> {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     let header_idx = loop_info.header;
@@ -1125,23 +1128,50 @@ fn analyze_reduction_pattern(
             rhs,
             ..
         } => {
-            // Both operands of multiply should be loads
+            // Both operands of multiply should be loads, or (NEON i32→i64 dot)
+            // sign-extension casts of i32 loads: (long)a[i] * (long)b[i].
             let mul_lhs_val = if let Operand::Value(v) = lhs { *v } else { return None };
             let mul_rhs_val = if let Operand::Value(v) = rhs { *v } else { return None };
 
             let mul_lhs_inst = find_inst_by_dest(body, mul_lhs_val)?;
             let mul_rhs_inst = find_inst_by_dest(body, mul_rhs_val)?;
 
-            let array_a_gep = if let Instruction::Load { ptr, .. } = mul_lhs_inst {
-                *ptr
-            } else {
-                return None;
+            // Resolve one multiply operand to its array GEP, tracking whether
+            // it came through an i32→i64 sign-extension cast of a load.
+            let mut widened_i32 = false;
+            let operand_gep = |inst: &Instruction, widened: &mut bool| -> Option<Value> {
+                match inst {
+                    Instruction::Load { ptr, .. } => Some(*ptr),
+                    Instruction::Cast { src, from_ty: IrType::I32, to_ty: IrType::I64, .. } if neon => {
+                        let src_val = if let Operand::Value(v) = src { *v } else { return None };
+                        if let Some(Instruction::Load { ptr, .. }) = find_inst_by_dest(body, src_val) {
+                            *widened = true;
+                            Some(*ptr)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
             };
 
-            let array_b_gep = if let Instruction::Load { ptr, .. } = mul_rhs_inst {
-                *ptr
+            let array_a_gep = operand_gep(mul_lhs_inst, &mut widened_i32)?;
+            let array_b_gep = operand_gep(mul_rhs_inst, &mut widened_i32)?;
+
+            // A widened dot must widen BOTH operands (C usual arithmetic
+            // conversions) and accumulate in i64; mixed forms are rejected.
+            let (element_type, accumulator_type) = if widened_i32 {
+                let both_widened = matches!(mul_lhs_inst, Instruction::Cast { .. })
+                    && matches!(mul_rhs_inst, Instruction::Cast { .. });
+                if !both_widened || element_type != IrType::I64 {
+                    if debug {
+                        eprintln!("[VEC-RED]   Rejecting partially widened dot product");
+                    }
+                    return None;
+                }
+                (IrType::I32, IrType::I64)
             } else {
-                return None;
+                (element_type, element_type)
             };
 
             // Verify both GEPs use IV
@@ -1160,7 +1190,7 @@ fn analyze_reduction_pattern(
             Some(ReductionPattern {
                 kind: ReductionKind::DotProduct,
                 element_type,
-                accumulator_type: element_type,
+                accumulator_type,
                 header_idx,
                 body_idx,
                 latch_idx,
@@ -2610,6 +2640,7 @@ fn insert_reduction_remainder_loop(
     vec_width: u64,
     horizontal_intrinsic: IntrinsicOp,
     vec_sum_value: Value,  // Accumulated vector SSA value
+    second_acc: Option<Value>,  // Second vector accumulator phi (NEON smlal2 half)
     next_val_id: &mut u32,
     next_label: &mut u32,
 ) -> usize {
@@ -2737,9 +2768,30 @@ fn insert_reduction_remainder_loop(
         _ => horizontal_intrinsic,  // Fallback
     };
 
-    let vec_exit_block = BasicBlock {
-        label: vec_exit_label,
-        instructions: vec![
+    let vec_exit_block = {
+        // When a second NEON accumulator was used (smlal/smlal2 split), fold
+        // the two vector accumulators together before the horizontal reduce.
+        let (horiz_src, mut prefix) = if let Some(acc2) = second_acc {
+            let combined = Value(*next_val_id);
+            *next_val_id += 1;
+            (
+                combined,
+                vec![Instruction::Intrinsic {
+                    dest: Some(combined),
+                    op: IntrinsicOp::VecAddI64x2,
+                    dest_ptr: None,
+                    args: vec![
+                        Operand::Value(pattern.accumulator_phi),
+                        Operand::Value(acc2),
+                    ],
+                }],
+            )
+        } else {
+            (pattern.accumulator_phi, Vec::new())
+        };
+        let mut instructions = Vec::new();
+        instructions.append(&mut prefix);
+        instructions.extend_from_slice(&[
             // Horizontal reduction: scalar_sum = reduce(vec_accumulator)
             // Use the accumulator PHI (not vec_sum_value) so that when the
             // vectorized loop has 0 iterations, we reduce the initial zero
@@ -2748,7 +2800,7 @@ fn insert_reduction_remainder_loop(
                 dest: Some(scalar_sum),
                 op: vec_horizontal_op,
                 dest_ptr: None,
-                args: vec![Operand::Value(pattern.accumulator_phi)],
+                args: vec![Operand::Value(horiz_src)],
             },
             // Compute starting index for remainder: i_rem_start = iv_final * vec_width
             Instruction::BinOp {
@@ -2758,9 +2810,13 @@ fn insert_reduction_remainder_loop(
                 rhs: Operand::Const(IrConst::I32(vec_width as i32)),
                 ty: IrType::I32,
             },
-        ],
-        terminator: Terminator::Branch(remainder_header_label),
-        source_spans: vec![],
+        ]);
+        BasicBlock {
+            label: vec_exit_label,
+            instructions,
+            terminator: Terminator::Branch(remainder_header_label),
+            source_spans: vec![],
+        }
     };
 
     // Step 3: Create remainder_header block
@@ -3530,6 +3586,7 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
         vec_width,
         horizontal_intrinsic,
         vec_sum_value,  // Pass the vector accumulator SSA value
+        None,           // AVX2 path uses a single accumulator
         &mut next_val_id,
         &mut next_label,
     );
@@ -3547,7 +3604,7 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
 }
 
 /// Transform reduction loop to use SSE2 128-bit vectorization (2×F64, 4×I32, etc.).
-fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -> usize {
+fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern, neon: bool) -> usize {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     let mut changes = 0;
 
@@ -3565,6 +3622,17 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
             IntrinsicOp::AddF64x2,
             Some(IntrinsicOp::MulF64x2),
             IntrinsicOp::HorizontalAddF64x2,
+        ),
+        // NEON 4-wide i32→i64 forms: sadalp for sums, smlal/smlal2 for dots.
+        IrType::I32 if pattern.accumulator_type == IrType::I64 && neon => (
+            4u64,
+            IntrinsicOp::VecLoadI32x4,
+            match pattern.kind {
+                ReductionKind::Sum => IntrinsicOp::VecSadalpI32x4,
+                ReductionKind::DotProduct => IntrinsicOp::VecSmlalLoI32x4,
+            },
+            None,
+            IntrinsicOp::VecHorizontalAddI64x2,
         ),
         IrType::I32 if pattern.accumulator_type == IrType::I64 => (
             2u64,
@@ -3762,6 +3830,9 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
     // Step 3: Transform loop body - replace scalar operations with vector intrinsics
     // Use register-based SSA values for vector operations (no stack allocations)
     let vec_sum_value: Value;
+    // NEON smlal dot products split lanes across two 2×I64 accumulators;
+    // this carries the second accumulator's header phi to the epilogue.
+    let mut second_acc: Option<Value> = None;
 
     match pattern.kind {
         ReductionKind::Sum => {
@@ -3781,6 +3852,12 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
                 IntrinsicOp::VecLoadWidenI32ToI64x2 => (
                     IntrinsicOp::VecLoadWidenI32ToI64x2,
                     IntrinsicOp::VecAddI64x2,
+                    IntrinsicOp::VecZeroI64x2,
+                ),
+                // NEON 4-wide i32→i64 sum: load 4×I32, accumulate pairs (sadalp).
+                IntrinsicOp::VecLoadI32x4 => (
+                    IntrinsicOp::VecLoadI32x4,
+                    IntrinsicOp::VecSadalpI32x4,
                     IntrinsicOp::VecZeroI64x2,
                 ),
                 _ => panic!("Unsupported SSE2 load intrinsic: {:?}", load_intrinsic),
@@ -3884,6 +3961,147 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
 
             if debug {
                 eprintln!("[VEC-RED]   Transformed sum body: load + add (register-based)");
+            }
+        }
+        // NEON 4-wide i32→i64 dot product: load both arrays 4×I32, then
+        // smlal (lanes 0-1) + smlal2 (lanes 2-3) into two independent 2×I64
+        // accumulators to break the loop-carried dependency chain.
+        ReductionKind::DotProduct
+            if pattern.element_type == IrType::I32
+                && pattern.accumulator_type == IrType::I64
+                && load_intrinsic == IntrinsicOp::VecLoadI32x4 =>
+        {
+            let vec_load_a = Value(next_val_id);
+            next_val_id += 1;
+            let vec_load_b = Value(next_val_id);
+            next_val_id += 1;
+            let acc0_next = Value(next_val_id);
+            next_val_id += 1;
+            let acc1_next = Value(next_val_id);
+            next_val_id += 1;
+            let init_zero0 = Value(next_val_id);
+            next_val_id += 1;
+            let init_zero1 = Value(next_val_id);
+            next_val_id += 1;
+            let acc1_phi = Value(next_val_id);
+            next_val_id += 1;
+            vec_sum_value = acc0_next;
+            second_acc = Some(acc1_phi);
+
+            // Zero both vector accumulators in the entry block.
+            {
+                let entry_block = &mut func.blocks[0];
+                for init in [init_zero0, init_zero1] {
+                    entry_block.instructions.push(Instruction::Intrinsic {
+                        dest: Some(init),
+                        op: IntrinsicOp::VecZeroI64x2,
+                        dest_ptr: None,
+                        args: vec![],
+                    });
+                }
+                changes += 2;
+            }
+
+            let latch_label = func.blocks[pattern.latch_idx].label;
+
+            // Rewire the original accumulator phi (acc0): entry → zero vector,
+            // backedge → smlal result. Remember the preheader label for acc1.
+            let mut preheader_label = None;
+            {
+                let header_block = &mut func.blocks[pattern.header_idx];
+                for inst in header_block.instructions.iter_mut() {
+                    if let Instruction::Phi { dest, incoming, .. } = inst {
+                        if *dest == pattern.accumulator_phi {
+                            for (val, label) in incoming.iter_mut() {
+                                if *label == latch_label {
+                                    *val = Operand::Value(acc0_next);
+                                } else {
+                                    preheader_label = Some(*label);
+                                    if matches!(val, Operand::Const(_)) {
+                                        *val = Operand::Value(init_zero0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let Some(preheader_label) = preheader_label else {
+                if debug {
+                    eprintln!("[VEC-RED]   NEON dot: no preheader edge on accumulator phi");
+                }
+                return changes;
+            };
+
+            // Insert the second accumulator phi after the existing header phis.
+            {
+                let header_block = &mut func.blocks[pattern.header_idx];
+                let insert_pos = header_block
+                    .instructions
+                    .iter()
+                    .rposition(|inst| matches!(inst, Instruction::Phi { .. }))
+                    .map(|p| p + 1)
+                    .unwrap_or(0);
+                header_block.instructions.insert(insert_pos, Instruction::Phi {
+                    dest: acc1_phi,
+                    ty: IrType::I64,
+                    incoming: vec![
+                        (Operand::Value(init_zero1), preheader_label),
+                        (Operand::Value(acc1_next), latch_label),
+                    ],
+                });
+                changes += 1;
+            }
+
+            // Body: two 4-wide loads + smlal/smlal2, replacing the scalar add.
+            {
+                let body_block = &mut func.blocks[pattern.body_idx];
+                body_block.instructions.insert(pattern.accumulator_add_idx, Instruction::Intrinsic {
+                    dest: Some(vec_load_a),
+                    op: IntrinsicOp::VecLoadI32x4,
+                    dest_ptr: None,
+                    args: vec![
+                        Operand::Value(pattern.array_a_gep),
+                        Operand::Const(IrConst::I64(0)),
+                    ],
+                });
+                body_block.instructions.insert(pattern.accumulator_add_idx + 1, Instruction::Intrinsic {
+                    dest: Some(vec_load_b),
+                    op: IntrinsicOp::VecLoadI32x4,
+                    dest_ptr: None,
+                    args: vec![
+                        Operand::Value(pattern.array_b_gep.unwrap()),
+                        Operand::Const(IrConst::I64(0)),
+                    ],
+                });
+                body_block.instructions.insert(pattern.accumulator_add_idx + 2, Instruction::Intrinsic {
+                    dest: Some(acc0_next),
+                    op: IntrinsicOp::VecSmlalLoI32x4,
+                    dest_ptr: None,
+                    args: vec![
+                        Operand::Value(pattern.accumulator_phi),
+                        Operand::Value(vec_load_a),
+                        Operand::Value(vec_load_b),
+                    ],
+                });
+                body_block.instructions.insert(pattern.accumulator_add_idx + 3, Instruction::Intrinsic {
+                    dest: Some(acc1_next),
+                    op: IntrinsicOp::VecSmlalHiI32x4,
+                    dest_ptr: None,
+                    args: vec![
+                        Operand::Value(acc1_phi),
+                        Operand::Value(vec_load_a),
+                        Operand::Value(vec_load_b),
+                    ],
+                });
+                // Remove the old scalar add; the scalar mul/casts/loads are now
+                // dead and cleaned up by DCE.
+                body_block.instructions.remove(pattern.accumulator_add_idx + 4);
+                changes += 4;
+            }
+
+            if debug {
+                eprintln!("[VEC-RED]   Transformed dot product body: load_a + load_b + smlal + smlal2 (NEON 4-wide)");
             }
         }
         ReductionKind::DotProduct => {
@@ -4042,6 +4260,7 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
         vec_width,
         horizontal_intrinsic,
         vec_sum_value,  // Pass the vector accumulator SSA value
+        second_acc,     // Second NEON accumulator phi (smlal2 half), if any
         &mut next_val_id,
         &mut next_label,
     );
@@ -4069,7 +4288,9 @@ pub(crate) fn vectorize_function(func: &mut IrFunction) -> usize {
 }
 
 /// AArch64 NEON has 128-bit vectors, matching the two-wide F64 transform.
+/// Passes neon=true so AArch64-only widening forms (sadalp, smlal/smlal2)
+/// may be emitted; other backends reject those intrinsics.
 pub(crate) fn vectorize_function_two_wide(func: &mut IrFunction) -> usize {
     let cfg = CfgAnalysis::build(func);
-    vectorize_with_analysis_mode(func, &cfg, true)
+    vectorize_with_analysis_mode(func, &cfg, true, true)
 }

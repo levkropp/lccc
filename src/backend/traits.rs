@@ -1288,6 +1288,37 @@ pub trait ArchCodegen {
         self.emit_fused_cmp_branch(op, lhs, rhs, ty, &true_label, &false_label);
     }
 
+    /// Whether the backend can fuse an integer compare feeding a Select into
+    /// compare + conditional-select, skipping the boolean materialization.
+    fn supports_fused_cmp_select(&self) -> bool {
+        false
+    }
+
+    /// Emit a fused compare-and-select: `dest = (lhs <op> rhs) ? tv : fv`
+    /// without materializing the comparison's boolean value. Only called for
+    /// integer comparisons whose Cmp result is used solely by this select
+    /// (the caller skips the standalone Cmp emission).
+    ///
+    /// Default: materialize via the generic cmp + select sequence.
+    fn emit_fused_cmp_select(
+        &mut self,
+        op: IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        cmp_ty: IrType,
+        true_val: &Operand,
+        false_val: &Operand,
+        dest: &Value,
+        sel_ty: IrType,
+    ) {
+        let dummy_dest = Value(u32::MAX);
+        self.emit_cmp(&dummy_dest, op, lhs, rhs, cmp_ty);
+        // The accumulator holds the boolean result; select on it.
+        self.emit_select(dest, &Operand::Value(dummy_dest), true_val, false_val, sel_ty);
+        // Invalidate cache since dummy_dest may have polluted it.
+        self.state().reg_cache.invalidate_all();
+    }
+
     /// Emit an indirect branch (computed goto).
     fn emit_indirect_branch(&mut self, target: &Operand) {
         self.emit_load_operand(target);

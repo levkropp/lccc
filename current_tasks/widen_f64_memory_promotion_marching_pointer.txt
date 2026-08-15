@@ -1,0 +1,22 @@
+Widen loop memory promotion to marching-pointer accumulators (nbody).
+
+src/passes/loop_memory_promote.rs currently promotes a loop memory location to
+a register only when the address is loop-invariant and there is exactly 1 load
++ 1 store per iteration. nbody's F64 accumulators (vx/vy/vz per body) round-trip
+through memory every iteration: the address is a marching pointer (p, p+stride
+across unrolled lanes) or an indexed load with loop-varying base, so promotion
+bails. nbody is ~1.6x vs GCC.
+
+Plan:
+1. Read loop_memory_promote.rs, identify the invariant-address restriction.
+2. Extend analysis to recurrences: address = base + i*stride (affine in the
+   induction variable), still exactly one load and one store per lane per
+   iteration, no aliasing stores in between.
+3. Promote to a scalar register carried across iterations, reload/stored at
+   loop boundaries as today.
+4. Env-gate (e.g. CCC_NO_MARCH_PROMOTE), benchmark nbody + full suite, commit.
+
+Risk: aliasing safety — must prove no other store in the loop can reach the
+promoted location (same as existing analysis, extended to affine addresses).
+
+Started: 2026-08-15

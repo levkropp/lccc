@@ -1413,6 +1413,32 @@ pub(crate) fn encode_neon_two_misc(operands: &[Operand], u_bit: u32, opcode: u32
     Ok(EncodeResult::Word(word))
 }
 
+// ── NEON pairwise add long / accumulate ──────────────────────────────────
+/// Encode SADDLP/UADDLP/SADALP/UADALP.
+/// Format: 0 Q U 01110 size 10000 opcode 10 Rn Rd
+/// Unlike most two-reg misc ops, the size field encodes the SOURCE (narrow)
+/// element size and Q encodes the source register width — deriving size from
+/// the destination (wide) arrangement produces a reserved encoding.
+pub(crate) fn encode_neon_pairwise_long(operands: &[Operand], u_bit: u32, opcode: u32) -> Result<EncodeResult, String> {
+    if operands.len() < 2 {
+        return Err("NEON pairwise-long requires 2 operands".to_string());
+    }
+    let (rd, _arr_d) = get_neon_reg(operands, 0)?;
+    let (rn, arr_n) = get_neon_reg(operands, 1)?;
+    let (q, size) = match arr_n.as_str() {
+        "8b" => (0u32, 0b00u32),
+        "16b" => (1, 0b00),
+        "4h" => (0, 0b01),
+        "8h" => (1, 0b01),
+        "2s" => (0, 0b10),
+        "4s" => (1, 0b10),
+        _ => return Err(format!("unsupported source arrangement for pairwise long: {}", arr_n)),
+    };
+    let word = (q << 30) | (u_bit << 29) | (0b01110 << 24) | (size << 22)
+        | (0b10000 << 17) | (opcode << 12) | (0b10 << 10) | (rn << 5) | rd;
+    Ok(EncodeResult::Word(word))
+}
+
 // ── NEON float two-register misc ─────────────────────────────────────────
 /// Encode NEON float two-reg misc: UCVTF, SCVTF, FCVTZS, FCVTZU, FNEG, FABS, etc. (vector)
 /// Format: 0 Q U 01110 size 10000 opcode 10 Rn Rd

@@ -1,0 +1,23 @@
+Vectorization coverage for loop_patterns benchmark (map + wider reductions).
+
+Current state (verified):
+- sum_array (i32 reduction over i32 array) vectorizes only 2-wide via sxtl;
+  GCC does 4-wide (sxtl + sxtl2, two vector accumulators). ~1.86x vs GCC.
+- dot_product (i32*i32 -> i64 accumulate) is NOT vectorized; GCC uses smlal/smlal2.
+- scale_add (map pattern: out[i] = a[i]*k + b[i]) is NOT vectorized.
+- Conditional reductions (sum of elements meeting a predicate) were deliberately
+  rejected as unsafe earlier (select semantics / FP exception concerns). Only
+  revisit with a fresh safety analysis: integer-only, no FP, prove the select
+  has no side effects and the identity element is correct for skipped lanes.
+
+Work items:
+1. Widen i32 sum reduction to 4 lanes (sxtl2 second accumulator pair).
+2. dot_product: recognize mul(widened a, widened b) accumulate into i64 -> smlal/smlal2.
+3. scale_add / map loops: elementwise vector store loop, no reduction epilogue.
+4. Conditional reduction: integer-only, side-effect-free select, correct identity.
+
+Benchmark: tests/benchmark loop_patterns (sum_array, dot_product, scale_add,
+cond_sum). Validate with run_benchmarks.py --only loop_patterns --reps 5 plus
+full 18/18 byte-identical and cargo test --release.
+
+Started: 2026-08-15

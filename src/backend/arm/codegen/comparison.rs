@@ -2,7 +2,7 @@
 
 use crate::ir::reexports::{IrCmpOp, Operand, Value};
 use crate::common::types::IrType;
-use super::emit::{ArmCodegen, arm_int_cond_code, arm_invert_cond_code};
+use super::emit::{ArmCodegen, arm_int_cond_code, arm_invert_cond_code, callee_saved_name, callee_saved_name_32, is_arm_fp_phys};
 
 impl ArmCodegen {
     pub(super) fn emit_float_cmp_impl(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
@@ -95,5 +95,56 @@ impl ArmCodegen {
         self.state.emit("    csel x0, x2, x1, ne");
         self.state.reg_cache.invalidate_acc();
         self.store_x0_to(dest);
+    }
+
+    /// Fused integer compare-and-select: `cmp lhs, rhs` + `csel dest, tv, fv, cc`.
+    /// The Cmp's boolean result was used only by this select, so the cset
+    /// materialization is skipped entirely. Register-allocated select arms are
+    /// used in place (no x0 round-trips), keeping the loop-carried dependency
+    /// chain short (cmp; csel) for if-converted hot loops.
+    pub(super) fn emit_fused_cmp_select_impl(
+        &mut self,
+        op: IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        cmp_ty: IrType,
+        true_val: &Operand,
+        false_val: &Operand,
+        dest: &Value,
+        sel_ty: IrType,
+    ) {
+        self.emit_int_cmp_insn(lhs, rhs, cmp_ty);
+        let cc = arm_int_cond_code(op);
+        let use_32bit = sel_ty.size() <= 4;
+
+        // Stage the select arms before the dest: x1/x2 scratch are never
+        // allocator-assigned, so they cannot collide with phys regs.
+        let f_name = self.select_arm_reg(false_val, "x1", use_32bit);
+        let t_name = self.select_arm_reg(true_val, "x2", use_32bit);
+
+        if let Some(dp) = self.dest_reg(dest).filter(|r| !is_arm_fp_phys(*r)) {
+            let d = if use_32bit { callee_saved_name_32(dp) } else { callee_saved_name(dp) };
+            self.state.emit_fmt(format_args!("    csel {}, {}, {}, {}", d, t_name, f_name, cc));
+        } else {
+            self.state.emit_fmt(format_args!("    csel x0, {}, {}, {}", t_name, f_name, cc));
+            self.store_x0_to(dest);
+        }
+        self.state.reg_cache.invalidate_acc();
+    }
+
+    /// Resolve a Select arm to a register name: its assigned phys reg when
+    /// available, otherwise loaded into the given scratch register.
+    fn select_arm_reg(&mut self, op: &Operand, scratch_x: &str, use_32bit: bool) -> String {
+        if let Operand::Value(v) = op {
+            if let Some(phys) = self.reg_assignments.get(&v.0).copied() {
+                if !is_arm_fp_phys(phys) {
+                    return (if use_32bit { callee_saved_name_32(phys) } else { callee_saved_name(phys) }).to_string();
+                }
+            }
+        }
+        let scratch = if use_32bit { scratch_x.replacen('x', "w", 1) } else { scratch_x.to_string() };
+        self.operand_to_x0(op);
+        self.state.emit_fmt(format_args!("    mov {}, x0", scratch));
+        scratch
     }
 }
