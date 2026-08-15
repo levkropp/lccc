@@ -25,6 +25,7 @@ pub(crate) mod inline;
 pub(crate) mod ipcp;
 pub(crate) mod iv_strength_reduce;
 pub(crate) mod licm;
+pub(crate) mod load_forward;
 pub(crate) mod loop_analysis;
 pub(crate) mod loop_memory_promote;
 pub(crate) mod univsr;
@@ -552,7 +553,10 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
 
         // Phase 7: If-conversion
         // Upstream: cfg_simplify (simpler CFG), constfold (simplified conditions)
+        // Forward redundant reloads first: removing a load from a conditional
+        // arm makes the arm side-effect-free so if-conversion can fire.
         if !dis.ifconv && should_run!(7, 0, 4) {
+            module.for_each_function(load_forward::run);
             let n = timed_pass!("if_convert", run_on_visited(module, &dirty, &mut changed, if_convert::if_convert_function));
             cur_pass_changes[7] = n;
             total_changes += n;
