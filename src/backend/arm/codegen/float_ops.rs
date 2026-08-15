@@ -69,6 +69,15 @@ impl ArmCodegen {
                 return;
             }
         }
+        // Stack-homed dest with a slot: store the FP register directly
+        // (`str dN, [slot]`) instead of round-tripping through x0
+        // (`fmov x0, dN; str x0, [slot]`).
+        if !self.state.is_alloca(dest.0) {
+            if let Some(slot) = self.state.get_slot(dest.0) {
+                self.emit_store_to_sp(source, slot.0, "str");
+                return;
+            }
+        }
         if ty == IrType::F32 {
             self.state.emit_fmt(format_args!("    fmov w0, {}", source));
         } else {

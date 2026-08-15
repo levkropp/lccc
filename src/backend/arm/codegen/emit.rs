@@ -2040,6 +2040,17 @@ impl ArchCodegen for ArmCodegen {
                 }
                 return;
             }
+            // Register-held src, stack-homed dest: store the FP register
+            // straight to the slot — no d0/x0 round-trip.
+            if let (None, Some(s)) = (dest_fp, src_fp) {
+                if !self.state.is_alloca(dest.0) {
+                    if let Some(slot) = self.state.get_slot(dest.0) {
+                        self.emit_store_to_sp(&arm_fp_name(s, IrType::F64), slot.0, "str");
+                        self.state.reg_cache.invalidate_acc();
+                        return;
+                    }
+                }
+            }
             self.float_operand_to_reg(src, IrType::F64, "d0");
             self.store_float_reg(dest, IrType::F64, "d0");
             self.state.reg_cache.invalidate_acc();
@@ -2058,6 +2069,13 @@ impl ArchCodegen for ArmCodegen {
                         self.state.emit_fmt(format_args!(
                             "    fmov {}, {}", arm_fp_name(d, IrType::F64), arm_fp_name(s, IrType::F64)));
                     }
+                }
+                // Register-held src, stack-homed dest: direct `str dN, [slot]`.
+                (None, Some(s)) if !self.state.is_alloca(dest.0)
+                    && self.state.get_slot(dest.0).is_some() =>
+                {
+                    let slot = self.state.get_slot(dest.0).unwrap();
+                    self.emit_store_to_sp(&arm_fp_name(s, IrType::F64), slot.0, "str");
                 }
                 _ => {
                     self.float_operand_to_reg(src, IrType::F64, "d0");
