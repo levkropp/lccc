@@ -282,7 +282,13 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // accumulator path (%eax) in the codegen, creating a 3rd channel.
     //
     // Pattern: r12, rbx, %eax, r12, rbx, %eax, ...
-    exclude_every_third_mul_temp(func, &mut eligible);
+    //
+    // This is an x86-64-specific trick: on AArch64/RISC-V the accumulator
+    // path is a single register and excluding mul temps from registers only
+    // adds shuffle overhead, so it is gated to the x86-64 register pool.
+    if config.xmm_regs.first().is_some_and(|r| r.0 == 20) {
+        exclude_every_third_mul_temp(func, &mut eligible);
+    }
 
     // --- Phi register coalescing ---
     //
