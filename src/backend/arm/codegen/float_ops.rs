@@ -30,6 +30,15 @@ impl ArmCodegen {
                     return;
                 }
             }
+            // Stack-homed FP value: load straight into the FP register
+            // (`ldr dN, [slot]`) instead of bouncing through a GPR
+            // (`ldr x0` + `fmov dN, x0` = 2 instructions plus transfer latency).
+            if !self.state.is_alloca(v.0) {
+                if let Some(slot) = self.state.get_slot(v.0) {
+                    self.emit_load_from_sp(target, slot.0, "ldr");
+                    return;
+                }
+            }
         }
         // FP constants load straight from the .rodata constant pool via a
         // PC-relative literal load (1 instruction vs. a 5-instruction
