@@ -231,14 +231,13 @@ impl GvnState {
             // Excluded from CSE:
             // - Segment-overridden loads: access thread-local or CPU-local storage
             //   that may differ between accesses even without visible stores
-            // - Float, long double, i128 types: use different register paths in
-            //   codegen that complicate Copy instruction handling
+            // - Long double and i128 types: need multi-register handling
             // - AtomicLoad: has ordering semantics (falls through to _ => None)
             Instruction::Load { dest, ptr, ty, seg_override } => {
                 if *seg_override != AddressSpace::Default {
                     return None;
                 }
-                if ty.is_float() || ty.is_long_double() || ty.is_128bit() {
+                if ty.is_long_double() || ty.is_128bit() {
                     return None;
                 }
                 let ptr_vn = self.operand_to_vn(&Operand::Value(*ptr));

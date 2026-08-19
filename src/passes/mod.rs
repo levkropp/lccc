@@ -12,6 +12,7 @@
 pub(crate) mod cfg_simplify;
 pub(crate) mod bit_idioms;
 pub(crate) mod aggregate_copy_forward;
+pub(crate) mod alias;
 pub(crate) mod block_layout;
 pub(crate) mod constant_fold;
 pub(crate) mod copy_prop;
