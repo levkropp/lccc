@@ -1258,6 +1258,8 @@ struct MapPattern {
     store_idx: usize,
     /// All block indices in the loop body
     loop_blocks: FxHashSet<usize>,
+    /// Plain copy form (dst[i] = src[i]): no scale/offset arithmetic.
+    plain_copy: bool,
 }
 
 /// Analyze a loop for the map pattern `dst[i] = src[i] * scale + offset`.
@@ -1416,27 +1418,32 @@ fn analyze_map_pattern(
         }
     };
 
-    // The stored value must be `mul(load, scale) + offset` (either operand
-    // order), with loop-invariant scale and offset.
+    // The stored value is either the load itself (plain copy `dst[i] = src[i]`)
+    // or `mul(load, scale) + offset` with loop-invariant scale and offset.
     let body = &func.blocks[body_idx];
-    let add_inst = find_inst_by_dest(body, store_val)?;
-    let Instruction::BinOp { op: IrBinOp::Add, lhs: add_lhs, rhs: add_rhs, ty: IrType::I32, .. } = add_inst else {
-        return None;
-    };
-    let (mul_val, offset) = match (add_lhs, add_rhs) {
-        (Operand::Value(v), _) if is_invariant(add_rhs) => (*v, add_rhs.clone()),
-        (_, Operand::Value(v)) if is_invariant(add_lhs) => (*v, add_lhs.clone()),
-        _ => return None,
-    };
+    let (scale, offset, plain_copy) = if store_val == load_dest {
+        (Operand::Const(IrConst::I32(1)), Operand::Const(IrConst::I32(0)), true)
+    } else {
+        let add_inst = find_inst_by_dest(body, store_val)?;
+        let Instruction::BinOp { op: IrBinOp::Add, lhs: add_lhs, rhs: add_rhs, ty: IrType::I32, .. } = add_inst else {
+            return None;
+        };
+        let (mul_val, offset) = match (add_lhs, add_rhs) {
+            (Operand::Value(v), _) if is_invariant(add_rhs) => (*v, add_rhs.clone()),
+            (_, Operand::Value(v)) if is_invariant(add_lhs) => (*v, add_lhs.clone()),
+            _ => return None,
+        };
 
-    let mul_inst = find_inst_by_dest(body, mul_val)?;
-    let Instruction::BinOp { op: IrBinOp::Mul, lhs: mul_lhs, rhs: mul_rhs, ty: IrType::I32, .. } = mul_inst else {
-        return None;
-    };
-    let scale = match (mul_lhs, mul_rhs) {
-        (Operand::Value(v), _) if *v == load_dest && is_invariant(mul_rhs) => mul_rhs.clone(),
-        (_, Operand::Value(v)) if *v == load_dest && is_invariant(mul_lhs) => mul_lhs.clone(),
-        _ => return None,
+        let mul_inst = find_inst_by_dest(body, mul_val)?;
+        let Instruction::BinOp { op: IrBinOp::Mul, lhs: mul_lhs, rhs: mul_rhs, ty: IrType::I32, .. } = mul_inst else {
+            return None;
+        };
+        let scale = match (mul_lhs, mul_rhs) {
+            (Operand::Value(v), _) if *v == load_dest && is_invariant(mul_rhs) => mul_rhs.clone(),
+            (_, Operand::Value(v)) if *v == load_dest && is_invariant(mul_lhs) => mul_lhs.clone(),
+            _ => return None,
+        };
+        (scale, offset, false)
     };
 
     // Alias safety: the two GEP base pointers must be provably distinct
@@ -1512,6 +1519,7 @@ fn analyze_map_pattern(
         offset,
         store_idx,
         loop_blocks: loop_info.body.clone(),
+        plain_copy,
     })
 }
 
@@ -4700,11 +4708,12 @@ fn transform_map_neon(func: &mut IrFunction, pattern: &MapPattern) -> usize {
     }
 
     // Step 3: Broadcast scale and offset into vector registers in the preheader.
+    // (Plain copies need no arithmetic operands.)
     let scale_vec = Value(next_val_id);
     next_val_id += 1;
     let offset_vec = Value(next_val_id);
     next_val_id += 1;
-    {
+    if !pattern.plain_copy {
         let preheader = &mut func.blocks[preheader_idx];
         preheader.instructions.push(Instruction::Intrinsic {
             dest: Some(scale_vec),
@@ -4721,7 +4730,7 @@ fn transform_map_neon(func: &mut IrFunction, pattern: &MapPattern) -> usize {
         changes += 2;
     }
 
-    // Step 4: Replace the scalar store with load → mul → add → store vectors.
+    // Step 4: Replace the scalar store with load (→ mul → add) → store vectors.
     // The scalar load/mul/add become dead and are cleaned up by DCE.
     {
         let vec_load = Value(next_val_id);
@@ -4739,37 +4748,55 @@ fn transform_map_neon(func: &mut IrFunction, pattern: &MapPattern) -> usize {
             if debug { eprintln!("[VEC-MAP]   Store not found at transform time"); }
             return changes;
         };
-        let vec_insts = [
-            Instruction::Intrinsic {
-                dest: Some(vec_load),
-                op: IntrinsicOp::VecLoadI32x4,
-                dest_ptr: None,
-                args: vec![Operand::Value(pattern.src_gep), Operand::Const(IrConst::I64(0))],
-            },
-            Instruction::Intrinsic {
-                dest: Some(vec_mul),
-                op: IntrinsicOp::VecMulI32x4,
-                dest_ptr: None,
-                args: vec![Operand::Value(vec_load), Operand::Value(scale_vec)],
-            },
-            Instruction::Intrinsic {
-                dest: Some(vec_add),
-                op: IntrinsicOp::VecAddI32x4,
-                dest_ptr: None,
-                args: vec![Operand::Value(vec_mul), Operand::Value(offset_vec)],
-            },
-            Instruction::Intrinsic {
-                dest: None,
-                op: IntrinsicOp::VecStoreI32x4,
-                dest_ptr: Some(pattern.dst_gep),
-                args: vec![Operand::Value(vec_add)],
-            },
-        ];
+        let vec_insts: Vec<Instruction> = if pattern.plain_copy {
+            vec![
+                Instruction::Intrinsic {
+                    dest: Some(vec_load),
+                    op: IntrinsicOp::VecLoadI32x4,
+                    dest_ptr: None,
+                    args: vec![Operand::Value(pattern.src_gep), Operand::Const(IrConst::I64(0))],
+                },
+                Instruction::Intrinsic {
+                    dest: None,
+                    op: IntrinsicOp::VecStoreI32x4,
+                    dest_ptr: Some(pattern.dst_gep),
+                    args: vec![Operand::Value(vec_load)],
+                },
+            ]
+        } else {
+            vec![
+                Instruction::Intrinsic {
+                    dest: Some(vec_load),
+                    op: IntrinsicOp::VecLoadI32x4,
+                    dest_ptr: None,
+                    args: vec![Operand::Value(pattern.src_gep), Operand::Const(IrConst::I64(0))],
+                },
+                Instruction::Intrinsic {
+                    dest: Some(vec_mul),
+                    op: IntrinsicOp::VecMulI32x4,
+                    dest_ptr: None,
+                    args: vec![Operand::Value(vec_load), Operand::Value(scale_vec)],
+                },
+                Instruction::Intrinsic {
+                    dest: Some(vec_add),
+                    op: IntrinsicOp::VecAddI32x4,
+                    dest_ptr: None,
+                    args: vec![Operand::Value(vec_mul), Operand::Value(offset_vec)],
+                },
+                Instruction::Intrinsic {
+                    dest: None,
+                    op: IntrinsicOp::VecStoreI32x4,
+                    dest_ptr: Some(pattern.dst_gep),
+                    args: vec![Operand::Value(vec_add)],
+                },
+            ]
+        };
+        let n_new = vec_insts.len();
         for (i, inst) in vec_insts.into_iter().enumerate() {
             body.instructions.insert(store_pos + i, inst);
         }
-        body.instructions.remove(store_pos + 4);
-        changes += 4;
+        body.instructions.remove(store_pos + n_new);
+        changes += n_new;
     }
 
     // Step 5: Remainder loop for N % 4.
@@ -4888,9 +4915,8 @@ fn insert_map_remainder_loop(
         source_spans: vec![],
     };
 
-    let remainder_body_block = BasicBlock {
-        label: remainder_body_label,
-        instructions: vec![
+    let remainder_body_block = {
+        let base_insts = vec![
             Instruction::Cast {
                 dest: i_rem_cast,
                 src: Operand::Value(i_rem_iv),
@@ -4922,29 +4948,45 @@ fn insert_map_remainder_loop(
                 ty: IrType::I32,
                 seg_override: AddressSpace::Default,
             },
-            Instruction::BinOp {
-                dest: mul_v,
-                op: IrBinOp::Mul,
-                lhs: Operand::Value(load_v),
-                rhs: pattern.scale.clone(),
-                ty: IrType::I32,
-            },
-            Instruction::BinOp {
-                dest: add_v,
-                op: IrBinOp::Add,
-                lhs: Operand::Value(mul_v),
-                rhs: pattern.offset.clone(),
-                ty: IrType::I32,
-            },
-            Instruction::Store {
-                val: Operand::Value(add_v),
+        ];
+        let mut instructions = base_insts;
+        if pattern.plain_copy {
+            instructions.push(Instruction::Store {
+                val: Operand::Value(load_v),
                 ptr: gep_dst,
                 ty: IrType::I32,
                 seg_override: AddressSpace::Default,
-            },
-        ],
-        terminator: Terminator::Branch(remainder_latch_label),
-        source_spans: vec![],
+            });
+        } else {
+            instructions.extend_from_slice(&[
+                Instruction::BinOp {
+                    dest: mul_v,
+                    op: IrBinOp::Mul,
+                    lhs: Operand::Value(load_v),
+                    rhs: pattern.scale.clone(),
+                    ty: IrType::I32,
+                },
+                Instruction::BinOp {
+                    dest: add_v,
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(mul_v),
+                    rhs: pattern.offset.clone(),
+                    ty: IrType::I32,
+                },
+                Instruction::Store {
+                    val: Operand::Value(add_v),
+                    ptr: gep_dst,
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+            ]);
+        }
+        BasicBlock {
+            label: remainder_body_label,
+            instructions,
+            terminator: Terminator::Branch(remainder_latch_label),
+            source_spans: vec![],
+        }
     };
 
     let remainder_latch_block = BasicBlock {

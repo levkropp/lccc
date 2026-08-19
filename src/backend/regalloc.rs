@@ -877,6 +877,16 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     let mut used_regs: Vec<PhysReg> = used_regs_set.iter().map(|&r| PhysReg(r)).collect();
     used_regs.sort_by_key(|r| r.0);
 
+    if std::env::var("CCC_DEBUG_REGDUMP").is_ok() {
+        let mut by_reg: Vec<(u8, u32)> = assignments.iter().map(|(&v, &r)| (r.0, v)).collect();
+        by_reg.sort();
+        eprintln!("[REGDUMP] func={} assigned={} liveness_intervals={}", func.name, assignments.len(), liveness.intervals.len());
+        for (r, v) in by_reg {
+            let iv = liveness.intervals.iter().find(|iv| iv.value_id == v);
+            eprintln!("[REGDUMP]   reg {:>2} -> v{} interval={:?}", r, v, iv.map(|i| (i.start, i.end)));
+        }
+    }
+
     // Verify: no two assigned values should have overlapping live intervals
     // in the same physical register.
     if std::env::var("CCC_VERIFY_REGALLOC").is_ok() {
