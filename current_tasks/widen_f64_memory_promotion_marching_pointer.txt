@@ -29,11 +29,20 @@ also runs to a fixpoint (all eligible pointers promote per run, not just one).
 Result: all three bodies[i].v* j-loop accumulators promote to registers.
 nbody 1.68x -> 1.60x vs GCC; geomean 0.597 -> 0.581. 18/18 byte-identical.
 
-Remaining nbody gap (1.6x): GCC vectorizes (x,y) struct component pairs as
-2xF64 NEON and hoists all i-invariant loads. Ours still re-loads mass_j 3x
-per iteration (GVN load CSE blocked by all-or-nothing clobber tracking),
-reloads dt per iteration, and has no component pairing. Next lever: use the
-LinForm engine for GVN/LICM alias precision (load CSE across non-aliasing
-stores) — broader than nbody (spectral_norm, struct-heavy loops).
+Follow-up exploration (2026-08-18, commit 51285cd5):
+- Extracted the linear-form engine to src/passes/alias.rs (shared).
+- GVN: F32/F64 loads now CSE (float exclusion predated backend F64 copies).
+  Benchmark-neutral on the suite, principled parity fix.
+- DEAD END: alias-aware selective store invalidation in GVN (keep load CSE
+  entries alive across provably-disjoint stores) — geomean-neutral A/B,
+  possible regressions (struct_copy), high complexity. Reverted.
+- DEAD END: affine LICM hoisting of invariant global/GEP loads past
+  provably-disjoint stores (bodies[i].x/y/z out of the j-loop) — 60% nbody
+  REGRESSION: hoisted FP values exhaust the FP register pool and every FP
+  intermediate starts bouncing through stack+GPR. Our regalloc cannot absorb
+  extra FP live values in hot loops. Reverted.
+- Remaining nbody gap (~1.5x): the FP register pool is the binding constraint;
+  next real wins need better FP regalloc/spill policy, or (x,y)-pair NEON
+  vectorization of the struct components like GCC does.
 
 Started: 2026-08-15
