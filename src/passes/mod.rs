@@ -37,6 +37,7 @@ mod resolve_asm;
 pub(crate) mod simplify;
 pub(crate) mod store_load_forward;
 pub(crate) mod loop_unroll;
+pub(crate) mod quadratic_sr;
 pub(crate) mod tail_call_elim;
 pub(crate) mod outline_switch;
 pub(crate) mod recursion_to_iter;
@@ -721,6 +722,11 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
     module.for_each_function(redundant_loads::run);
     // Merged loads orphan their (now dead) address computations; clean up.
     module.for_each_function(dce::eliminate_dead_code);
+    // Second-order strength reduction for triangular loop indices (slope-1).
+    if !disabled.contains("quadsr") {
+        module.for_each_function(quadratic_sr::run);
+        module.for_each_function(dce::eliminate_dead_code);
+    }
 
     // Hoist FP constants used in loop bodies into preheader Copies so they can
     // stay in FP registers across the loop (AArch64 constant-pool literal loads
