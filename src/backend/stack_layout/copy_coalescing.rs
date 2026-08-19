@@ -387,7 +387,7 @@ pub(super) fn build_copy_alias_map(
             // the dest's slot could see each other's writes (unlike register
             // coalescing, there is no per-source interval conflict check here).
             let mut claimed_dests: FxHashSet<u32> = FxHashSet::default();
-            for (phi_dest, backedge_src) in detect_phi_coalesce_groups(func, liveness) {
+            for (phi_dest, backedge_src) in detect_phi_coalesce_groups(func, liveness, false) {
                 if std::env::var("CCC_DEBUG_LOOP_PHI").is_ok() {
                     eprintln!(
                         "[LOOP_PHI] func={} pair dest=v{} src=v{} dest_reg={} src_reg={} aliased={} ty_ok={}",

@@ -308,7 +308,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // The backedge source is removed from the eligible set so it doesn't get
     // allocated independently. After allocation, it inherits the phi dest's
     // register assignment.
-    let all_phi_pairs = detect_phi_coalesce_groups(func, &liveness);
+    let all_phi_pairs = detect_phi_coalesce_groups(func, &liveness, false);
+    // The FP register coalescing below verifies interval conflicts itself, so
+    // it can use the relaxed pair set that allows cross-block backedge sources
+    // (e.g. a value also read by the loop-exit test, like mandelbrot's y).
+    let fp_phi_pairs = detect_phi_coalesce_groups(func, &liveness, true);
     let mut phi_coalesce = if std::env::var("CCC_NO_PHI_COALESCE").is_ok() {
         Vec::new()
     } else {
@@ -769,9 +773,15 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // eliminating the backedge fmov/mov from the loop's serial dependency
     // chain (e.g. `fmadd d16, .., d16` instead of fmadd into a temp + fmov).
     if arm_fp_pool {
-        for &(phi_dest, backedge_src) in &all_phi_pairs {
+        let debug = std::env::var("CCC_DEBUG_FPCOAL").is_ok();
+        for &(phi_dest, backedge_src) in &fp_phi_pairs {
             let d_reg = assignments.get(&phi_dest).copied().filter(|r| (32..=38).contains(&r.0) || (40..=55).contains(&r.0));
             let s_reg = assignments.get(&backedge_src).copied().filter(|r| (32..=38).contains(&r.0) || (40..=55).contains(&r.0));
+            if debug {
+                eprintln!("[FPCOAL] cand phi={} d_reg={:?} src={} s_reg={:?} f64={} vec={}",
+                    phi_dest, d_reg.map(|r| r.0), backedge_src, s_reg.map(|r| r.0),
+                    f64_value_set.contains(&phi_dest), vector_values.contains(&phi_dest));
+            }
             let (Some(d), Some(s)) = (d_reg, s_reg) else { continue };
             if d == s {
                 continue;
@@ -1407,6 +1417,7 @@ fn count_value_uses_in_loop(
 pub(crate) fn detect_phi_coalesce_groups(
     func: &IrFunction,
     liveness: &LivenessResult,
+    permit_cross_block_src: bool,
 ) -> Vec<(u32, u32)> {
     // Step 1: Find multi-def values (phi dests after phi elimination).
     // A value is multi-def if it has Copy definitions in multiple blocks.
@@ -1600,7 +1611,10 @@ pub(crate) fn detect_phi_coalesce_groups(
                         // phi dest's register, but the allocator may reassign
                         // that register to other values in those blocks,
                         // clobbering the source before its cross-block uses.
-                        let src_has_cross_block_use = src_use_blocks
+                        // Register coalescing consumers (which verify interval
+                        // conflicts themselves) pass permit_cross_block_src to
+                        // skip this conservative proxy.
+                        let src_has_cross_block_use = !permit_cross_block_src && src_use_blocks
                             .get(&src_val.0)
                             .map(|blocks| blocks.iter().any(|&b| b != block_idx))
                             .unwrap_or(false);

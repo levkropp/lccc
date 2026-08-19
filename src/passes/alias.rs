@@ -147,15 +147,24 @@ pub(crate) fn resolve_lin_form(
 ) -> Option<LinForm> {
     if fuel == 0 { return None; }
     let fuel = fuel - 1;
+    if std::env::var("CCC_DEBUG_PROMOTE").is_ok() && find_def(func, v).is_none() {
+        eprintln!("[RESOLVE] v{} bail: no def", v.0);
+    }
     let inst = find_def(func, v)?;
     let def_bi = def_block.get(&v.0).copied().unwrap_or(usize::MAX);
     let debug = std::env::var("CCC_DEBUG_PROMOTE").is_ok();
+    macro_rules! bail {
+        ($why:expr) => {{
+            if debug { eprintln!("[RESOLVE] v{} bail: {}", v.0, $why); }
+            return None;
+        }};
+    }
 
     if def_bi == cur_header {
         // Current-loop phi: the marching variable. value = init + stride*t
         // for both pointer and integer phis.
         if matches!(inst, Instruction::Phi { .. }) {
-            let (init_op, stride) = striding_phi(func, v)?;
+            let Some((init_op, stride)) = striding_phi(func, v) else { bail!("cur-header phi not striding") };
             let mut f = match init_op {
                 Operand::Value(init_v) => {
                     resolve_lin_form(func, lp_body, def_block, cur_header, init_v, fuel)?
@@ -165,7 +174,7 @@ pub(crate) fn resolve_lin_form(
             f.march = f.march.checked_add(stride)?;
             return Some(f);
         }
-        return None;
+        bail!("in cur header but not a phi");
     }
 
     match inst {
