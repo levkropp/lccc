@@ -85,16 +85,38 @@ impl ArmCodegen {
         self.state.reg_cache.invalidate_all();
     }
 
-    pub(super) fn emit_select_impl(&mut self, dest: &Value, cond: &Operand, true_val: &Operand, false_val: &Operand, _ty: IrType) {
-        self.operand_to_x0(false_val);
-        self.state.emit("    mov x1, x0");
-        self.operand_to_x0(true_val);
-        self.state.emit("    mov x2, x0");
-        self.operand_to_x0(cond);
-        self.state.emit("    cmp x0, #0");
-        self.state.emit("    csel x0, x2, x1, ne");
+    pub(super) fn emit_select_impl(&mut self, dest: &Value, cond: &Operand, true_val: &Operand, false_val: &Operand, ty: IrType) {
+        let use_32bit = ty.size() <= 4;
+        // Register-direct staging: use each operand's assigned phys reg when
+        // available instead of round-tripping through x0/x1/x2.
+        let f_name = self.select_arm_reg(false_val, "x1", use_32bit);
+        let t_name = self.select_arm_reg(true_val, "x2", use_32bit);
+        // The condition: compare its phys reg directly when possible. Always
+        // compare the full 64-bit register: 32-bit-produced values have
+        // zeroed upper halves on AArch64, so this is correct for any width.
+        match cond {
+            Operand::Value(v) => {
+                if let Some(phys) = self.reg_assignments.get(&v.0).copied().filter(|r| !is_arm_fp_phys(*r)) {
+                    let c = callee_saved_name(phys);
+                    self.state.emit_fmt(format_args!("    cmp {}, #0", c));
+                } else {
+                    self.operand_to_x0(cond);
+                    self.state.emit("    cmp x0, #0");
+                }
+            }
+            _ => {
+                self.operand_to_x0(cond);
+                self.state.emit("    cmp x0, #0");
+            }
+        }
+        if let Some(dp) = self.dest_reg(dest).filter(|r| !is_arm_fp_phys(*r)) {
+            let d = if use_32bit { callee_saved_name_32(dp) } else { callee_saved_name(dp) };
+            self.state.emit_fmt(format_args!("    csel {}, {}, {}, ne", d, t_name, f_name));
+        } else {
+            self.state.emit_fmt(format_args!("    csel x0, {}, {}, ne", t_name, f_name));
+            self.store_x0_to(dest);
+        }
         self.state.reg_cache.invalidate_acc();
-        self.store_x0_to(dest);
     }
 
     /// Fused integer compare-and-select: `cmp lhs, rhs` + `csel dest, tv, fv, cc`.

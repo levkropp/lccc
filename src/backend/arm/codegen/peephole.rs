@@ -429,6 +429,7 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= eliminate_redundant_branches(&lines, &mut kinds, n);
         changed |= eliminate_self_moves(&mut kinds, n);
         changed |= eliminate_redundant_sxtw(&mut lines, &mut kinds, n);
+        changed |= eliminate_redundant_sxtb(&mut lines, &mut kinds, n);
         changed |= eliminate_move_chains(&mut lines, &mut kinds, n);
         changed |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
         changed |= propagate_address_aliases(&mut lines, &mut kinds, n);
@@ -464,6 +465,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_redundant_branches(&lines, &mut kinds, n);
             changed2 |= eliminate_self_moves(&mut kinds, n);
             changed2 |= eliminate_redundant_sxtw(&mut lines, &mut kinds, n);
+            changed2 |= eliminate_redundant_sxtb(&mut lines, &mut kinds, n);
             changed2 |= eliminate_move_chains(&mut lines, &mut kinds, n);
             changed2 |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
             changed2 |= propagate_address_aliases(&mut lines, &mut kinds, n);
@@ -932,6 +934,79 @@ fn eliminate_redundant_sxtw(lines: &mut [String], kinds: &mut [LineKind], n: usi
                 if let Some(dst) = written_gp_register(&lines[i], kinds[i]) {
                     if dst < 32 {
                         extended[dst as usize] = false;
+                    }
+                }
+            }
+        }
+    }
+    changed
+}
+
+// ── Pass 3b: Redundant byte sign-extension elimination ──────────────────────
+//
+// Mirror of eliminate_redundant_sxtw for byte-level extensions: `ldrsb`
+// produces a value whose bits 7..63 are uniform (a sign-extended byte), so a
+// later `sxtb xD, wS` on it is redundant. Fires on char-byte loops like
+// sieve's count loop (`ldrsb x0, [p]` then `sxtb` before the zero test).
+
+fn eliminate_redundant_sxtb(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut extb = [false; 33];
+    extb[32] = true; // the zero register is "byte-extended"
+    let mut changed = false;
+    for i in 0..n {
+        match kinds[i] {
+            LineKind::Label | LineKind::Branch | LineKind::CondBranch
+            | LineKind::CmpBranch | LineKind::Call | LineKind::Ret => {
+                extb = [false; 33];
+                extb[32] = true;
+            }
+            LineKind::Move { dst, src, is_32bit } => {
+                if is_32bit {
+                    // w-mov zeroes bits 32-63, breaking byte-extension of negatives.
+                    if dst < 32 {
+                        extb[dst as usize] = false;
+                    }
+                } else if dst < 32 {
+                    extb[dst as usize] = extb[src as usize];
+                }
+            }
+            _ => {
+                let t = lines[i].trim().to_string();
+                // sxtb xD, wS
+                if let Some(rest) = t.strip_prefix("sxtb ") {
+                    if let Some((d, s)) = rest.split_once(", ") {
+                        let dst = parse_reg(d.trim());
+                        let src = parse_reg(s.trim());
+                        if dst != REG_NONE && src != REG_NONE && dst < 32 && src < 32 {
+                            if extb[src as usize] {
+                                if dst == src {
+                                    kinds[i] = LineKind::Nop;
+                                } else {
+                                    lines[i] = format!("    mov {}, {}", xreg_name(dst), xreg_name(src));
+                                    kinds[i] = LineKind::Move { dst, src, is_32bit: false };
+                                }
+                                changed = true;
+                            }
+                            // The sxtb result is byte-extended either way.
+                            extb[dst as usize] = true;
+                            continue;
+                        }
+                    }
+                }
+                // ldrsb xD/wD, [...] creates a byte-sign-extended value.
+                if let Some(rest) = t.strip_prefix("ldrsb ") {
+                    if let Some((d, _)) = rest.split_once(',') {
+                        let dst = parse_reg(d.trim());
+                        if dst != REG_NONE && dst < 32 {
+                            extb[dst as usize] = true;
+                        }
+                        continue;
+                    }
+                }
+                // Any other write clobbers the tracking.
+                if let Some(dst) = written_gp_register(&t, kinds[i]) {
+                    if dst < 32 {
+                        extb[dst as usize] = false;
                     }
                 }
             }
