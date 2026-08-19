@@ -30,6 +30,7 @@ pub(crate) mod licm;
 pub(crate) mod load_forward;
 pub(crate) mod loop_analysis;
 pub(crate) mod loop_memory_promote;
+pub(crate) mod redundant_loads;
 pub(crate) mod univsr;
 pub(crate) mod narrow;
 mod resolve_asm;
@@ -714,6 +715,10 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
     // exposed canonical natural loops.
     module.for_each_function(loop_memory_promote::run);
     module.for_each_function(loop_memory_promote::mark_f64_add_reduction);
+    // Late redundant-load elimination: post-IVSR, field accesses have constant
+    // offsets, so same-address loads (the frontend's repeated `a[j].field`)
+    // merge when intervening stores are provably non-aliasing.
+    module.for_each_function(redundant_loads::run);
 
     // Hoist FP constants used in loop bodies into preheader Copies so they can
     // stay in FP registers across the loop (AArch64 constant-pool literal loads
