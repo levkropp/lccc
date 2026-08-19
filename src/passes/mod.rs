@@ -719,6 +719,8 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
     // offsets, so same-address loads (the frontend's repeated `a[j].field`)
     // merge when intervening stores are provably non-aliasing.
     module.for_each_function(redundant_loads::run);
+    // Merged loads orphan their (now dead) address computations; clean up.
+    module.for_each_function(dce::eliminate_dead_code);
 
     // Hoist FP constants used in loop bodies into preheader Copies so they can
     // stay in FP registers across the loop (AArch64 constant-pool literal loads
