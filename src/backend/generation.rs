@@ -743,7 +743,7 @@ fn detect_cmp_select_fusion(
 ///
 /// Returns a set of instruction indices that should be skipped because they
 /// will be handled by the preceding Mul's fused emission.
-fn detect_mul_add_fusions(block: &BasicBlock, use_counts: &[u32], fuse_float: bool) -> FxHashSet<usize> {
+fn detect_mul_add_fusions(block: &BasicBlock, use_counts: &[u32], fuse_float: bool, accumulator_dests: &FxHashSet<u32>) -> FxHashSet<usize> {
     let mut skip_set = FxHashSet::default();
 
     for (idx, inst) in block.instructions.iter().enumerate() {
@@ -768,7 +768,8 @@ fn detect_mul_add_fusions(block: &BasicBlock, use_counts: &[u32], fuse_float: bo
             continue;
         }
 
-        // Next instruction must be a BinOp::Add that uses the multiply result
+        // Next instruction must be a BinOp::Add (or, for floats with native
+        // fused multiply-subtract, a BinOp::Sub) that uses the multiply result
         let next_idx = idx + 1;
         if next_idx >= block.instructions.len() {
             continue;
@@ -776,6 +777,17 @@ fn detect_mul_add_fusions(block: &BasicBlock, use_counts: &[u32], fuse_float: bo
         let next_inst = &block.instructions[next_idx];
         let (add_lhs, add_rhs, add_ty) = match next_inst {
             Instruction::BinOp { op: crate::ir::reexports::IrBinOp::Add, lhs, rhs, ty, .. } => (lhs, rhs, ty),
+            // a - b*c → fmsub, b*c - a → fnmsub (single-rounding, matching
+            // GCC -O2's -ffp-contract=fast). Float-only: integer mul-temp
+            // fusion stays Add-only. CCC_NO_FMSUB restores Add-only behavior.
+            // Skipped when the Sub dest is a loop-carried accumulator: fusing
+            // an accumulator update lengthens the serial dependency chain.
+            Instruction::BinOp { dest: sub_dest, op: crate::ir::reexports::IrBinOp::Sub, lhs, rhs, ty, .. }
+                if mul_ty.is_float() && fuse_float && std::env::var("CCC_NO_FMSUB").is_err()
+                    && !accumulator_dests.contains(&sub_dest.0) =>
+            {
+                (lhs, rhs, ty)
+            }
             _ => continue,
         };
 
@@ -1330,6 +1342,60 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
     let mut last_debug_line: u32 = 0;
     cg.state().current_program_point = 0;
 
+    // Loop-carried accumulator destinations. Fusing `acc -= a*b` into fmsub
+    // puts the multiply on the accumulator's serial dependency chain (fmsub
+    // has longer latency than fsub), which measurably slows latency-bound
+    // accumulate loops (nbody: +13%). Such Subs stay split so the multiply
+    // issues independently of the chain. Accumulators are recognized as:
+    // surviving Phi dests (if elimination hasn't run), dests of multiple
+    // Copies (the phi-web shape after phi elimination), and memory-promoted
+    // loop F64 values.
+    let mut accumulator_dests: FxHashSet<u32> = func
+        .loop_promoted_f64_values
+        .iter()
+        .map(|v| v.0)
+        .collect();
+    {
+        let mut copy_def_count: FxHashMap<u32, u32> = FxHashMap::default();
+        for b in &func.blocks {
+            for inst in &b.instructions {
+                match inst {
+                    Instruction::Phi { dest, .. } => {
+                        accumulator_dests.insert(dest.0);
+                    }
+                    Instruction::Copy { dest, .. } => {
+                        let c = copy_def_count.entry(dest.0).or_insert(0);
+                        *c += 1;
+                        if *c == 2 {
+                            accumulator_dests.insert(dest.0);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Pull in values feeding accumulators through Copy chains: the backedge
+        // source of an accumulator phi (e.g. the fresh `Sub` dest that is
+        // copied into the accumulator register at the latch) sits on the same
+        // serial chain, so fusing it is just as harmful.
+        loop {
+            let mut grew = false;
+            for b in &func.blocks {
+                for inst in &b.instructions {
+                    if let Instruction::Copy { dest, src: Operand::Value(s) } = inst {
+                        if accumulator_dests.contains(&dest.0) && !accumulator_dests.contains(&s.0) {
+                            accumulator_dests.insert(s.0);
+                            grew = true;
+                        }
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+    }
+
     for block in &func.blocks {
         if Some(block.label) != entry_label {
             // Invalidate register cache at block boundaries: a value in a register
@@ -1344,7 +1410,7 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
         // CondBranch terminator, emit a fused compare-and-conditional-jump
         // instead of materializing the boolean result to a register/stack slot.
         let fuse_idx = detect_cmp_branch_fusion(block, &value_use_counts, cg.supports_fused_fp_cmp_branch());
-        let mul_add_fusions = detect_mul_add_fusions(block, &value_use_counts, cg.supports_fused_float_mul_add());
+        let mul_add_fusions = detect_mul_add_fusions(block, &value_use_counts, cg.supports_fused_float_mul_add(), &accumulator_dests);
         let cmp_select_fusions = if cg.supports_fused_cmp_select() {
             detect_cmp_select_fusion(block, &value_use_counts)
         } else {
@@ -1446,13 +1512,27 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
                     // Only fuse if the multiply temp is NOT register-allocated.
                     // If it IS registered, the standard register-direct path is better.
                     if cg.get_phys_reg_for_value(dest.0).is_none() || ty.is_float() {
-                        if let Some(Instruction::BinOp { dest: add_dest, lhs: add_lhs, rhs: add_rhs, ty: add_ty, .. }) = block.instructions.get(idx + 1) {
-                            let mul_is_lhs = matches!(add_lhs, Operand::Value(v) if v.0 == dest.0);
-                            let acc_op = if mul_is_lhs { add_rhs } else { add_lhs };
-                            cg.emit_fused_mul_add(dest, lhs, rhs, acc_op, add_dest, *add_ty);
-                            skip_fused_add = true;
-                            cg.state().current_program_point += 1;
-                            continue;
+                        match block.instructions.get(idx + 1) {
+                            Some(Instruction::BinOp { dest: add_dest, op: crate::ir::reexports::IrBinOp::Add,
+                                                      lhs: add_lhs, rhs: add_rhs, ty: add_ty, .. }) => {
+                                let mul_is_lhs = matches!(add_lhs, Operand::Value(v) if v.0 == dest.0);
+                                let acc_op = if mul_is_lhs { add_rhs } else { add_lhs };
+                                cg.emit_fused_mul_add(dest, lhs, rhs, acc_op, add_dest, *add_ty);
+                                skip_fused_add = true;
+                                cg.state().current_program_point += 1;
+                                continue;
+                            }
+                            Some(Instruction::BinOp { dest: sub_dest, op: crate::ir::reexports::IrBinOp::Sub,
+                                                      lhs: sub_lhs, rhs: sub_rhs, ty: sub_ty, .. }) => {
+                                // a - b*c: fmsub(acc=a). b*c - a: fnmsub(acc=a).
+                                let mul_is_lhs = matches!(sub_lhs, Operand::Value(v) if v.0 == dest.0);
+                                let acc_op = if mul_is_lhs { sub_rhs } else { sub_lhs };
+                                cg.emit_fused_mul_sub(dest, lhs, rhs, acc_op, sub_dest, *sub_ty, mul_is_lhs);
+                                skip_fused_add = true;
+                                cg.state().current_program_point += 1;
+                                continue;
+                            }
+                            _ => {}
                         }
                     }
                 }

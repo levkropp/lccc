@@ -410,6 +410,22 @@ pub trait ArchCodegen {
 
     fn supports_fused_float_mul_add(&self) -> bool { false }
 
+    /// Emit a fused multiply-subtract. When `mul_is_lhs` is false this is
+    /// `sub_dest = acc - (mul_lhs * mul_rhs)` (fmsub); when true it is
+    /// `sub_dest = (mul_lhs * mul_rhs) - acc` (fnmsub).
+    ///
+    /// Default implementation falls back to separate mul + sub.
+    fn emit_fused_mul_sub(&mut self, _mul_dest: &Value, mul_lhs: &Operand, mul_rhs: &Operand,
+                          acc: &Operand, sub_dest: &Value, ty: IrType, mul_is_lhs: bool) {
+        self.emit_int_binop(_mul_dest, IrBinOp::Mul, mul_lhs, mul_rhs, ty);
+        let (l, r) = if mul_is_lhs {
+            (Operand::Value(Value(_mul_dest.0)), *acc)
+        } else {
+            (*acc, Operand::Value(Value(_mul_dest.0)))
+        };
+        self.emit_int_binop(sub_dest, IrBinOp::Sub, &l, &r, ty);
+    }
+
     /// Whether the target can encode a shifted register directly as the second
     /// operand of an integer logical instruction (for example AArch64's
     /// `orr w0, w1, w2, lsr #5`).

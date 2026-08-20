@@ -1870,6 +1870,21 @@ impl ArchCodegen for ArmCodegen {
             self.emit_int_fused_mul_add_impl(mul_lhs, mul_rhs, acc, add_dest, ty);
         }
     }
+    fn emit_fused_mul_sub(&mut self, mul_dest: &Value, mul_lhs: &Operand, mul_rhs: &Operand,
+                          acc: &Operand, sub_dest: &Value, ty: IrType, mul_is_lhs: bool) {
+        if ty == IrType::F32 || ty == IrType::F64 {
+            self.emit_fused_mul_sub_impl(mul_dest, mul_lhs, mul_rhs, acc, sub_dest, ty, mul_is_lhs);
+        } else {
+            // Integer sub fusion is not profitable here; separate mul + sub.
+            self.emit_int_binop(mul_dest, IrBinOp::Mul, mul_lhs, mul_rhs, ty);
+            let (l, r) = if mul_is_lhs {
+                (Operand::Value(Value(mul_dest.0)), *acc)
+            } else {
+                (*acc, Operand::Value(Value(mul_dest.0)))
+            };
+            self.emit_int_binop(sub_dest, IrBinOp::Sub, &l, &r, ty);
+        }
+    }
     fn state(&mut self) -> &mut CodegenState { &mut self.state }
     fn state_ref(&self) -> &CodegenState { &self.state }
 
