@@ -1476,6 +1476,10 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
                 continue;
             }
             // Skip GEP instructions whose offset has been folded into Load/Store.
+            // Note: the base must be alloca- or register-resident. A slot-homed
+            // (Indirect) base may have its interval end at the GEP — its last
+            // IR use — and the folded load would read the slot AFTER Tier-2
+            // slot packing may have reused it. Do not widen to Indirect.
             if let Instruction::GetElementPtr { dest, base, .. } = inst {
                 if gep_fold_map.contains_key(&dest.0) &&
                    (cg.state_ref().is_alloca(base.0) || cg.get_phys_reg_for_value(base.0).is_some()) {

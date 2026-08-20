@@ -57,6 +57,14 @@ architectural, not pass-level. This doc records the evidence and the plan.
   pool-aware gating; the 60% affine-LICM regression came from hoisted values
   outbidding accumulators for FP registers. Do not retry without a
   register-pressure-aware gate.
+- Widening the const-GEP fold to slot-homed (Indirect) bases: MISCOMPILE.
+  The base's live interval ends at the GEP (its last IR use); the folded
+  load reads the base's slot one step later, after Tier-2 slot packing may
+  have reused it. The same interval-edge hazard applies to register reuse
+  after a value's last IR use — remember it for the allocator rewrite.
+- GPR pool extension via x9-x15: the emitter's scratch discipline
+  (address staging, memcpy, call staging, intrinsics) is load-bearing;
+  x16/x17 are also used as scratch in 24+ sites. Not a bounded change.
 
 ## Latent backend hazards found (fixed)
 

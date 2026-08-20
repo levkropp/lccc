@@ -370,11 +370,27 @@ impl ArmCodegen {
                 }
                 SlotAddr::Indirect(slot) => {
                     self.emit_load_ptr_from_slot_impl(slot, base.0);
-                    if offset != 0 {
-                        self.emit_add_offset_to_addr_reg_impl(offset);
-                    }
                     let (actual_instr, dest_reg) = Self::arm_parse_load(load_instr);
-                    self.state.emit_fmt(format_args!("    {} {}, [x9]", actual_instr, dest_reg));
+                    // Fold the constant offset into the addressing mode when
+                    // encodable (mirrors the store side): scaled unsigned
+                    // offset, else the unscaled ldur range, else a separate add.
+                    let size = match ty {
+                        IrType::I8 | IrType::U8 => 1,
+                        IrType::I16 | IrType::U16 => 2,
+                        IrType::I32 | IrType::U32 | IrType::F32 => 4,
+                        _ => 8,
+                    };
+                    if offset > 0 && offset % size == 0 && offset / size <= 4095 {
+                        self.state.emit_fmt(format_args!("    {} {}, [x9, #{}]", actual_instr, dest_reg, offset));
+                    } else if offset != 0 && (-256..=255).contains(&offset) {
+                        let unscaled = Self::arm_unscaled_load(actual_instr);
+                        self.state.emit_fmt(format_args!("    {} {}, [x9, #{}]", unscaled, dest_reg, offset));
+                    } else {
+                        if offset != 0 {
+                            self.emit_add_offset_to_addr_reg_impl(offset);
+                        }
+                        self.state.emit_fmt(format_args!("    {} {}, [x9]", actual_instr, dest_reg));
+                    }
                 }
             }
             self.store_x0_to(dest);

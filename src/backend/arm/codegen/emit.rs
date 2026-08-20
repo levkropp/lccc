@@ -1312,6 +1312,20 @@ impl ArmCodegen {
         }
     }
 
+    /// Map a scaled load mnemonic to its unscaled (ldur) form for offsets
+    /// that don't fit the scaled unsigned encoding.
+    pub(super) fn arm_unscaled_load(instr: &'static str) -> &'static str {
+        match instr {
+            "ldr" => "ldur",
+            "ldrb" => "ldurb",
+            "ldrh" => "ldurh",
+            "ldrsb" => "ldursb",
+            "ldrsh" => "ldursh",
+            "ldrsw" => "ldursw",
+            other => other,
+        }
+    }
+
     // --- Intrinsic helpers (NEON) ---
 
     /// Load the address represented by a pointer Value into the given register.

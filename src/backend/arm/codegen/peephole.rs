@@ -437,6 +437,7 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= propagate_address_aliases(&mut lines, &mut kinds, n);
         changed |= forward_fp_slot_loads(&mut lines, &mut kinds, n);
         changed |= fuse_fp_adjacent_pairs(&mut lines, &mut kinds, n);
+        changed |= eliminate_repeated_slot_loads(&mut lines, &mut kinds, n);
         changed |= fold_destructive_pointer_updates(&mut lines, &mut kinds, n);
         changed |= fuse_branch_over_branch(&mut lines, &mut kinds, n);
         if rotate {
@@ -475,6 +476,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= propagate_address_aliases(&mut lines, &mut kinds, n);
             changed2 |= forward_fp_slot_loads(&mut lines, &mut kinds, n);
             changed2 |= fuse_fp_adjacent_pairs(&mut lines, &mut kinds, n);
+            changed2 |= eliminate_repeated_slot_loads(&mut lines, &mut kinds, n);
             changed2 |= fold_destructive_pointer_updates(&mut lines, &mut kinds, n);
             rounds2 += 1;
         }
@@ -1076,6 +1078,86 @@ fn fuse_fp_adjacent_pairs(lines: &mut [String], kinds: &mut [LineKind], n: usize
         kinds[i] = classify_line(&lines[i]);
         kinds[pj] = LineKind::Nop;
         changed = true;
+    }
+    changed
+}
+
+// ── Repeated GP slot load elimination ───────────────────────────────────────
+//
+// `ldr x9, [sp, #off]` ... `ldr x9, [sp, #off]` (same slot, no clobber):
+// spill-heavy code reloads slot-homed pointers once per field access. The
+// second load is redundant (or becomes a `mov` when the destination differs).
+// Same tracking discipline as forward_fp_slot_loads: stores through unknown
+// bases, calls, and control-flow boundaries drop all state; a write of the
+// cached register drops the entry.
+fn eliminate_repeated_slot_loads(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_SLOT_LOAD_DEDUP").is_ok() {
+        return false;
+    }
+    // (offset, is_word) -> register holding the slot's content
+    let mut cached: FxHashMap<(i32, bool), u8> = FxHashMap::default();
+    let mut changed = false;
+    for i in 0..n {
+        match kinds[i] {
+            LineKind::Label | LineKind::Branch | LineKind::CondBranch
+            | LineKind::CmpBranch | LineKind::Call | LineKind::Ret => {
+                cached.clear();
+                continue;
+            }
+            LineKind::Directive | LineKind::Nop => continue,
+            LineKind::StoreSp { offset, is_word, .. } => {
+                // Invalidate entries overlapping the stored range.
+                let (lo, hi) = (offset, offset + if is_word { 4 } else { 8 });
+                cached.retain(|&(off, word), _| {
+                    let (l2, h2) = (off, off + if word { 4 } else { 8 });
+                    h2 <= lo || l2 >= hi
+                });
+                continue;
+            }
+            LineKind::LoadSp { reg, offset, is_word } => {
+                if let Some(&prev) = cached.get(&(offset, is_word)) {
+                    if prev == reg {
+                        kinds[i] = LineKind::Nop;
+                        changed = true;
+                        continue;
+                    }
+                    lines[i] = format!(
+                        "    mov {}, {}",
+                        if is_word { wreg_name(reg) } else { xreg_name(reg) },
+                        if is_word { wreg_name(prev) } else { xreg_name(prev) }
+                    );
+                    kinds[i] = LineKind::Move { dst: reg, src: prev, is_32bit: is_word };
+                    changed = true;
+                }
+                // The load (or its mov replacement) writes `reg`: any entry
+                // cached under it is stale. Then record the new mapping.
+                cached.retain(|_, &mut r| r != reg);
+                cached.insert((offset, is_word), reg);
+                continue;
+            }
+            _ => {}
+        }
+        let t = lines[i].trim();
+        // Stores through untracked bases may hit the frame: drop everything.
+        if t.starts_with("st") {
+            cached.clear();
+            continue;
+        }
+        // Loads and other instructions only invalidate via their destination.
+        if let Some(w) = written_gp_register(&lines[i], kinds[i]) {
+            cached.retain(|_, &mut r| r != w);
+        } else {
+            // Unrecognized kinds: check destination-position mentions broadly.
+            let mut dead = Vec::new();
+            for &r in cached.values() {
+                if gp_reg_written_broad(&lines[i], r) {
+                    dead.push(r);
+                }
+            }
+            for r in dead {
+                cached.retain(|_, &mut v| v != r);
+            }
+        }
     }
     changed
 }
@@ -2892,8 +2974,77 @@ f:
 ";
         let result = peephole_optimize(input.to_string());
         assert!(result.contains("ldp d22, d28, [x7]"), "reversed pair normalized:\n{}", result);
-    }#[test]
-fn test_fp_pair_latch_stores_no_overlap() {
+    }
+
+    // ── Repeated slot load elimination ───────────────────────────────────
+
+    #[test]
+    fn test_repeated_slot_load_same_reg_deleted() {
+        let input = "\
+f:
+    ldr x9, [sp, #392]
+    ldr d28, [x9, #80]
+    fmul d29, d28, d8
+    ldr x9, [sp, #392]
+    ldr d30, [x9, #56]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert_eq!(result.matches("ldr x9, [sp, #392]").count(), 1,
+            "second load deleted:\n{}", result);
+    }
+
+    #[test]
+    fn test_repeated_slot_load_different_reg_mov() {
+        // The repeat load becomes a mov, and copy-propagation then folds the
+        // mov into the consumer — the second slot load disappears entirely.
+        let input = "\
+f:
+    ldr x9, [sp, #392]
+    ldr d28, [x9, #80]
+    ldr x10, [sp, #392]
+    ldr d30, [x10, #56]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.contains("ldr x10, [sp, #392]"), "repeat load gone:\n{}", result);
+        assert!(result.contains("ldr d30, [x9, #56]"), "consumer uses x9:\n{}", result);
+    }
+
+    #[test]
+    fn test_repeated_slot_load_blocked_by_intervening_store() {
+        // A store through an unknown base may write the frame slot.
+        let input = "\
+f:
+    ldr x9, [sp, #392]
+    str d0, [x26]
+    ldr x9, [sp, #392]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert_eq!(result.matches("ldr x9, [sp, #392]").count(), 2,
+            "unknown-base store must block:\n{}", result);
+    }
+
+    #[test]
+    fn test_repeated_slot_load_blocked_by_reg_clobber() {
+        let input = "\
+f:
+    ldr x9, [sp, #392]
+    add x9, x9, #8
+    ldr x9, [sp, #392]
+    ret
+";
+        // x9 was overwritten by the add: the second load must stay.
+        let result = peephole_optimize(input.to_string());
+        assert_eq!(result.matches("ldr x9, [sp, #392]").count(), 2,
+            "clobbered register must block:\n{}", result);
+    }
+
+
+
+    #[test]
+    fn test_fp_pair_latch_stores_no_overlap() {
     // Consecutive latch spill stores fuse pairwise; an already-paired line
     // must not be re-paired into an overlapping stp.
     let input = "\
