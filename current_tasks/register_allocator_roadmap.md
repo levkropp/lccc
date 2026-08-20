@@ -1,6 +1,6 @@
 # AArch64 codegen quality: findings + register-allocator roadmap
 
-Session outcome: geomean vs GCC -O2 improved 0.61x -> 0.581x with 9 verified
+Session outcome: geomean vs GCC -O2 improved 0.61x -> 0.580x with 11 verified
 wins (all 18/18 byte-identical, suites green). The remaining gap to GCC is
 architectural, not pass-level. This doc records the evidence and the plan.
 
@@ -13,6 +13,10 @@ architectural, not pass-level. This doc records the evidence and the plan.
 - Register-direct Select emission (no x0/x1/x2 staging) + redundant sxtb elim.
 - Opened unused loop-promotion FP regs (d27-d31) to the general FP scan.
 - Quadratic strength reduction (triangular indices) for spectral_norm.
+- Call-spanning F64 values allocate to the callee-saved FP pool (d8-d14)
+  instead of never being allocated (restricted-pool support in the scan).
+- GlobalAddr CSE (substitution-based pass): one SSA value per symbol per
+  dominance scope instead of one per access (fannkuch -3-5%).
 
 ## Reverted / documented dead-ends (measured, do not retry)
 
@@ -28,6 +32,26 @@ architectural, not pass-level. This doc records the evidence and the plan.
 - Extended register steal to non-phi hot values: MISCOMPILE (strlen_bench).
 - d15/v15 pool opening: regressed nbody +4%.
 - Full unroll for struct_copy: 30ms vs 18.6ms baseline (body bloat).
+- CCC_LOOP_PIN cap sweep on fannkuch: 0->4066, 1->3715, 2->3458, 4->3474,
+  6->3417 ms. The default cap of 2 is the sweet spot; more steals evict
+  warm holders. Do not raise.
+- GVN-style (Copy-inserting) CSE for pointer-valued expressions: hits the
+  same stale-base-register landmine that disabled GEP CSE. GlobalAddr CSE
+  must be substitution-based (see global_addr_cse.rs).
+
+## Latent backend hazards found (fixed)
+
+- peephole propagate_address_aliases deleted the defining `mov xD, x0` of an
+  address alias based on a same-block window, ignoring cross-block uses
+  (segfault when GlobalAddr CSE made aliases multi-use). Fixed with a
+  full-function scan that only deletes on proven death of the alias.
+- tail_call_elim::replace_values_in_inst missed Intrinsic::dest_ptr and
+  InlineAsm::outputs — dangling uses after substitution passes. Fixed in the
+  shared helper.
+- Lesson: making any pointer-valued SSA value multi-use exercises backend
+  fast paths (accumulator reg_cache, text peepholes, fold analyses) that were
+  written assuming single-use/immediate consumption. Verify with the
+  progressive suite (hash_table_mini catches this class).
 
 ## Root cause of the remaining gap (fannkuch 1.95x, struct_copy 1.67x, nbody 1.35x)
 

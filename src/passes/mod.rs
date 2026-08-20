@@ -20,6 +20,7 @@ pub(crate) mod dce;
 mod dead_statics;
 pub(crate) mod div_by_const;
 pub(crate) mod fp_const_hoist;
+pub(crate) mod global_addr_cse;
 pub(crate) mod int_const_hoist;
 pub(crate) mod gvn;
 pub(crate) mod if_convert;
@@ -366,6 +367,13 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
     if !disabled.contains("rec2iter") {
         module.for_each_function(recursion_to_iter::recursion_to_iteration);
     }
+
+    // Merge duplicate global-address materializations into one SSA value per
+    // symbol (per dominance-safe scope). Runs before the main loop so GVN,
+    // LICM, and the register allocator all see the deduplicated value web
+    // (loops over several static arrays otherwise keep a dozen interchangeable
+    // base-address values live, starving the register pools).
+    module.for_each_function(global_addr_cse::run);
 
     let iterations = 3;
     let num_funcs = module.functions.len();

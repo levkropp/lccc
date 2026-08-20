@@ -488,10 +488,34 @@ pub fn peephole_optimize(asm: String) -> String {
 /// Propagate a register copy used only as a memory-address alias within one
 /// basic block. This handles vector intrinsics where an SSA Copy gives the C
 /// pointer a short-lived register solely for `[xN]` loads/stores.
+///
+/// Soundness: the defining `mov` may only be deleted when the copy's value is
+/// provably dead after the rewritten window — every mention of `dst` from here
+/// to the end of the function's text must be accounted for. An earlier version
+/// stopped the scan at the first block boundary and deleted the mov anyway,
+/// which silently dropped the initializer of any alias used in a later block
+/// (exposed when global-address CSE made such aliases multi-use). We therefore
+/// scan to the end of the function and commit only on proof of death:
+/// overwrite of `dst` by an instruction that does not read it, or the end of
+/// the function's text. Anything unrecognized (other memory ops, unknown
+/// instruction kinds, calls) blocks the transform.
 fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     fn mentions(line: &str, reg: u8) -> bool {
         line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .any(|tok| tok == xreg_name(reg) || tok == wreg_name(reg))
+    }
+    fn mention_count(line: &str, reg: u8) -> usize {
+        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|tok| *tok == xreg_name(reg) || *tok == wreg_name(reg))
+            .count()
+    }
+    // Column-0 identifier label: the next function or data object, i.e. the
+    // end of the current function's text. Block labels start with '.', and
+    // inline-asm numeric local labels (`1:`) start with a digit — neither
+    // terminates the function's text.
+    fn is_function_boundary(line: &str) -> bool {
+        line.ends_with(':')
+            && line.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
     }
     let mut changed = false;
     for i in 0..n {
@@ -499,35 +523,74 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
         if dst == src || dst >= 29 || src >= 29 { continue; }
         let mut uses = Vec::new();
         let mut valid = true;
+        let mut provably_dead = false;
+        let mut src_alive = true;
         let mut j = i + 1;
         while j < n {
-            if matches!(kinds[j], LineKind::Label | LineKind::Branch | LineKind::CondBranch
-                | LineKind::CmpBranch | LineKind::Call | LineKind::Ret) { break; }
-            if written_gp_register(&lines[j], kinds[j]) == Some(src) {
-                let mut tail = j + 1;
-                while tail < n && !matches!(kinds[tail], LineKind::Label | LineKind::Branch
-                    | LineKind::CondBranch | LineKind::CmpBranch | LineKind::Call | LineKind::Ret)
-                {
-                    if mentions(&lines[tail], dst) { valid = false; }
-                    tail += 1;
-                }
+            if is_function_boundary(&lines[j]) {
+                provably_dead = true;
                 break;
             }
-            if written_gp_register(&lines[j], kinds[j]) == Some(dst) {
-                break;
-            }
-            if mentions(&lines[j], dst) {
-                let address = format!("[{}", xreg_name(dst));
-                if lines[j].contains(&address) {
-                    uses.push(j);
-                } else {
-                    valid = false;
-                    break;
+            match kinds[j] {
+                // No runtime effect. A return ends this path; textually later
+                // lines belong to other paths, so keep scanning.
+                //
+                // Note: an epilogue's `ldp xD, ...` callee-save restore is NOT
+                // treated as proof of death here — it ends the value only on
+                // that return path, and textually later blocks (other paths)
+                // may still use it, so it falls through to the plain-mention
+                // handling and blocks the transform.
+                LineKind::Nop | LineKind::Directive | LineKind::Label | LineKind::Ret => {}
+                // Calls clobber src (x0) and all caller-saved registers. Rather
+                // than reason about save/restore pairs, stop without committing.
+                LineKind::Call => { valid = false; break; }
+                _ => {
+                    // Kinds whose destination register written_gp_register
+                    // models precisely.
+                    let trusted = matches!(kinds[j],
+                        LineKind::Move { .. } | LineKind::MoveImm { .. }
+                        | LineKind::MoveWide { .. } | LineKind::Sxtw { .. }
+                        | LineKind::LoadSp { .. } | LineKind::LoadswSp { .. }
+                        | LineKind::Alu | LineKind::Compare
+                        | LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch
+                        | LineKind::StoreSp { .. });
+                    let written = written_gp_register(&lines[j], kinds[j]);
+                    if (trusted && written == Some(src))
+                        || (!trusted && mentions(&lines[j], src))
+                    {
+                        src_alive = false;
+                    }
+                    if mentions(&lines[j], dst) {
+                        if trusted && written == Some(dst) && mention_count(&lines[j], dst) == 1 {
+                            // dst overwritten without being read: the mov's
+                            // value is dead past this instruction (register
+                            // assignments are per-value with disjoint live
+                            // intervals, so no later text can use the old value).
+                            provably_dead = true;
+                            break;
+                        }
+                        let address = format!("[{}", xreg_name(dst));
+                        if src_alive && mention_count(&lines[j], dst) == 1
+                            && lines[j].contains(&address)
+                        {
+                            // dst used purely as the address base of a
+                            // load/store while src is alive: rewritable.
+                            uses.push(j);
+                        } else {
+                            // Non-address use, an unmodelled effect, or an
+                            // address use after src died: the mov must stay.
+                            valid = false;
+                            break;
+                        }
+                    }
                 }
             }
             j += 1;
         }
-        if valid && !uses.is_empty() {
+        if j == n {
+            provably_dead = true; // scanned to the end of the file
+        }
+        if valid && provably_dead && !uses.is_empty() {
             for use_idx in uses {
                 lines[use_idx] = replace_whole_word(&lines[use_idx], xreg_name(dst), xreg_name(src));
                 kinds[use_idx] = classify_line(&lines[use_idx]);
@@ -1861,5 +1924,53 @@ mod tests {
         let result = peephole_optimize(input.to_string());
         // Store must be preserved because address of stack slot is taken
         assert!(result.contains("str w0, [sp, #16]"));
+    }
+
+    // ── Address-alias soundness ────────────────────────────────────────
+
+    #[test]
+    fn test_address_alias_mov_survives_cross_block_use() {
+        // The mov's register is used as an address in a LATER block (after a
+        // call): deleting the initializer must not happen even though the
+        // in-window use is a pure address alias.
+        let input = "\
+f:
+    adrp x0, tbl
+    add x0, x0, :lo12:tbl
+    mov x23, x0
+    ldr x4, [x23, x28, lsl #3]
+    mov x19, x4
+    bl strcmp
+.LBB9:
+    ldr x19, [x23, x27, lsl #3]
+    str x22, [x23, x27, lsl #3]
+    ret
+g:
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("mov x23, x0"), "defining mov must survive:\n{}", result);
+        assert!(result.contains("[x23, x27, lsl #3]"),
+            "cross-block use must not be rewritten:\n{}", result);
+    }
+
+    #[test]
+    fn test_address_alias_folded_when_provably_dead() {
+        // The intended optimization: a short-lived address alias whose
+        // register is overwritten (without being read) after the uses.
+        let input = "\
+f:
+    mov x9, x26
+    ldr x4, [x9]
+    str x4, [x9, #8]
+    mov x9, x5
+    ret
+g:
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.contains("mov x9, x26"), "dead alias mov removed:\n{}", result);
+        assert!(result.contains("ldr x4, [x26]"), "use rewritten:\n{}", result);
+        assert!(result.contains("str x4, [x26, #8]"), "use rewritten:\n{}", result);
     }
 }
