@@ -91,6 +91,14 @@ pub(crate) fn vectorize_with_analysis(func: &mut IrFunction, cfg: &CfgAnalysis) 
 }
 
 fn vectorize_with_analysis_mode(func: &mut IrFunction, cfg: &CfgAnalysis, force_two_wide: bool, neon: bool) -> usize {
+    vectorize_mode_impl(func, cfg, force_two_wide, neon, false)
+}
+
+/// `late_clamp_only`: restrict to conditional-sum reductions (Select-clamped
+/// accumulators, which only exist after if-conversion). Every other pattern
+/// had its chance in the early pass; re-matching them late can re-transform
+/// the synthesized remainder loops.
+fn vectorize_mode_impl(func: &mut IrFunction, cfg: &CfgAnalysis, force_two_wide: bool, neon: bool, late_clamp_only: bool) -> usize {
     let num_blocks = func.blocks.len();
     let loops = loop_analysis::find_natural_loops(
         num_blocks,
@@ -129,6 +137,19 @@ fn vectorize_with_analysis_mode(func: &mut IrFunction, cfg: &CfgAnalysis, force_
         }
 
         // Try to vectorize this loop - first try matmul, then try reduction patterns.
+        if late_clamp_only {
+            // Late pass: only conditional-sum reductions (Select-clamped
+            // accumulators). Everything else had its chance in the early pass.
+            if let Some(red_pattern) = analyze_reduction_pattern(func, loop_info, cfg, force_two_wide, neon) {
+                if red_pattern.clamp_nonnegative {
+                    if debug {
+                        eprintln!("[VEC] Conditional-sum reduction matched (late)! Transforming");
+                    }
+                    total_changes += transform_reduction_sse2(func, &red_pattern, neon);
+                }
+            }
+            continue;
+        }
         if let Some(pattern) = analyze_loop_pattern(func, loop_info, cfg) {
             // Select vector width: default to AVX2 (4-wide) unless explicitly disabled
             let use_sse2 = force_two_wide || std::env::var("LCCC_FORCE_SSE2").is_ok();
@@ -262,6 +283,11 @@ struct ReductionPattern {
     array_b_gep: Option<Value>,
     /// Index of the add instruction that updates the accumulator
     accumulator_add_idx: usize,
+    /// Conditional-sum form: the accumulator update is
+    /// `Select(cmp(x, 0), acc + x, acc)`, i.e. `acc += max(x, 0)`.
+    /// The vector transform clamps each loaded lane with smax before
+    /// accumulating (integer-identical result).
+    clamp_nonnegative: bool,
     /// Loop limit value (N in `i < N`)
     limit: Operand,
     /// Comparison instruction index that tests loop exit condition
@@ -974,6 +1000,86 @@ fn analyze_reduction_pattern(
     let body_idx = body_idx?;
     let accumulator_add_idx = accumulator_add_idx?;
     let add_result = add_result?;
+
+    // Conditional-sum wrapper: `Select(cmp(x, 0), acc + x, acc)` — i.e.
+    // `acc += max(x, 0)`. This MUST be detected before matching the add's
+    // operand: a clamped sum vectorized as an unconditional one would be a
+    // miscompile. Only the NEON widening shape (I32 elements into an I64
+    // accumulator via smax+sadalp) is supported; any other Select-wrapped
+    // accumulator update rejects the loop.
+    let mut clamp_nonnegative = false;
+    {
+        let body_block = &func.blocks[body_idx];
+        for inst in &body_block.instructions {
+            let Instruction::Select { cond, true_val, false_val, .. } = inst else { continue };
+            let (Operand::Value(cond_v), Operand::Value(tv), Operand::Value(fv)) = (cond, true_val, false_val) else { continue };
+            let add_arm_is_true = if tv.0 == add_result.0 && accumulator_derived.contains(fv) {
+                true
+            } else if fv.0 == add_result.0 && accumulator_derived.contains(tv) {
+                false
+            } else {
+                continue;
+            };
+            // The Select must feed the accumulator phi's backedge.
+            let Some(select_dest) = inst.dest() else { continue };
+            let feeds_phi = header.instructions.iter().any(|i| matches!(i,
+                Instruction::Phi { dest, incoming, .. } if *dest == accumulator_phi
+                    && incoming.iter().any(|(op, _)| matches!(op, Operand::Value(v) if v.0 == select_dest.0))));
+            if !feeds_phi {
+                continue;
+            }
+            // Condition: the added element (or the load it came from) vs zero.
+            let Some(cmp_inst) = body_block.instructions.iter()
+                .find(|i| matches!(i.dest(), Some(d) if d.0 == cond_v.0)) else { continue };
+            let Instruction::Cmp { op, lhs, rhs, .. } = cmp_inst else { continue };
+            let is_zero = |o: &Operand| matches!(o, Operand::Const(c) if c.to_i64() == Some(0));
+            // The element is the Add's non-accumulator operand or its def source.
+            let elem_vals: [u32; 2] = {
+                let mut vals = [u32::MAX; 2];
+                if let Instruction::BinOp { lhs, rhs, .. } = &body_block.instructions[accumulator_add_idx] {
+                    for (k, op) in [lhs, rhs].iter().enumerate() {
+                        if let Operand::Value(v) = op {
+                            if !accumulator_derived.contains(v) {
+                                vals[0] = v.0;
+                                // One step through a cast (the i32 load result).
+                                if let Some(Instruction::Cast { src: Operand::Value(sv), .. }) =
+                                    body_block.instructions.iter().find(|i| matches!(i.dest(), Some(d) if d.0 == v.0))
+                                {
+                                    vals[1] = sv.0;
+                                }
+                            }
+                        }
+                    }
+                }
+                vals
+            };
+            let is_elem = |o: &Operand| matches!(o, Operand::Value(v) if elem_vals.contains(&v.0));
+            use crate::ir::reexports::IrCmpOp as C;
+            let adds_when_nonneg = match (op, add_arm_is_true) {
+                (C::Sgt | C::Sge, true) if is_elem(lhs) && is_zero(rhs) => true,
+                (C::Slt | C::Sle, false) if is_elem(lhs) && is_zero(rhs) => true,
+                (C::Slt | C::Sle, true) if is_elem(rhs) && is_zero(lhs) => true,
+                (C::Sgt | C::Sge, false) if is_elem(rhs) && is_zero(lhs) => true,
+                _ => false,
+            };
+            if !adds_when_nonneg {
+                continue;
+            }
+            // Only the NEON i32→i64 widening transform implements the clamp.
+            let add_ty = match &body_block.instructions[accumulator_add_idx] {
+                Instruction::BinOp { ty, .. } => *ty,
+                _ => IrType::I32,
+            };
+            if !(neon && add_ty == IrType::I64) {
+                if debug {
+                    eprintln!("[VEC-RED]   Rejecting: conditional sum without NEON i32->i64 clamp support");
+                }
+                return None;
+            }
+            clamp_nonnegative = true;
+            break;
+        }
+    }
     let body = &func.blocks[body_idx];
     let add_inst = &body.instructions[accumulator_add_idx];
 
@@ -1025,7 +1131,7 @@ fn analyze_reduction_pattern(
         Instruction::Load { ptr, .. } => {
             let array_gep = *ptr;
             // Verify GEP uses IV
-            if !gep_uses_iv(func, &loop_info.body, array_gep, iv, &iv_derived) {
+            if !gep_uses_iv(func, &loop_info.body, array_gep, iv, &iv_derived, element_type.size()) {
                 if debug {
                     eprintln!("[VEC-RED]   Array GEP doesn't use IV");
                 }
@@ -1050,6 +1156,7 @@ fn analyze_reduction_pattern(
                 array_a_gep: array_gep,
                 array_b_gep: None,
                 accumulator_add_idx,
+                clamp_nonnegative: false,
                 limit,
                 exit_cmp_inst_idx,
                 exit_cmp_dest,
@@ -1081,7 +1188,7 @@ fn analyze_reduction_pattern(
 
                 let array_gep = *ptr;
                 // Verify GEP uses IV
-                if !gep_uses_iv(func, &loop_info.body, array_gep, iv, &iv_derived) {
+                if !gep_uses_iv(func, &loop_info.body, array_gep, iv, &iv_derived, from_ty.size()) {
                     if debug {
                         eprintln!("[VEC-RED]   Array GEP doesn't use IV");
                     }
@@ -1119,6 +1226,7 @@ fn analyze_reduction_pattern(
                     array_a_gep: array_gep,
                     array_b_gep: None,
                     accumulator_add_idx,
+                    clamp_nonnegative,
                     limit,
                     exit_cmp_inst_idx,
                     exit_cmp_dest,
@@ -1186,8 +1294,8 @@ fn analyze_reduction_pattern(
             };
 
             // Verify both GEPs use IV
-            if !gep_uses_iv(func, &loop_info.body, array_a_gep, iv, &iv_derived) ||
-               !gep_uses_iv(func, &loop_info.body, array_b_gep, iv, &iv_derived) {
+            if !gep_uses_iv(func, &loop_info.body, array_a_gep, iv, &iv_derived, element_type.size()) ||
+               !gep_uses_iv(func, &loop_info.body, array_b_gep, iv, &iv_derived, element_type.size()) {
                 if debug {
                     eprintln!("[VEC-RED]   Array GEPs don't use IV");
                 }
@@ -1212,6 +1320,7 @@ fn analyze_reduction_pattern(
                 array_a_gep,
                 array_b_gep: Some(array_b_gep),
                 accumulator_add_idx,
+                clamp_nonnegative: false,
                 limit,
                 exit_cmp_inst_idx,
                 exit_cmp_dest,
@@ -1399,8 +1508,8 @@ fn analyze_map_pattern(
     let (body_idx, store_idx, dst_gep, store_val) = store_info?;
 
     // Both GEPs must be indexed by the IV.
-    if !gep_uses_iv(func, &loop_info.body, src_gep, iv, &iv_derived)
-        || !gep_uses_iv(func, &loop_info.body, dst_gep, iv, &iv_derived)
+    if !gep_uses_iv(func, &loop_info.body, src_gep, iv, &iv_derived, 4)
+        || !gep_uses_iv(func, &loop_info.body, dst_gep, iv, &iv_derived, 4)
     {
         if debug { eprintln!("[VEC-MAP]   GEPs don't use IV"); }
         return None;
@@ -1530,6 +1639,7 @@ fn gep_uses_iv(
     gep: Value,
     iv: Value,
     iv_derived: &FxHashSet<Value>,
+    elem_size: usize,
 ) -> bool {
     // Find the GEP instruction in the loop
     for &block_idx in loop_blocks {
@@ -1545,6 +1655,30 @@ fn gep_uses_iv(
                         // Also check if offset is computed from IV (e.g., iv * 8)
                         // Trace back through multiply/add operations
                         return value_depends_on_iv(func, loop_blocks, *v, iv, iv_derived);
+                    }
+                }
+            }
+        }
+    }
+    // Marching-pointer form (post-IVSR): the load's pointer is itself a phi
+    // whose backedge steps it by a constant GEP offset. The step must advance
+    // exactly one element per iteration, or vector-width scaling would change
+    // the stride.
+    for &block_idx in loop_blocks {
+        for inst in &func.blocks[block_idx].instructions {
+            if let Instruction::Phi { dest, incoming, .. } = inst {
+                if *dest != gep {
+                    continue;
+                }
+                for (op, _) in incoming {
+                    if let Operand::Value(v) = op {
+                        let steps = func.blocks.iter().flat_map(|b| &b.instructions).any(|i| {
+                            matches!(i, Instruction::GetElementPtr { dest: d, base, offset: Operand::Const(c), .. }
+                                if *d == *v && base.0 == gep.0 && c.to_i64() == Some(elem_size as i64))
+                        });
+                        if steps {
+                            return true;
+                        }
                     }
                 }
             }
@@ -2973,7 +3107,24 @@ fn insert_reduction_remainder_loop(
                 }
             }
         }
-        let result = base.unwrap_or(pattern.array_a_gep);
+        let mut result = base.unwrap_or(pattern.array_a_gep);
+        // Marching-pointer form: the array "GEP" is the pointer phi itself;
+        // the true array base is its preheader (non-latch) incoming value.
+        let header = &func.blocks[pattern.header_idx];
+        let latch_label = func.blocks[pattern.latch_idx].label;
+        for inst in &header.instructions {
+            if let Instruction::Phi { dest, incoming, .. } = inst {
+                if *dest == result {
+                    for (op, lbl) in incoming {
+                        if *lbl != latch_label {
+                            if let Operand::Value(v) = op {
+                                result = *v;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if std::env::var("LCCC_DEBUG_VECTORIZE").is_ok() {
             eprintln!("[VEC-RED] array_a_base = Value({}), array_a_gep = Value({})",
                 result.0, pattern.array_a_gep.0);
@@ -3212,14 +3363,47 @@ fn insert_reduction_remainder_loop(
     // Add pattern-specific operations
     match pattern.kind {
         ReductionKind::Sum => {
-            // Simple sum: sum += array_a[i]
-            remainder_body_instructions.push(Instruction::BinOp {
-                dest: sum_rem_next,
-                op: IrBinOp::Add,
-                lhs: Operand::Value(sum_rem_phi),
-                rhs: Operand::Value(scalar_a),
-                ty: pattern.accumulator_type,
-            });
+            if pattern.clamp_nonnegative {
+                // Conditional sum: acc += max(x, 0) as a scalar Select.
+                let cmp_rem = Value(*next_val_id);
+                *next_val_id += 1;
+                let sum_with_x = Value(*next_val_id);
+                *next_val_id += 1;
+                let zero_const = match pattern.accumulator_type {
+                    IrType::I64 => IrConst::I64(0),
+                    _ => IrConst::I32(0),
+                };
+                remainder_body_instructions.push(Instruction::Cmp {
+                    dest: cmp_rem,
+                    op: IrCmpOp::Sgt,
+                    lhs: Operand::Value(scalar_a),
+                    rhs: Operand::Const(zero_const),
+                    ty: pattern.accumulator_type,
+                });
+                remainder_body_instructions.push(Instruction::BinOp {
+                    dest: sum_with_x,
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(sum_rem_phi),
+                    rhs: Operand::Value(scalar_a),
+                    ty: pattern.accumulator_type,
+                });
+                remainder_body_instructions.push(Instruction::Select {
+                    dest: sum_rem_next,
+                    cond: Operand::Value(cmp_rem),
+                    true_val: Operand::Value(sum_with_x),
+                    false_val: Operand::Value(sum_rem_phi),
+                    ty: pattern.accumulator_type,
+                });
+            } else {
+                // Simple sum: sum += array_a[i]
+                remainder_body_instructions.push(Instruction::BinOp {
+                    dest: sum_rem_next,
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(sum_rem_phi),
+                    rhs: Operand::Value(scalar_a),
+                    ty: pattern.accumulator_type,
+                });
+            }
         }
         ReductionKind::DotProduct => {
             // Dot product: sum += a[i] * b[i]
@@ -4133,6 +4317,27 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern, n
         }
     }
 
+    // Marching-pointer form (post-IVSR): the array "GEP" is a phi stepped by a
+    // constant per iteration. Scale every constant step of that phi by the
+    // vector width (one element per iter -> vec_width elements per iter).
+    for &block_idx in &pattern.loop_blocks {
+        for inst in func.blocks[block_idx].instructions.iter_mut() {
+            if let Instruction::GetElementPtr { base, offset: Operand::Const(c), .. } = inst {
+                let is_array_step = base.0 == pattern.array_a_gep.0
+                    || pattern.array_b_gep.is_some_and(|g| base.0 == g.0);
+                if is_array_step {
+                    if let Some(k) = c.to_i64() {
+                        *c = match c {
+                            IrConst::I32(_) => IrConst::I32(k as i32 * vec_width as i32),
+                            _ => IrConst::I64(k * vec_width as i64),
+                        };
+                        changes += 1;
+                    }
+                }
+            }
+        }
+    }
+
     // Step 3: Transform loop body - replace scalar operations with vector intrinsics
     // Use register-based SSA values for vector operations (no stack allocations)
     let vec_sum_value: Value;
@@ -4222,23 +4427,79 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern, n
             };
 
             // Create vector add (accumulate) - reads from PHI, produces new value
+            let (clamp_inst, add_operand) = if pattern.clamp_nonnegative {
+                let vec_clamped = Value(next_val_id);
+                next_val_id += 1;
+                (
+                    Some(Instruction::Intrinsic {
+                        dest: Some(vec_clamped),
+                        op: IntrinsicOp::VecSmaxZeroI32x4,
+                        dest_ptr: None,
+                        args: vec![Operand::Value(vec_load)],
+                    }),
+                    vec_clamped,
+                )
+            } else {
+                (None, vec_load)
+            };
             let add_inst = Instruction::Intrinsic {
                 dest: Some(vec_sum_value),
                 op: vec_add_op,
                 dest_ptr: None,
                 args: vec![
                     Operand::Value(pattern.accumulator_phi),
-                    Operand::Value(vec_load),
+                    Operand::Value(add_operand),
                 ],
             };
 
             // Insert instructions and remove old scalar add
             {
                 let body_block = &mut func.blocks[pattern.body_idx];
+                // Conditional-sum form: the Select and its cmp must also be
+                // removed — they would dangle once the Add is gone. Capture by
+                // VALUE now; remove AFTER the insert/remove below, since the
+                // cmp may sit before the Add (position shifts would otherwise
+                // delete the wrong instruction).
+                let mut add_dest = None;
+                let mut sel_cmp_val = None;
+                if pattern.clamp_nonnegative {
+                    add_dest = match &body_block.instructions[pattern.accumulator_add_idx] {
+                        Instruction::BinOp { dest, .. } => Some(*dest),
+                        _ => None,
+                    };
+                    for inst in body_block.instructions.iter() {
+                        if let Instruction::Select { cond, true_val, false_val, .. } = inst {
+                            let uses_add = [true_val, false_val].iter()
+                                .any(|o| matches!(o, Operand::Value(v) if Some(v.0) == add_dest.map(|d| d.0)));
+                            if uses_add {
+                                if let Operand::Value(cv) = cond {
+                                    sel_cmp_val = Some(*cv);
+                                }
+                            }
+                        }
+                    }
+                }
                 body_block.instructions.insert(pattern.accumulator_add_idx, load_inst);
-                body_block.instructions.insert(pattern.accumulator_add_idx + 1, add_inst);
-                body_block.instructions.remove(pattern.accumulator_add_idx + 2);
+                let n_before_add = if clamp_inst.is_some() { 2 } else { 1 };
+                if let Some(ci) = clamp_inst {
+                    body_block.instructions.insert(pattern.accumulator_add_idx + 1, ci);
+                }
+                body_block.instructions.insert(pattern.accumulator_add_idx + n_before_add, add_inst);
+                body_block.instructions.remove(pattern.accumulator_add_idx + n_before_add + 1);
                 changes += 2;
+                if let Some(add_dest) = add_dest {
+                    if let Some(sp) = body_block.instructions.iter().position(|i| matches!(i,
+                        Instruction::Select { true_val, false_val, .. }
+                            if [true_val, false_val].iter().any(|o| matches!(o, Operand::Value(v) if v.0 == add_dest.0))))
+                    {
+                        body_block.instructions.remove(sp);
+                    }
+                    if let Some(cv) = sel_cmp_val {
+                        if let Some(cp) = body_block.instructions.iter().position(|i| matches!(i.dest(), Some(d) if d.0 == cv.0)) {
+                            body_block.instructions.remove(cp);
+                        }
+                    }
+                }
 
                 // Debug: Log vector accumulator flow
                 if debug {
@@ -5026,4 +5287,11 @@ pub(crate) fn vectorize_function(func: &mut IrFunction) -> usize {
 pub(crate) fn vectorize_function_two_wide(func: &mut IrFunction) -> usize {
     let cfg = CfgAnalysis::build(func);
     vectorize_with_analysis_mode(func, &cfg, true, true)
+}
+
+/// Late AArch64 pass: only conditional-sum reductions (Select-clamped
+/// accumulator loops, a shape that exists only after if-conversion).
+pub(crate) fn vectorize_function_two_wide_late(func: &mut IrFunction) -> usize {
+    let cfg = CfgAnalysis::build(func);
+    vectorize_mode_impl(func, &cfg, true, true, true)
 }

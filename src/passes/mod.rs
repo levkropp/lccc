@@ -693,6 +693,28 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
         std::mem::swap(&mut dirty, &mut changed);
     }
 
+    // Late vectorization: conditional-reduction loops (sum_positive etc.) are
+    // Select-shaped only after the main loop's if_convert phase, so the early
+    // vectorizer never sees them. A second AArch64 pass here catches them.
+    // CCC_DISABLE_PASSES=latevec disables.
+    if matches!(target, crate::backend::Target::Aarch64) && !disabled.contains("latevec") {
+        let n = module.for_each_function(vectorize::vectorize_function_two_wide_late);
+        if n > 0 {
+            // The vectorizer's block surgery does not maintain source_spans;
+            // drop any that no longer align with their block's instructions.
+            for func in &mut module.functions {
+                for block in &mut func.blocks {
+                    if !block.source_spans.is_empty()
+                        && block.source_spans.len() != block.instructions.len()
+                    {
+                        block.source_spans.clear();
+                    }
+                }
+            }
+            module.for_each_function(dce::eliminate_dead_code);
+        }
+    }
+
     // DCE can remove aggregate-copy consumers that previously made forwarding
     // unsafe (for example a full returned struct whose only surviving use is
     // one field load). Re-run forwarding before final loop promotion.

@@ -463,6 +463,22 @@ impl ArmCodegen {
                 }
             }
 
+            // NEON smax against zero: clamp each 4×I32 lane to >= 0.
+            IntrinsicOp::VecSmaxZeroI32x4 => {
+                if let Some(d) = dest {
+                    let src = self.load_vector_value_128(&args[0], "q0");
+                    // v1 is scratch here (q0/q1 are the load_vector scratch regs).
+                    self.state.emit("    eor v1.16b, v1.16b, v1.16b");
+                    if let Some(name) = self.assigned_vector_reg(d.0) {
+                        self.state.vector_values.insert(d.0);
+                        self.state.emit_fmt(format_args!("    smax {}.4s, {}.4s, v1.4s", name, src));
+                    } else {
+                        self.state.emit_fmt(format_args!("    smax v0.4s, {}.4s, v1.4s", src));
+                        self.store_vector_value_128(d, "q0");
+                    }
+                }
+            }
+
             // NEON smlal/smlal2: accumulate sign-extended products of the low
             // (2s) or high (4s) halves of two 4×I32 vectors into a 2×I64 acc.
             IntrinsicOp::VecSmlalLoI32x4 | IntrinsicOp::VecSmlalHiI32x4 => {

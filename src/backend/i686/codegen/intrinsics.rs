@@ -447,7 +447,8 @@ impl I686Codegen {
             IntrinsicOp::VecMulI32x4 | IntrinsicOp::VecBroadcastI32x4 |
             IntrinsicOp::VecStoreI32x4 |
             IntrinsicOp::VecSadalpI32x4 |
-            IntrinsicOp::VecSmlalLoI32x4 | IntrinsicOp::VecSmlalHiI32x4 => {
+            IntrinsicOp::VecSmlalLoI32x4 | IntrinsicOp::VecSmlalHiI32x4 |
+            IntrinsicOp::VecSmaxZeroI32x4 => {
                 // These are x86-64/AArch64-specific register-based vector operations
                 unimplemented!("Register-based vector intrinsics not implemented for i686");
             }

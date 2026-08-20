@@ -218,6 +218,9 @@ pub enum IntrinsicOp {
     VecSmlalLoI32x4,
     /// NEON smlal2 (high half): same as VecSmlalLoI32x4 but for lanes 2-3.
     VecSmlalHiI32x4,
+    /// NEON smax against zero: dest = max(args[0], 0) per lane (4×I32).
+    /// Used to clamp conditional-sum addends: sum(x>0 ? x : 0) == sum(max(x,0)).
+    VecSmaxZeroI32x4,
 
     /// Horizontal reduction: %scalar = horizontal_add(%vec) - AVX2 4×F64 → F64
     /// args[0] = source vector value; dest = scalar F64 result
@@ -427,6 +430,7 @@ impl IntrinsicOp {
             | IntrinsicOp::VecMulI32x4 | IntrinsicOp::VecBroadcastI32x4
             | IntrinsicOp::VecSadalpI32x4
             | IntrinsicOp::VecSmlalLoI32x4 | IntrinsicOp::VecSmlalHiI32x4
+            | IntrinsicOp::VecSmaxZeroI32x4
         )
     }
 }
