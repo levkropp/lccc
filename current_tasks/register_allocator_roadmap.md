@@ -1,6 +1,6 @@
 # AArch64 codegen quality: findings + register-allocator roadmap
 
-Session outcome: geomean vs GCC -O2 improved 0.61x -> 0.580x with 11 verified
+Session outcome: geomean vs GCC -O2 improved 0.61x -> ~0.56x with 15 verified
 wins (all 18/18 byte-identical, suites green). The remaining gap to GCC is
 architectural, not pass-level. This doc records the evidence and the plan.
 
@@ -17,6 +17,17 @@ architectural, not pass-level. This doc records the evidence and the plan.
   instead of never being allocated (restricted-pool support in the scan).
 - GlobalAddr CSE (substitution-based pass): one SSA value per symbol per
   dominance scope instead of one per access (fannkuch -3-5%).
+- fmsub/fnmsub fusion of float Mul;Sub, gated off loop-carried accumulators
+  (fusing acc-=a*b lengthens the serial chain: ungated nbody +13%).
+- Aggregate memcpy-temp forwarding hoist: alloca/global terminals end the
+  def chain instead of rejecting it (struct_copy temps forward into place).
+- Full unroll of small constant-trip loops enabled by default (trip<=16,
+  <=512 expanded insts) — a win now that the forwarding chain works
+  (struct_copy 1.80x -> 1.31x).
+- FP spill-slot store->load forwarding peephole (str dS,[slot] / ldr dD,[slot]
+  -> fmov), tracking sp-derived base registers (struct_copy -2.7%).
+- Dead-store elimination escape analysis: sp-derived bases that only feed
+  address uses no longer bail the pass; dead FP/base-form stores removed.
 
 ## Reverted / documented dead-ends (measured, do not retry)
 

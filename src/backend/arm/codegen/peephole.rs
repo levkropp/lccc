@@ -1667,40 +1667,182 @@ use crate::backend::peephole_common::{replace_source_reg_in_instruction, replace
 // to register moves, leaving the original stores dead.
 
 fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
-    // Safety check: if any instruction takes the address of sp (e.g., `add xN, sp, #off`),
-    // stack slots could be accessed through pointers, so we must not eliminate any stores.
-    // This is conservative but sound — it prevents miscompilation when arrays or structs
-    // are allocated on the stack and passed by pointer to callees.
+    // Safety: stack slots can be accessed through sp-derived pointer registers
+    // (`add xN, sp, #off` etc.). Instead of bailing on any address-of-sp, track
+    // the derived bases: as long as every use of a base is an address use
+    // (`[xN]`, `[xN, #k]`), a copy/adjustment of another base, or a clobber
+    // that ends its lineage, no frame address ever leaves the function's
+    // visible text, so all slot loads are accounted for below. Any other use
+    // (stored as a value, call argument, comparison, inline asm, ...) is an
+    // escape and we bail.
+    //
+    // Base offsets are tracked in sp terms: `add xN, sp, #k` gives xN offset k,
+    // `mov xM, xN` copies it, `add/sub xN, xN, #k` adjusts it, and a write of
+    // any other kind ends the mapping. Calls clobber caller-saved bases and
+    // are escapes when a base sits in an argument register.
+
+    // Collect candidate bases and check for escapes.
+    let mut base_off: FxHashMap<u8, i32> = FxHashMap::default();
+    let mut escaped = false;
     for i in 0..n {
-        if kinds[i] == LineKind::Nop {
+        if escaped {
+            break;
+        }
+        let t = lines[i].trim();
+        if kinds[i] == LineKind::Nop || t.is_empty() {
             continue;
         }
-        let trimmed = lines[i].trim();
-        // Check for address-of-sp patterns:
-        // - `add xN, sp, #offset` (common for array/struct address)
-        // - `mov xN, sp` (copying stack pointer)
-        // - `sub xN, sp, #N` (stack address computation)
-        if (trimmed.starts_with("add ") || trimmed.starts_with("sub ")) && trimmed.contains(", sp,") {
-            return false;
+        if kinds[i] == LineKind::Label || kinds[i] == LineKind::Directive {
+            continue;
         }
-        if trimmed.starts_with("mov ") && trimmed.contains(", sp") {
-            // Check it's actually "mov xN, sp" not "mov sp, xN"
-            if let Some(rest) = trimmed.strip_prefix("mov ") {
-                if let Some((_, src)) = rest.split_once(", ") {
-                    if src.trim() == "sp" {
-                        return false;
+        if kinds[i] == LineKind::Call {
+            // A base in an argument register at a call site escapes.
+            for b in 0..=8u8 {
+                if base_off.contains_key(&b) {
+                    escaped = true;
+                    break;
+                }
+            }
+            // Calls clobber caller-saved registers: end those lineages.
+            base_off.retain(|&r, _| r >= 19);
+            continue;
+        }
+
+        // Base creation from sp (`add xN, sp, #k` / `sub xN, sp, #k` /
+        // `mov xN, sp`): these lines mention no existing base, so handle
+        // them before the mention scan.
+        let mut created = false;
+        if let Some(rest) = t.strip_prefix("add ").or_else(|| t.strip_prefix("sub ")) {
+            let neg = t.starts_with("sub ");
+            if let Some((dst_s, srcs)) = rest.split_once(", ") {
+                if let Some((src_s, imm_s)) = srcs.split_once(", ") {
+                    if src_s.trim() == "sp" {
+                        if let Some(imm) = imm_s.trim().strip_prefix('#').and_then(|v| v.parse::<i32>().ok()) {
+                            let dst = parse_reg(dst_s.trim());
+                            if dst < 29 {
+                                base_off.insert(dst, if neg { -imm } else { imm });
+                            }
+                            created = true;
+                        }
                     }
                 }
             }
+        } else if let Some(rest) = t.strip_prefix("mov ") {
+            if let Some((dst_s, src_s)) = rest.split_once(", ") {
+                if src_s.trim() == "sp" {
+                    let dst = parse_reg(dst_s.trim());
+                    if dst < 29 {
+                        base_off.insert(dst, 0);
+                    }
+                    created = true;
+                }
+            }
+        }
+        if created {
+            continue;
+        }
+
+        // Mentions of currently tracked bases in this line (x or w form).
+        let mut mentioned = Vec::new();
+        for &b in base_off.keys() {
+            let xn = xreg_name(b);
+            let wn = wreg_name(b);
+            if t.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .any(|tok| tok == xn || tok == wn)
+            {
+                mentioned.push(b);
+            }
+        }
+        for b in mentioned {
+            let xn = xreg_name(b);
+            // Address use as `[xN]` / `[xN, #k]`: allowed. Writeback forms
+            // (`!` or `], #`) rewrite the register — end the lineage.
+            let addr_form = format!("[{}", xn);
+            if t.contains(&addr_form) {
+                if t.contains("!") || t.contains("],") {
+                    base_off.remove(&b);
+                }
+                continue;
+            }
+            // Base-creating or base-preserving forms.
+            if let Some(rest) = t.strip_prefix("mov ") {
+                if let Some((dst_s, src_s)) = rest.split_once(", ") {
+                    let (dst_s, src_s) = (dst_s.trim(), src_s.trim());
+                    if dst_s == xn {
+                        // mov xN, xM: re-based if xM is a base, clobbered otherwise.
+                        let src = parse_reg(src_s);
+                        match base_off.get(&src).copied() {
+                            Some(off) => base_off.insert(b, off),
+                            None => base_off.remove(&b),
+                        };
+                    } else if src_s == xn {
+                        // mov xM, xN: xM joins the lineage.
+                        let dst = parse_reg(dst_s);
+                        if dst < 29 {
+                            let off = base_off[&b];
+                            base_off.insert(dst, off);
+                        }
+                    }
+                    continue;
+                }
+            }
+            if let Some(rest) = t.strip_prefix("add ").or_else(|| t.strip_prefix("sub ")) {
+                let neg = t.starts_with("sub ");
+                if let Some((dst_s, srcs)) = rest.split_once(", ") {
+                    if let Some((src_s, imm_s)) = srcs.split_once(", ") {
+                        if let Some(imm) = imm_s.trim().strip_prefix('#').and_then(|v| v.parse::<i32>().ok()) {
+                            let dst = parse_reg(dst_s.trim());
+                            let src = parse_reg(src_s.trim());
+                            let signed = if neg { -imm } else { imm };
+                            if dst == b && src == b {
+                                base_off.insert(b, base_off[&b] + signed);
+                                continue;
+                            }
+                            if let Some(&off) = base_off.get(&src) {
+                                if dst < 29 {
+                                    base_off.insert(dst, off + signed);
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            // A write of the base by a load or ALU op ends the lineage (allowed).
+            if gp_reg_written_broad(&lines[i], b) {
+                base_off.remove(&b);
+                continue;
+            }
+            // Anything else is a genuine use of the pointer value: escape.
+            escaped = true;
+            break;
         }
     }
+    if escaped {
+        return false;
+    }
 
-    // Phase 1: Collect all (offset, size) byte ranges that are loaded from.
-    // We must use byte-range overlap (not exact offset match) because a wide
-    // store (e.g. `str x` at offset 16, 8 bytes) can be partially read by a
-    // narrower load at a different offset (e.g. `ldr w` at offset 20, 4 bytes).
+    // Phase 1: collect all loaded byte ranges, resolving base-relative forms.
     let mut loaded_ranges: Vec<(i32, i32)> = Vec::new(); // (offset, size)
+    let mut base_off: FxHashMap<u8, i32> = FxHashMap::default();
+
     for i in 0..n {
+        track_sp_bases(&lines[i], kinds[i], &mut base_off);
+        // FP loads/stores and base forms.
+        if let Some((is_store, _reg, addr, width)) = parse_fp_mem(&lines[i]) {
+            if !is_store {
+                let off = match addr {
+                    FpAddr::Sp(off) => Some(off),
+                    FpAddr::Base(b, k) => base_off.get(&b).map(|&o| o + k),
+                };
+                if let Some(off) = off {
+                    loaded_ranges.push((off, fp_access_width(width)));
+                } else {
+                    // Unknown-base load: may read anything (frame addresses did
+                    // not escape, so it cannot read our frame — no action).
+                }
+            }
+        }
         match kinds[i] {
             LineKind::LoadSp { offset, is_word, .. } => {
                 let size = if is_word { 4 } else { 8 };
@@ -1733,17 +1875,46 @@ fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: us
                         if let Some(off) = extract_sp_offset(trimmed) {
                             loaded_ranges.push((off, sz));
                         }
+                    } else if trimmed.starts_with("ldr ") || trimmed.starts_with("ldp ") || trimmed.starts_with("ldur ") {
+                        // Load through a tracked base register.
+                        if let Some(bracket) = trimmed.find("[x") {
+                            let inner = &trimmed[bracket..];
+                            if let Some((b, k)) = parse_base_addr(inner) {
+                                if let Some(&o) = base_off.get(&b) {
+                                    loaded_ranges.push((o + k, sz));
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
     }
 
-    // Phase 2: Remove stores whose byte range does not overlap any load range
+    // Phase 2: remove stores whose byte range does not overlap any load range.
+    // Covers GP sp stores and FP sp/base-form stores alike.
     let mut changed = false;
+    let mut base_off: FxHashMap<u8, i32> = FxHashMap::default();
     for i in 0..n {
-        if let LineKind::StoreSp { offset, is_word, .. } = kinds[i] {
-            let store_size = if is_word { 4 } else { 8 };
+        track_sp_bases(&lines[i], kinds[i], &mut base_off);
+        let range: Option<(i32, i32)> = match kinds[i] {
+            LineKind::StoreSp { offset, is_word, .. } => {
+                Some((offset, if is_word { 4 } else { 8 }))
+            }
+            _ => {
+                match parse_fp_mem(&lines[i]) {
+                    Some((true, _reg, addr, width)) => {
+                        let off = match addr {
+                            FpAddr::Sp(off) => Some(off),
+                            FpAddr::Base(b, k) => base_off.get(&b).map(|&o| o + k),
+                        };
+                        off.map(|o| (o, fp_access_width(width)))
+                    }
+                    _ => None,
+                }
+            }
+        };
+        if let Some((offset, store_size)) = range {
             let overlaps_any_load = loaded_ranges.iter().any(|&(load_off, load_sz)| {
                 // Two ranges [a, a+as) and [b, b+bs) overlap iff a < b+bs && b < a+as
                 offset < load_off + load_sz && load_off < offset + store_size
@@ -1756,6 +1927,83 @@ fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: us
     }
     changed
 }
+
+/// Parse `[xN]`, `[xN, #k]` (no writeback) into (base register, offset).
+fn parse_base_addr(inner_bracketed: &str) -> Option<(u8, i32)> {
+    let inner = inner_bracketed.strip_prefix('[')?;
+    let inner = inner.split_once(']').map(|(h, _)| h).unwrap_or(inner);
+    let (base, off) = match inner.split_once(", ") {
+        Some((b, o)) => (b.trim(), o.trim().strip_prefix('#')?.parse::<i32>().ok()?),
+        None => (inner.trim(), 0),
+    };
+    let b = parse_reg(base);
+    (b < 29).then_some((b, off))
+}
+
+/// Maintain the sp-derived base-register map for one line of text:
+/// `add/sub xN, sp, #k` creates, `mov` copies or ends a lineage, `add/sub`
+/// on a base adjusts or derives, calls end caller-saved lineages, and any
+/// other write of a tracked register ends its lineage.
+fn track_sp_bases(line: &str, kind: LineKind, base_off: &mut FxHashMap<u8, i32>) {
+    let t = line.trim();
+    if let Some(rest) = t.strip_prefix("add ").or_else(|| t.strip_prefix("sub ")) {
+        let neg = t.starts_with("sub ");
+        if let Some((dst_s, srcs)) = rest.split_once(", ") {
+            if let Some((src_s, imm_s)) = srcs.split_once(", ") {
+                let dst = parse_reg(dst_s.trim());
+                let src = parse_reg(src_s.trim());
+                let imm = imm_s.trim().strip_prefix('#').and_then(|v| v.parse::<i32>().ok());
+                if let Some(imm) = imm {
+                    let signed = if neg { -imm } else { imm };
+                    if src_s.trim() == "sp" && dst < 29 {
+                        base_off.insert(dst, signed);
+                        return;
+                    }
+                    if let Some(&off) = base_off.get(&src) {
+                        if dst < 29 {
+                            base_off.insert(dst, off + signed);
+                        }
+                    }
+                }
+            }
+        }
+    } else if let Some(rest) = t.strip_prefix("mov ") {
+        if let Some((dst_s, src_s)) = rest.split_once(", ") {
+            let (dst_s, src_s) = (dst_s.trim(), src_s.trim());
+            let dst = parse_reg(dst_s);
+            if src_s == "sp" {
+                if dst < 29 {
+                    base_off.insert(dst, 0);
+                }
+                return;
+            }
+            let src = parse_reg(src_s);
+            if let Some(&off) = base_off.get(&src) {
+                if dst < 29 {
+                    base_off.insert(dst, off);
+                }
+            } else if dst < 29 {
+                // mov xN, <non-base>: clobbered, lineage ends.
+                base_off.remove(&dst);
+            }
+        }
+    }
+    // Calls clobber caller-saved registers: end those lineages.
+    if kind == LineKind::Call {
+        base_off.retain(|&r, _| r >= 19);
+        return;
+    }
+    let mut dead = Vec::new();
+    for &b in base_off.keys() {
+        if gp_reg_written_broad(line, b) || written_gp_register(line, kind) == Some(b) {
+            dead.push(b);
+        }
+    }
+    for b in dead {
+        base_off.remove(&b);
+    }
+}
+
 
 /// Extract the numeric offset from an instruction containing `[sp, #N]` or `[sp]`.
 fn extract_sp_offset(line: &str) -> Option<i32> {
@@ -2228,14 +2476,68 @@ mod tests {
 
     #[test]
     fn test_dse_with_address_taken() {
-        // When sp address is taken, no stores should be eliminated
+        // An sp-derived address that is only materialized but never used does
+        // NOT escape — the store is still dead and may be eliminated.
         let input = "\
     str w0, [sp, #16]\n\
     add x1, sp, #16\n\
     ret\n";
         let result = peephole_optimize(input.to_string());
-        // Store must be preserved because address of stack slot is taken
-        assert!(result.contains("str w0, [sp, #16]"));
+        assert!(!result.contains("str w0, [sp, #16]"),
+            "non-escaping address-of-sp allows elimination:\n{}", result);
+    }
+
+    #[test]
+    fn test_dse_with_escaping_address() {
+        // The derived base is stored into memory here: the address escapes,
+        // so no store elimination may happen at all.
+        let input = "\
+    str w0, [sp, #16]\n\
+    add x1, sp, #16\n\
+    str x1, [x9]\n\
+    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("str w0, [sp, #16]"),
+            "escaping address must preserve stores:\n{}", result);
+    }
+
+    #[test]
+    fn test_dse_dead_fp_store_via_base() {
+        // FP field store through an sp-derived base whose slot is never
+        // loaded: dead, eliminated.
+        let input = "\
+f:
+    add x23, sp, #112
+    fmul d28, d27, d17
+    str d28, [x23]
+    fadd d0, d1, d1
+    ret
+g:
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.contains("str d28, [x23]"),
+            "dead FP store via base eliminated:\n{}", result);
+    }
+
+    #[test]
+    fn test_dse_live_fp_store_via_base_kept() {
+        // The slot-forward pass converts the load to an fmov first, which
+        // makes the store dead — the whole round-trip dissolves.
+        let input = "\
+f:
+    add x23, sp, #112
+    fmul d28, d27, d17
+    str d28, [x23]
+    ldr d0, [sp, #112]
+    fadd d0, d0, d0
+    ret
+g:
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("fmov d0, d28"), "load forwarded:\n{}", result);
+        assert!(!result.contains("str d28"), "store then dead:\n{}", result);
     }
 
     // ── Address-alias soundness ────────────────────────────────────────
