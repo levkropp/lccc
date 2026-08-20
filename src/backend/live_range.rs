@@ -11,7 +11,7 @@
 
 use super::liveness::{LiveInterval, for_each_operand_in_instruction, for_each_operand_in_terminator};
 use super::regalloc::PhysReg;
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::reexports::{Instruction, IrFunction, Operand, Terminator, Value};
 
 /// Enhanced live interval with priority, uses, and spill weight.
@@ -136,6 +136,15 @@ pub struct LinearScanAllocator {
     // Rotation index for register selection: start searching from this index
     // instead of 0 to distribute consecutive allocations across different registers.
     pub next_reg_idx: usize,
+
+    /// Values that may only be allocated from `restricted_regs` instead of the
+    /// full `available_regs` pool. Used on AArch64 to confine call-spanning
+    /// F64 values to the callee-saved FP registers (d8-d14), which survive
+    /// calls; empty for all other scans (no behavior change).
+    pub restricted_values: FxHashSet<u32>,
+
+    /// Register subset used for values in `restricted_values`.
+    pub restricted_regs: Vec<PhysReg>,
 }
 
 impl LinearScanAllocator {
@@ -152,6 +161,8 @@ impl LinearScanAllocator {
             next_spill_slot: 0,
             enable_splitting: false,
             next_reg_idx: 0,
+            restricted_values: FxHashSet::default(),
+            restricted_regs: Vec::new(),
         }
     }
 
@@ -210,9 +221,18 @@ impl LinearScanAllocator {
     /// 2. Find a register that's free for the entire duration of the range
     /// 3. If none, return None (caller will spill)
     pub fn find_free_register(&mut self, range: &LiveRange) -> Option<PhysReg> {
+        // Values in the restricted set (e.g. call-spanning F64 values that may
+        // only use callee-saved FP registers) draw from the restricted subset.
+        let pool: &[PhysReg] = if self.restricted_values.contains(&range.value_id) {
+            &self.restricted_regs
+        } else {
+            &self.available_regs
+        };
+
         // Try register hint first (for coalescing with Copy sources)
         if let Some(hint) = range.reg_hint {
-            if self.is_register_free(hint, range.start)
+            if pool.contains(&hint)
+                && self.is_register_free(hint, range.start)
                 && self.active.iter().all(|a| !a.range.overlaps_with(range))
             {
                 return Some(hint);
@@ -221,12 +241,12 @@ impl LinearScanAllocator {
 
         // Find any free register, rotating the start index to distribute
         // consecutive allocations across different registers for ILP.
-        let n = self.available_regs.len();
+        let n = pool.len();
         if n == 0 { return None; }
         let start = self.next_reg_idx % n;
         for offset in 0..n {
             let idx = (start + offset) % n;
-            let reg = self.available_regs[idx];
+            let reg = pool[idx];
             // Check if this register is free at the start of the range
             if self.is_register_free(reg, range.start) {
                 // Also check that no active interval uses this register

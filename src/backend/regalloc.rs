@@ -628,6 +628,21 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     } else {
         (FxHashSet::default(), FxHashSet::default())
     };
+    // The callee-saved FP subset (allocator IDs 32..=38 → d8-d14) present in
+    // the pool. Call-spanning F64 values may only draw from these; empty when
+    // CCC_NO_FP_CALLEE_SAVED removed them, which also keeps the strict
+    // call-span filter below (a call-spanning value in a caller-saved FP
+    // register would be clobbered by the spanned call).
+    let arm_callee_fp: Vec<PhysReg> = if arm_fp_pool {
+        config
+            .xmm_regs
+            .iter()
+            .copied()
+            .filter(|r| (32..=38).contains(&r.0))
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     // Phase 3: XMM register allocation for F64 values that don't span calls.
     // These values were excluded from GPR allocation but can use XMM registers.
@@ -682,7 +697,22 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             .filter(|iv| non_gpr_values.contains(&iv.value_id))
             .filter(|iv| iv.end > iv.start)
             .filter(|iv| !assignments.contains_key(&iv.value_id))
-            .filter(|iv| !spans_any_call(iv, call_points))
+            // AArch64: call-spanning F64 scalars stay eligible, but are
+            // restricted below to the callee-saved FP registers (d8-d14),
+            // which survive calls by the ABI. 128-bit vectors keep the
+            // strict filter: only the low 64 bits of v8-v15 are callee-saved.
+            // Other targets keep the strict filter (their XMM pools are
+            // entirely caller-saved). CCC_NO_FP_CALLSPAN restores the old
+            // behavior for A/B.
+            .filter(|iv| {
+                if !spans_any_call(iv, call_points) {
+                    return true;
+                }
+                !arm_callee_fp.is_empty()
+                    && std::env::var("CCC_NO_FP_CALLSPAN").is_err()
+                    && f64_value_set.contains(&iv.value_id)
+                    && !vector_values.contains(&iv.value_id)
+            })
             // Skip values that are only ever copied (never feed a computation):
             // they don't need a register and would starve values that do.
             .filter(|iv| !arm_fp_pool || real_use.contains(&iv.value_id))
@@ -742,6 +772,17 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             );
             let mut xmm_allocator =
                 LinearScanAllocator::new(f64_ranges, config.xmm_regs.clone());
+            // Confine call-spanning F64 values to the callee-saved FP subset
+            // (allocator IDs 32..=38 → d8-d14) present in the pool; the
+            // caller-saved d16-d31 would be clobbered by the spanned call.
+            if !arm_callee_fp.is_empty() {
+                xmm_allocator.restricted_values = f64_intervals
+                    .iter()
+                    .filter(|iv| spans_any_call(iv, call_points))
+                    .map(|iv| iv.value_id)
+                    .collect();
+                xmm_allocator.restricted_regs = arm_callee_fp.clone();
+            }
             xmm_allocator.run();
 
             for (vid, reg) in &xmm_allocator.assignments {
