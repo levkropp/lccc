@@ -436,6 +436,7 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
         changed |= propagate_address_aliases(&mut lines, &mut kinds, n);
         changed |= forward_fp_slot_loads(&mut lines, &mut kinds, n);
+        changed |= fuse_fp_adjacent_pairs(&mut lines, &mut kinds, n);
         changed |= fold_destructive_pointer_updates(&mut lines, &mut kinds, n);
         changed |= fuse_branch_over_branch(&mut lines, &mut kinds, n);
         if rotate {
@@ -473,6 +474,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
             changed2 |= propagate_address_aliases(&mut lines, &mut kinds, n);
             changed2 |= forward_fp_slot_loads(&mut lines, &mut kinds, n);
+            changed2 |= fuse_fp_adjacent_pairs(&mut lines, &mut kinds, n);
             changed2 |= fold_destructive_pointer_updates(&mut lines, &mut kinds, n);
             rounds2 += 1;
         }
@@ -954,6 +956,128 @@ fn gp_reg_written_broad(line: &str, num: u8) -> bool {
             let op = op.trim();
             op == xreg_name(num) || op == wreg_name(num)
         })
+}
+
+// ── Adjacent FP field pair fusion (ldp/stp) ─────────────────────────────────
+//
+// `ldr dA, [xB]` + `ldr dC, [xB, #8]` (within a small window) → `ldp dA, dC,
+// [xB]`, and likewise `str` pairs → `stp`. Struct-of-double loops (nbody,
+// spectral_norm, struct_copy) load/store adjacent fields in pairs; fusing
+// halves the memory-op issue slots. Bit-identical: ldp/stp move the same
+// bytes as the two scalar accesses. CCC_NO_FP_PAIR disables.
+//
+// Soundness: the second access moves up to the first's position, so nothing
+// in the gap may write memory (for loads), touch memory at all (for stores),
+// or mention either destination register or the base.
+fn fuse_fp_adjacent_pairs(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_FP_PAIR").is_ok() {
+        return false;
+    }
+    let mention = |line: &str, reg: u8, is_fp: bool| {
+        let (a, b) = if is_fp {
+            (format!("d{}", reg), format!("q{}", reg))
+        } else {
+            (xreg_name(reg).to_string(), wreg_name(reg).to_string())
+        };
+        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|tok| tok == a || tok == b)
+    };
+    let mut changed = false;
+    for i in 0..n {
+        // Skip lines already Nop'd by earlier fusions/passes: their text is
+        // stale and must not be re-paired.
+        if kinds[i] == LineKind::Nop {
+            continue;
+        }
+        let Some((is_store, ra, addra, b'd')) = parse_fp_mem(&lines[i]) else { continue };
+        let base_reg = match addra {
+            FpAddr::Sp(_) => u8::MAX, // sp is never rewritten mid-body
+            FpAddr::Base(b, _) => b,
+        };
+        // Find a mergeable partner within a 4-instruction window.
+        let mut partner = None;
+        let mut j = i + 1;
+        while j < n && j <= i + 4 {
+            if kinds[j] == LineKind::Nop {
+                j += 1;
+                continue;
+            }
+            match kinds[j] {
+                LineKind::Label | LineKind::Branch | LineKind::CondBranch
+                | LineKind::CmpBranch | LineKind::Call | LineKind::Ret
+                | LineKind::Directive => break,
+                _ => {}
+            }
+            let tj = lines[j].trim();
+            // A valid merge partner is not a hazard to itself — check for it
+            // before the generic memory-hazard break.
+            if let Some((is_store2, rc, addrc, b'd')) = parse_fp_mem(&lines[j]) {
+                if is_store2 == is_store && rc != ra {
+                    let same_base = match (addra, addrc) {
+                        (FpAddr::Sp(a), FpAddr::Sp(b)) => Some((a, b)),
+                        (FpAddr::Base(x, a), FpAddr::Base(y, b)) if x == y => Some((a, b)),
+                        _ => None,
+                    };
+                    if let Some((oa, ob)) = same_base {
+                        if (oa - ob).abs() == 8 {
+                            // The partner's load/store moves up to position i:
+                            // no gap line may mention rc (its physical register
+                            // could carry a live older value), write ra, or
+                            // write the base.
+                            let mut ok = true;
+                            for k in (i + 1)..j {
+                                if kinds[k] == LineKind::Nop {
+                                    continue;
+                                }
+                                if mention(&lines[k], rc, true)
+                                    || fp_reg_written(&lines[k], ra)
+                                    || (base_reg != u8::MAX
+                                        && gp_reg_written_broad(&lines[k], base_reg))
+                                {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            if ok {
+                                partner = Some((j, rc, ob));
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            let is_mem = parse_fp_mem(&lines[j]).is_some()
+                || matches!(kinds[j], LineKind::StoreSp { .. } | LineKind::LoadSp { .. }
+                    | LineKind::LoadswSp { .. } | LineKind::MemOther
+                    | LineKind::StorePairSp | LineKind::LoadPairSp | LineKind::LoadsbReg);
+            // A store in the gap could alias the pending load; for store
+            // fusion any memory access is a hazard.
+            if is_mem && (is_store || tj.starts_with("st")) {
+                break;
+            }
+            j += 1;
+        }
+        let Some((pj, rc, ob)) = partner else { continue };
+        let oa = match addra {
+            FpAddr::Sp(o) => o,
+            FpAddr::Base(_, o) => o,
+        };
+        let (lo_reg, hi_reg, lo) = if oa <= ob { (ra, rc, oa) } else { (rc, ra, ob) };
+        let base_str = match addra {
+            FpAddr::Sp(_) => "sp".to_string(),
+            FpAddr::Base(b, _) => xreg_name(b).to_string(),
+        };
+        let mnem = if is_store { "stp" } else { "ldp" };
+        lines[i] = if lo == 0 {
+            format!("    {} d{}, d{}, [{}]", mnem, lo_reg, hi_reg, base_str)
+        } else {
+            format!("    {} d{}, d{}, [{}, #{}]", mnem, lo_reg, hi_reg, base_str, lo)
+        };
+        kinds[i] = classify_line(&lines[i]);
+        kinds[pj] = LineKind::Nop;
+        changed = true;
+    }
+    changed
 }
 
 fn forward_fp_slot_loads(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
@@ -2682,8 +2806,8 @@ f:
     #[test]
     fn test_fp_slot_forward_blocked_by_intervening_reload_of_source() {
         // The reload of d0 from a different slot clobbers the tracked source
-        // of slot #232's entry: forwarding the second load would read the
-        // wrong value.
+        // of slot #232's entry: forwarding the second load as `fmov d1, d0`
+        // would read the wrong value.
         let input = "\
 f:
     str d0, [sp, #232]
@@ -2692,7 +2816,106 @@ f:
     ret
 ";
         let result = peephole_optimize(input.to_string());
-        assert!(result.contains("ldr d1, [sp, #232]"),
+        assert!(!result.contains("fmov d1, d0"),
             "reload of source must block forward:\n{}", result);
     }
+
+    // ── FP field pair fusion (ldp/stp) ───────────────────────────────────
+
+    #[test]
+    fn test_fp_pair_loads_fused() {
+        let input = "\
+f:
+    ldr d22, [x7]
+    ldr d23, [x26]
+    fsub d27, d22, d23
+    ldr d28, [x7, #8]
+    fsub d30, d28, d29
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("ldp d22, d28, [x7]"), "loads fused:\n{}", result);
+        assert!(!result.contains("ldr d28, [x7, #8]"));
+    }
+
+    #[test]
+    fn test_fp_pair_stores_fused() {
+        let input = "\
+f:
+    str d10, [x8]
+    str d22, [x8, #8]
+    ldr d1, [x8]
+    ldr d2, [x8, #8]
+    fadd d0, d1, d2
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("stp d10, d22, [x8]"), "stores fused:\n{}", result);
+    }
+
+    #[test]
+    fn test_fp_pair_loads_blocked_by_store() {
+        // A store between the loads may alias the second load's address.
+        let input = "\
+f:
+    ldr d22, [x7]
+    str d0, [x9]
+    ldr d28, [x7, #8]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("ldr d28, [x7, #8]"), "store must block fusion:\n{}", result);
+        assert!(!result.contains("ldp"));
+    }
+
+    #[test]
+    fn test_fp_pair_stores_blocked_by_load() {
+        // A load between the stores may read the second store's address.
+        let input = "\
+f:
+    str d10, [x7]
+    ldr d0, [x9]
+    str d22, [x7, #8]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("str d22, [x7, #8]"), "load must block store fusion:\n{}", result);
+    }
+
+    #[test]
+    fn test_fp_pair_reversed_offsets() {
+        let input = "\
+f:
+    ldr d28, [x7, #8]
+    ldr d22, [x7]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("ldp d22, d28, [x7]"), "reversed pair normalized:\n{}", result);
+    }#[test]
+fn test_fp_pair_latch_stores_no_overlap() {
+    // Consecutive latch spill stores fuse pairwise; an already-paired line
+    // must not be re-paired into an overlapping stp.
+    let input = "\
+f:
+    add x19, x26, #56
+    str d10, [sp, #344]
+    str d22, [sp, #352]
+    str d30, [sp, #360]
+    str d19, [sp, #368]
+    str d27, [sp, #376]
+    mov x26, x19
+    ldr d0, [sp, #344]
+    ldr d1, [sp, #352]
+    ldr d2, [sp, #360]
+    ldr d3, [sp, #368]
+    ldr d4, [sp, #376]
+    ret
+";
+    let result = peephole_optimize(input.to_string());
+    assert!(result.contains("stp d10, d22, [sp, #344]"), "first pair:\n{}", result);
+    assert!(result.contains("stp d30, d19, [sp, #360]"), "second pair:\n{}", result);
+    assert!(!result.contains("stp d22"), "no overlapping re-fusion:\n{}", result);
+}
+
 }
