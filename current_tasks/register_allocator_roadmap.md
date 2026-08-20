@@ -65,6 +65,14 @@ architectural, not pass-level. This doc records the evidence and the plan.
 - GPR pool extension via x9-x15: the emitter's scratch discipline
   (address staging, memcpy, call staging, intrinsics) is load-bearing;
   x16/x17 are also used as scratch in 24+ sites. Not a bounded change.
+- Trampoline branch inversion (b.cc exit / skip-trampoline / latch):
+  spectral_norm +5% consistently (hot path became the taken branch),
+  nbody -1.7%. Net negative; dropped.
+- Second-chance FP scan for loop-carried copy webs (mandebrot zr/zi web):
+  web members' intervals coexist, so each takes its OWN register and the
+  web copies persist as fmovs while pool pressure rises — mandelbrot +11%.
+  The web needs coalescing (one register per logical accumulator), not
+  more registers. Do not retry without true web coalescing.
 
 ## Latent backend hazards found (fixed)
 
