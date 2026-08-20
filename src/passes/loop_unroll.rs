@@ -92,6 +92,12 @@ struct UnrollCandidate {
 /// Run the loop-unrolling pass on one function. Returns the number of loops
 /// that were successfully unrolled.
 pub(crate) fn unroll_loops(func: &mut IrFunction) -> usize {
+    unroll_loops_impl(func, std::env::var("CCC_NO_FULL_UNROLL").is_err())
+}
+
+/// `allow_full` controls the full-unroll sub-pass (tests disable it to
+/// exercise the partial unroller's structure deterministically).
+fn unroll_loops_impl(func: &mut IrFunction, allow_full: bool) -> usize {
     if func.blocks.len() < 2 {
         return 0;
     }
@@ -99,7 +105,11 @@ pub(crate) fn unroll_loops(func: &mut IrFunction) -> usize {
     // entirely (exposing constant GEP offsets for aggregate scalarization),
     // and iterating internally handles trip counts that only become constant
     // after an outer loop is unrolled.
-    let mut count = full_unroll_constant_loops(func);
+    let mut count = if allow_full {
+        full_unroll_constant_loops(func)
+    } else {
+        0
+    };
 
     let cfg = CfgAnalysis::build(func);
     let raw = loop_analysis::find_natural_loops(
@@ -794,18 +804,14 @@ struct FullUnrollPlan {
 /// Run full unrolling on one function; returns the number of loops unrolled.
 /// Iterates internally so that loops whose trip count becomes constant only
 /// after an outer loop was unrolled (e.g. `j = i+1 .. 4`) are also unrolled.
-/// Run full unrolling on one function; returns the number of loops unrolled.
-/// Iterates internally so that loops whose trip count becomes constant only
-/// after an outer loop was unrolled (e.g. `j = i+1 .. 4`) are also unrolled.
 ///
-/// Currently OPT-IN (CCC_FULL_UNROLL=1): on the target workload (struct_copy's
-/// inlined make/distance loops) unrolling alone does not eliminate aggregate
-/// memory traffic and the code growth is a net loss, so it is off by default
-/// pending a working store->load forwarding chain.
+/// Default-on: bounded to constant trip counts ≤ 16 and ≤ 512 expanded
+/// instructions per loop, so code growth is contained. The aggregate
+/// store→load forwarding chain (aggregate_copy_forward + store_load_forward)
+/// eliminates the temporary traffic unrolling exposes (struct_copy's inlined
+/// make/distance loops: 18.7ms → 13.7ms). CCC_NO_FULL_UNROLL disables
+/// (checked by the caller, `unroll_loops`).
 pub(crate) fn full_unroll_constant_loops(func: &mut IrFunction) -> usize {
-    if std::env::var("CCC_FULL_UNROLL").is_err() {
-        return 0;
-    }
     let mut total = 0;
     for _ in 0..32 {
         let n = full_unroll_once(func);
@@ -2515,8 +2521,7 @@ mod tests {
 
         func.next_value_id = 21;
 
-        let n = unroll_loops(&mut func);
-
+        let n = unroll_loops_impl(&mut func, false);
         // Outer loop must NOT be unrolled (body_work contains inner header B2).
         let outer_latch = func.blocks.iter().find(|b| b.label == BlockId(5)).unwrap();
         assert!(

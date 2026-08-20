@@ -188,6 +188,10 @@ fn try_hoist_def_chain(func: &mut IrFunction, bi: usize, dest: Value) -> bool {
     let mut chain: Vec<usize> = Vec::new(); // instruction indices
     let mut worklist = vec![dest.0];
     let mut seen = FxHashSet::default();
+    // Same-block terminal definitions (allocas, address constants) the chain
+    // bottoms out in: available for the whole block, so they terminate the
+    // chain — but the reinsertion point must stay after their positions.
+    let mut terminal_dests: FxHashSet<u32> = FxHashSet::default();
     while let Some(v) = worklist.pop() {
         if !seen.insert(v) {
             continue;
@@ -199,8 +203,18 @@ fn try_hoist_def_chain(func: &mut IrFunction, bi: usize, dest: Value) -> bool {
                 break;
             }
         }
-        let Some(di) = def_pos else { continue }; // defined elsewhere/alloca: available
+        let Some(di) = def_pos else { continue }; // defined elsewhere: available
         let inst = &func.blocks[bi].instructions[di];
+        if matches!(
+            inst,
+            Instruction::Alloca { .. }
+                | Instruction::ParamRef { .. }
+                | Instruction::GlobalAddr { .. }
+                | Instruction::LabelAddr { .. }
+        ) {
+            terminal_dests.insert(v);
+            continue;
+        }
         let movable = matches!(
             inst,
             Instruction::GetElementPtr { .. }
@@ -218,8 +232,10 @@ fn try_hoist_def_chain(func: &mut IrFunction, bi: usize, dest: Value) -> bool {
             worklist.push(u);
         }
     }
-    // Remove from the block (descending index order), then reinsert at the top
-    // (after leading Alloca/Phi instructions) in dependency order.
+    // Remove from the block (descending index order), then reinsert in
+    // dependency order after the leading Alloca/Phi instructions AND after
+    // any same-block terminal definitions (a mid-block Alloca the chain
+    // references must still precede the hoisted instructions).
     chain.sort_unstable();
     let mut moved = Vec::with_capacity(chain.len());
     for &di in chain.iter().rev() {
@@ -236,6 +252,13 @@ fn try_hoist_def_chain(func: &mut IrFunction, bi: usize, dest: Value) -> bool {
         match &func.blocks[bi].instructions[ins] {
             Instruction::Alloca { .. } | Instruction::Phi { .. } => ins += 1,
             _ => break,
+        }
+    }
+    for (idx, inst) in func.blocks[bi].instructions.iter().enumerate() {
+        if let Some(d) = inst.dest() {
+            if terminal_dests.contains(&d.0) {
+                ins = ins.max(idx + 1);
+            }
         }
     }
     for inst in moved.into_iter().rev() {
