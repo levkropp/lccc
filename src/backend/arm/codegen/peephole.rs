@@ -33,6 +33,8 @@
 
 // ── Line classification types ────────────────────────────────────────────────
 
+use crate::common::fx_hash::FxHashMap;
+
 /// Compact classification of an assembly line.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum LineKind {
@@ -433,6 +435,7 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= eliminate_move_chains(&mut lines, &mut kinds, n);
         changed |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
         changed |= propagate_address_aliases(&mut lines, &mut kinds, n);
+        changed |= forward_fp_slot_loads(&mut lines, &mut kinds, n);
         changed |= fold_destructive_pointer_updates(&mut lines, &mut kinds, n);
         changed |= fuse_branch_over_branch(&mut lines, &mut kinds, n);
         if rotate {
@@ -469,6 +472,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_move_chains(&mut lines, &mut kinds, n);
             changed2 |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
             changed2 |= propagate_address_aliases(&mut lines, &mut kinds, n);
+            changed2 |= forward_fp_slot_loads(&mut lines, &mut kinds, n);
             changed2 |= fold_destructive_pointer_updates(&mut lines, &mut kinds, n);
             rounds2 += 1;
         }
@@ -823,6 +827,314 @@ fn eliminate_dead_call_staging_moves(lines: &[String], kinds: &mut [LineKind], n
 // The load is redundant since the value is already in the register.
 // Also: str xN, [sp, #off]  →  ldr xM, [sp, #off]  → replace load with mov xM, xN
 // Also handles: str wN, [sp, #off]  →  ldrsw xN, [sp, #off]
+
+// ── FP spill slot load forwarding ────────────────────────────────────────────
+//
+// Pattern: `str dS, [sp, #off]` (or via a materialized `sp`-derived base
+// register) followed by `ldr dD, [sp, #off]` in the same block. The slot-home
+// emission produces these store/reload round-trips for unallocated FP
+// temporaries; the load is replaceable with `fmov dD, dS` (or deleted when
+// dD == dS) as long as neither the slot nor dS is clobbered in between.
+//
+// Tracking is deliberately conservative: any store through an unknown base,
+// any call, and any control-flow boundary drops all state, and any write of
+// a source register drops the entries that forward from it.
+
+/// Parse an FP register name token (`d7`, `s3`, `q16`, `v2`, `v2.2d`) to its
+/// register number.
+fn fp_token_reg(tok: &str) -> Option<u8> {
+    let tok = tok.trim();
+    let digits = match tok.as_bytes().first() {
+        Some(b'd') | Some(b's') | Some(b'q') | Some(b'v') => {
+            let mut end = 1;
+            while end < tok.len() && tok.as_bytes()[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end == 1 {
+                return None;
+            }
+            &tok[1..end]
+        }
+        _ => return None,
+    };
+    digits.parse::<u8>().ok().filter(|&r| r <= 31)
+}
+
+/// An FP memory operand location: direct `[sp, #off]` slot, or a register
+/// base with a byte offset (`[xN]` / `[xN, #k]`).
+#[derive(Clone, Copy)]
+enum FpAddr {
+    Sp(i32),
+    Base(u8, i32),
+}
+
+/// Parse `str dS, ...` / `ldr dD, ...` (d/s/q widths) into (reg, FpAddr).
+fn parse_fp_mem(line: &str) -> Option<(bool, u8, FpAddr, u8)> {
+    let t = line.trim();
+    let (is_store, rest) = if let Some(r) = t.strip_prefix("str ") {
+        (true, r)
+    } else if let Some(r) = t.strip_prefix("ldr ") {
+        (false, r)
+    } else {
+        return None;
+    };
+    let (reg_str, addr) = rest.split_once(", ")?;
+    let reg_str = reg_str.trim();
+    let width = reg_str.as_bytes().first().copied()?;
+    if !matches!(width, b'd' | b's' | b'q') {
+        return None;
+    }
+    let reg = fp_token_reg(reg_str)?;
+    let addr = addr.trim();
+    if let Some(off) = parse_sp_offset(addr) {
+        return Some((is_store, reg, FpAddr::Sp(off), width));
+    }
+    if addr.starts_with("[x") && addr.ends_with(']') && !addr.contains('!') {
+        let inner = &addr[1..addr.len() - 1];
+        let (base, off) = match inner.split_once(", ") {
+            Some((b, o)) => (b.trim(), o.trim().strip_prefix('#')?.parse::<i32>().ok()?),
+            None => (inner.trim(), 0),
+        };
+        let base_reg = parse_reg(base);
+        if base_reg < 29 {
+            return Some((is_store, reg, FpAddr::Base(base_reg, off), width));
+        }
+    }
+    None
+}
+
+/// Width in bytes of an FP spill slot access kind.
+fn fp_access_width(width: u8) -> i32 {
+    match width {
+        b's' => 4,
+        b'q' => 16,
+        _ => 8, // d
+    }
+}
+
+/// Does this line write FP register `num` (any d/s/q/v name form) as its
+/// destination? Store/branch/compare mnemonics never write a register.
+fn fp_reg_written(line: &str, num: u8) -> bool {
+    let t = line.trim();
+    let Some((mnem, rest)) = t.split_once(' ') else { return false };
+    if matches!(
+        mnem,
+        "str" | "stp" | "strb" | "strh" | "stur" | "sturb" | "sturh" | "stlr"
+            | "stlrb" | "stlrh" | "fcmp" | "fcmpe" | "b" | "bl" | "ret" | "cbz"
+            | "cbnz" | "tbz" | "tbnz" | "cmp" | "cmn"
+    ) || mnem.starts_with("b.")
+    {
+        return false;
+    }
+    rest.split(',')
+        .next()
+        .is_some_and(|first| fp_token_reg(first) == Some(num))
+}
+
+/// Does this line write GP register `num` (x or w form)? Checks the first two
+/// operand positions (pair loads write the second). False positives are fine
+/// (callers only use this to drop tracking state, never to enable a rewrite);
+/// false negatives are not, so store/branch/compare mnemonics are excluded and
+/// anything unrecognized counts as a write when the register appears early.
+fn gp_reg_written_broad(line: &str, num: u8) -> bool {
+    let t = line.trim();
+    let Some((mnem, rest)) = t.split_once(' ') else { return false };
+    if matches!(
+        mnem,
+        "str" | "stp" | "strb" | "strh" | "stur" | "sturb" | "sturh" | "stlr"
+            | "stlrb" | "stlrh" | "fcmp" | "fcmpe" | "b" | "bl" | "ret" | "cbz"
+            | "cbnz" | "tbz" | "tbnz" | "cmp" | "cmn"
+    ) || mnem.starts_with("b.")
+    {
+        return false;
+    }
+    rest.split(',')
+        .take(2)
+        .any(|op| {
+            let op = op.trim();
+            op == xreg_name(num) || op == wreg_name(num)
+        })
+}
+
+fn forward_fp_slot_loads(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_FP_SLOT_FWD").is_ok() {
+        return false;
+    }
+    // slot (offset, width) -> source FP register number
+    let mut slot_src: FxHashMap<(i32, u8), u8> = FxHashMap::default();
+    // sp-derived base register -> sp offset (`add xN, sp, #off` / `mov xN, sp`)
+    let mut base_off: FxHashMap<u8, i32> = FxHashMap::default();
+    let mut changed = false;
+
+    let mut i = 0;
+    while i < n {
+        match kinds[i] {
+            LineKind::Label | LineKind::Branch | LineKind::CondBranch
+            | LineKind::CmpBranch | LineKind::Call | LineKind::Ret => {
+                slot_src.clear();
+                base_off.clear();
+                i += 1;
+                continue;
+            }
+            LineKind::Directive | LineKind::Nop => {
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        let t = lines[i].trim().to_string();
+
+        // Track sp-derived base registers: `add xN, sp, #off`, `mov xN, sp`.
+        if let Some(rest) = t.strip_prefix("add ") {
+            if let Some((dst_s, srcs)) = rest.split_once(", ") {
+                if let Some((src_s, imm_s)) = srcs.split_once(", ") {
+                    if src_s.trim() == "sp" {
+                        let dst = parse_reg(dst_s.trim());
+                        if dst < 29 {
+                            if let Some(imm) = imm_s.trim().strip_prefix('#').and_then(|v| v.parse::<i32>().ok()) {
+                                base_off.insert(dst, imm);
+                                i += 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        } else if let Some(rest) = t.strip_prefix("mov ") {
+            if let Some((dst_s, src_s)) = rest.split_once(", ") {
+                if src_s.trim() == "sp" {
+                    let dst = parse_reg(dst_s.trim());
+                    if dst < 29 {
+                        base_off.insert(dst, 0);
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Any write of a tracked base register invalidates its mapping.
+        // (Broad check: loads through untracked bases and pair loads can also
+        // rewrite the register; over-dropping only loses optimization.)
+        {
+            let mut dead_bases = Vec::new();
+            for &b in base_off.keys() {
+                if written_gp_register(&lines[i], kinds[i]) == Some(b)
+                    || gp_reg_written_broad(&lines[i], b)
+                {
+                    dead_bases.push(b);
+                }
+            }
+            for b in dead_bases {
+                base_off.remove(&b);
+            }
+        }
+
+        if let Some((is_store, reg, addr, width)) = parse_fp_mem(&lines[i]) {
+            let slot_off = match addr {
+                FpAddr::Sp(off) => Some(off),
+                FpAddr::Base(b, k) => base_off.get(&b).map(|&base| base + k),
+            };
+            let Some(slot_off) = slot_off else {
+                // Unknown base: a store through it may alias anything tracked.
+                if is_store {
+                    slot_src.clear();
+                    base_off.clear();
+                } else {
+                    // Unknown-base load still clobbers its destination.
+                    let mut to_drop = Vec::new();
+                    for (&key, &s) in slot_src.iter() {
+                        if s == reg {
+                            to_drop.push(key);
+                        }
+                    }
+                    for key in to_drop {
+                        slot_src.remove(&key);
+                    }
+                }
+                i += 1;
+                continue;
+            };
+            if is_store {
+                let (lo, hi) = (slot_off, slot_off + fp_access_width(width));
+                slot_src.retain(|&(off, w), _| {
+                    let (l2, h2) = (off, off + fp_access_width(w));
+                    h2 <= lo || l2 >= hi
+                });
+                slot_src.insert((slot_off, width), reg);
+            } else {
+                if let Some(&src) = slot_src.get(&(slot_off, width)) {
+                    if src == reg {
+                        // Loading a slot into the register that already holds
+                        // its content: redundant.
+                        kinds[i] = LineKind::Nop;
+                        changed = true;
+                        i += 1;
+                        continue;
+                    }
+                    lines[i] = if width == b'q' {
+                        format!("    mov v{}.16b, v{}.16b", reg, src)
+                    } else {
+                        format!("    fmov {}{}, {}{}", width as char, reg, width as char, src)
+                    };
+                    kinds[i] = classify_line(&lines[i]);
+                    changed = true;
+                }
+                // The load writes its destination register, whether or not a
+                // forward happened: entries forwarding FROM that register are
+                // now stale. (Missing this clobbered a still-tracked entry
+                // whose source was silently reloaded between store and use.)
+                slot_src.retain(|_, &mut s| s != reg);
+            }
+            i += 1;
+            continue;
+        }
+
+        // GP stack stores invalidate overlapping FP entries.
+        if let LineKind::StoreSp { offset, is_word, .. } = kinds[i] {
+            let (lo, hi) = (offset, offset + if is_word { 4 } else { 8 });
+            slot_src.retain(|&(off, w), _| {
+                let (l2, h2) = (off, off + fp_access_width(w));
+                h2 <= lo || l2 >= hi
+            });
+            i += 1;
+            continue;
+        }
+
+        match kinds[i] {
+            // Untracked store forms may write anywhere: drop all state.
+            LineKind::MemOther | LineKind::StorePairSp if t.starts_with("st") => {
+                slot_src.clear();
+                base_off.clear();
+            }
+            // Pair loads write two registers: drop entries sourcing either.
+            LineKind::LoadPairSp => {
+                let mut ops = t
+                    .trim_start_matches("ldp ")
+                    .split(',')
+                    .take(2)
+                    .filter_map(|tok| fp_token_reg(tok));
+                let (a, b) = (ops.next(), ops.next());
+                slot_src.retain(|_, &mut s| Some(s) != a && Some(s) != b);
+            }
+            // Other instructions: drop entries whose source register they write.
+            _ => {
+                let mut to_drop = Vec::new();
+                for (&key, &s) in slot_src.iter() {
+                    if fp_reg_written(&lines[i], s) {
+                        to_drop.push(key);
+                    }
+                }
+                for key in to_drop {
+                    slot_src.remove(&key);
+                }
+            }
+        }
+        i += 1;
+    }
+    changed
+}
 
 fn eliminate_adjacent_store_load(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
@@ -1972,5 +2284,113 @@ g:
         assert!(!result.contains("mov x9, x26"), "dead alias mov removed:\n{}", result);
         assert!(result.contains("ldr x4, [x26]"), "use rewritten:\n{}", result);
         assert!(result.contains("str x4, [x26, #8]"), "use rewritten:\n{}", result);
+    }
+
+    // ── FP spill slot forwarding ─────────────────────────────────────────
+
+    #[test]
+    fn test_fp_slot_forward_basic() {
+        let input = "\
+f:
+    fsub d0, d12, d21
+    str d0, [sp, #224]
+    fmul d3, d0, d0
+    ldr d1, [sp, #224]
+    fadd d4, d1, d3
+    ret
+g:
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("fmov d1, d0"), "reload forwarded:\n{}", result);
+        assert!(!result.contains("ldr d1, [sp, #224]"));
+    }
+
+    #[test]
+    fn test_fp_slot_forward_same_reg_deletes() {
+        let input = "\
+f:
+    str d7, [sp, #64]
+    ldr d7, [sp, #64]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.contains("ldr d7, [sp, #64]"), "redundant reload deleted:\n{}", result);
+    }
+
+    #[test]
+    fn test_fp_slot_forward_blocked_by_source_clobber() {
+        // d0 is overwritten between the store and the load: no forwarding.
+        let input = "\
+f:
+    str d0, [sp, #224]
+    fmul d0, d1, d2
+    ldr d1, [sp, #224]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("ldr d1, [sp, #224]"), "clobbered source must not forward:\n{}", result);
+    }
+
+    #[test]
+    fn test_fp_slot_forward_blocked_by_unknown_store() {
+        // A store through an untracked base may alias the slot: no forwarding.
+        let input = "\
+f:
+    str d0, [sp, #224]
+    str d5, [x9]
+    ldr d1, [sp, #224]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("ldr d1, [sp, #224]"), "unknown-base store must block:\n{}", result);
+    }
+
+    #[test]
+    fn test_fp_slot_forward_via_materialized_base() {
+        // Stores through an sp-derived base register are tracked.
+        let input = "\
+f:
+    add x23, sp, #112
+    fmul d28, d27, d17
+    str d28, [x23]
+    fadd d4, d1, d1
+    ldr d6, [sp, #112]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("fmov d6, d28"), "base-tracked forward:\n{}", result);
+    }
+
+    #[test]
+    fn test_fp_slot_forward_gp_store_overlap_blocks() {
+        // A GP word store into the upper half of the double slot must
+        // invalidate the double's forward entry.
+        let input = "\
+f:
+    str d0, [sp, #224]
+    str w1, [sp, #228]
+    ldr d1, [sp, #224]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("ldr d1, [sp, #224]"), "overlapping GP store must block:\n{}", result);
+    }
+
+    #[test]
+    fn test_fp_slot_forward_blocked_by_intervening_reload_of_source() {
+        // The reload of d0 from a different slot clobbers the tracked source
+        // of slot #232's entry: forwarding the second load would read the
+        // wrong value.
+        let input = "\
+f:
+    str d0, [sp, #232]
+    ldr d0, [sp, #224]
+    ldr d1, [sp, #232]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("ldr d1, [sp, #232]"),
+            "reload of source must block forward:\n{}", result);
     }
 }
