@@ -38,12 +38,9 @@ architectural, not pass-level. This doc records the evidence and the plan.
 - GVN-style (Copy-inserting) CSE for pointer-valued expressions: hits the
   same stale-base-register landmine that disabled GEP CSE. GlobalAddr CSE
   must be substitution-based (see global_addr_cse.rs).
-- fmsub/fnmsub fusion of `a - b*c` (Mul;Sub adjacency): on accumulator
-  update chains it lengthens the serial dependency (fmsub latency > fsub),
-  nbody +13% regression. Gated to non-accumulator dests the fusion then
-  fires ZERO times across all 18 benchmarks (every FP mul;sub pattern in the
-  suite is an accumulator update). Reverted; not worth the rounding-change
-  risk surface for no measurable win.
+- fmsub/fnmsub fusion of `a - b*c` on accumulator update chains lengthens
+  the serial dependency (fmsub latency > fsub): nbody +13%. Shipped GATED
+  (e3b21b8f): accumulator-feeding Subs stay split (mandelbrot -1.4%).
 - Read-only loop-invariant F64 load hoisting (nbody bodies[i].x/y/z,
   struct_copy particle fields): needs phi-derived-pointer alias proof and
   pool-aware gating; the 60% affine-LICM regression came from hoisted values
