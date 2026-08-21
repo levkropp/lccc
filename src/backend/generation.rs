@@ -810,6 +810,69 @@ fn detect_mul_add_fusions(block: &BasicBlock, use_counts: &[u32], fuse_float: bo
     skip_set
 }
 
+/// Find gap-fused multiply-add candidates: `fmul` at idx, one or two harmless
+/// instructions (Load/GEP — the j-side address computation and velocity load
+/// in nbody), then `fadd` consuming the mul result. The fmadd is emitted AT
+/// the Add so the gap instructions land in between. Returns
+/// (mul_idx, add_idx, gap_indices). The driver validates register aliasing
+/// before committing. CCC_NO_GAP_FMA disables.
+fn detect_gap_fma_fusions(
+    block: &BasicBlock,
+    use_counts: &[u32],
+    fuse_float: bool,
+    accumulator_dests: &FxHashSet<u32>,
+) -> Vec<(usize, usize, Vec<usize>)> {
+    let mut out = Vec::new();
+    if !fuse_float || std::env::var("CCC_NO_GAP_FMA").is_ok() {
+        return out;
+    }
+    for (idx, inst) in block.instructions.iter().enumerate() {
+        let (mul_dest, mul_ty) = match inst {
+            Instruction::BinOp { dest, op: crate::ir::reexports::IrBinOp::Mul, ty, .. } => (dest, ty),
+            _ => continue,
+        };
+        if !mul_ty.is_float() || matches!(mul_ty, IrType::F128) {
+            continue;
+        }
+        // Multiply result must have exactly 1 use (the add).
+        let mul_uses = if (mul_dest.0 as usize) < use_counts.len() {
+            use_counts[mul_dest.0 as usize]
+        } else {
+            0
+        };
+        if mul_uses != 1 {
+            continue;
+        }
+        let mut gap: Vec<usize> = Vec::new();
+        let mut found = None;
+        for j in (idx + 1)..block.instructions.len() {
+            match &block.instructions[j] {
+                Instruction::Load { .. } | Instruction::GetElementPtr { .. } if gap.len() < 2 => {
+                    gap.push(j);
+                }
+                Instruction::BinOp { dest: add_dest, op: crate::ir::reexports::IrBinOp::Add, lhs, rhs, ty: add_ty, .. }
+                    if !gap.is_empty() =>
+                {
+                    let mul_used = matches!(lhs, Operand::Value(v) if v.0 == mul_dest.0)
+                        || matches!(rhs, Operand::Value(v) if v.0 == mul_dest.0);
+                    if mul_used && *add_ty == *mul_ty && !accumulator_dests.contains(&add_dest.0) {
+                        found = Some(j);
+                    }
+                    break;
+                }
+                _ => break,
+            }
+        }
+        if let Some(add_idx) = found {
+            if std::env::var("CCC_DEBUG_GAPFMA").is_ok() {
+                eprintln!("[GAPFMA] candidate mul={} add={} gap={:?}", idx, add_idx, gap);
+            }
+            out.push((idx, add_idx, gap));
+        }
+    }
+    out
+}
+
 /// Find adjacent `shift; logical` pairs that AArch64 can encode as one
 /// shifted-register logical instruction.  Requiring one use makes eliding the
 /// standalone shift safe.
@@ -1411,6 +1474,47 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
         // instead of materializing the boolean result to a register/stack slot.
         let fuse_idx = detect_cmp_branch_fusion(block, &value_use_counts, cg.supports_fused_fp_cmp_branch());
         let mul_add_fusions = detect_mul_add_fusions(block, &value_use_counts, cg.supports_fused_float_mul_add(), &accumulator_dests);
+        // Gap-fused fmadd candidates: Mul, Load, Add. Validated against
+        // register assignments below — the intervening load's destination
+        // register must not alias either multiply operand's register.
+        let mut gap_mul_skips: FxHashSet<usize> = FxHashSet::default();
+        let mut gap_add_fusions: FxHashMap<usize, usize> = FxHashMap::default();
+        for &(mul_idx, add_idx, ref gap) in &detect_gap_fma_fusions(block, &value_use_counts, cg.supports_fused_float_mul_add(), &accumulator_dests) {
+            let (mul_lhs, mul_rhs) = match &block.instructions[mul_idx] {
+                Instruction::BinOp { lhs, rhs, .. } => (lhs.clone(), rhs.clone()),
+                _ => continue,
+            };
+            // Register safety: no gap instruction's destination register may
+            // alias either multiply operand's register (GEP dests are GPRs,
+            // disjoint from the FP operands; the load's FP dest is checked).
+            let mut clash = false;
+            for &g in gap {
+                let gap_dest = match &block.instructions[g] {
+                    Instruction::Load { dest, .. } => Some(*dest),
+                    Instruction::GetElementPtr { dest, .. } => Some(*dest),
+                    _ => None,
+                };
+                if let Some(gd) = gap_dest {
+                    let gap_phys = cg.get_phys_reg_for_value(gd.0);
+                    if gap_phys.is_none() {
+                        continue;
+                    }
+                    for op in [&mul_lhs, &mul_rhs] {
+                        if let Operand::Value(v) = op {
+                            if cg.get_phys_reg_for_value(v.0) == gap_phys {
+                                clash = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if clash {
+                if std::env::var("CCC_DEBUG_GAPFMA").is_ok() { eprintln!("[GAPFMA] REJECT physreg clash mul={}", mul_idx); }
+                continue;
+            }
+            gap_mul_skips.insert(mul_idx);
+            gap_add_fusions.insert(add_idx, mul_idx);
+        }
         let cmp_select_fusions = if cg.supports_fused_cmp_select() {
             detect_cmp_select_fusion(block, &value_use_counts)
         } else {
@@ -1469,6 +1573,25 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
                 skip_fused_add = false;
                 cg.state().current_program_point += 1;
                 continue;
+            }
+            // Gap-fused fmadd: skip the Mul (its result is computed by the
+            // fmadd emitted at the Add, after the intervening Load).
+            if gap_mul_skips.contains(&idx) {
+                cg.state().current_program_point += 1;
+                continue;
+            }
+            if let Some(&mul_idx) = gap_add_fusions.get(&idx) {
+                if let (
+                    Instruction::BinOp { dest: mul_dest, lhs: mul_lhs, rhs: mul_rhs, ty: mul_ty, .. },
+                    Instruction::BinOp { dest: add_dest, lhs: add_lhs, rhs: add_rhs, .. },
+                ) = (&block.instructions[mul_idx], inst)
+                {
+                    let mul_is_lhs = matches!(add_lhs, Operand::Value(v) if v.0 == mul_dest.0);
+                    let acc_op = if mul_is_lhs { add_rhs } else { add_lhs };
+                    cg.emit_fused_mul_add(mul_dest, mul_lhs, mul_rhs, acc_op, add_dest, *mul_ty);
+                    cg.state().current_program_point += 1;
+                    continue;
+                }
             }
             if skip_fused_logical {
                 skip_fused_logical = false;
