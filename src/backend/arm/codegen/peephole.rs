@@ -443,6 +443,7 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= fuse_branch_over_branch(&mut lines, &mut kinds, n);
         // After the folds: dead staging movs (their patterns must win first).
         changed |= eliminate_overwritten_moves(&lines, &mut kinds, n);
+        changed |= eliminate_overwritten_stores(&lines, &mut kinds, n);
         if rotate {
             changed |= rotate_simple_loops(&mut lines, &mut kinds, n);
         }
@@ -464,6 +465,9 @@ pub fn peephole_optimize(asm: String) -> String {
     if std::env::var("CCC_NO_GDSE").is_err() {
         global_dead_store_elimination(&lines, &mut kinds, n);
     }
+    // After rotation (phase 1) and dead-store cleanup: sink loop-carried
+    // slot-home stores out of bottom-tested loops.
+    sink_loop_carried_stores(&mut lines, &mut kinds, n);
 
     // Phase 3: Local cleanup after global passes (up to 4 rounds)
     {
@@ -485,6 +489,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_repeated_slot_loads(&mut lines, &mut kinds, n);
             changed2 |= fold_destructive_pointer_updates(&mut lines, &mut kinds, n);
             changed2 |= eliminate_overwritten_moves(&lines, &mut kinds, n);
+            changed2 |= eliminate_overwritten_stores(&lines, &mut kinds, n);
             rounds2 += 1;
         }
     }
@@ -2665,6 +2670,422 @@ fn rotate_simple_loops(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
     changed
 }
 
+// ── Loop-carried store sinking ───────────────────────────────────────────────
+//
+// The slot-home discipline gives every SSA value a mandatory stack slot, so a
+// loop-carried value is stored to its slot once per iteration even when
+// nothing in the loop ever loads the slot back (the value stays live in a
+// register; the slot is only read after the loop).  Sink such a store to the
+// loop's fall-through exit:
+//
+//     .Lbody:                       .Lbody:
+//       ...                           ...
+//       str x0, [sp, #24]   -->       ...            (store removed)
+//       ...                           ...
+//       b.le .Lbody                   b.le .Lbody
+//       b .Lexit                      str x0, [sp, #24]  (stored once)
+//                                     b .Lexit
+//
+// Soundness conditions (all checked below): the slot is not otherwise
+// referenced inside the loop, this is the only store to it, every path from
+// the loop head to the fall-through exit executes the store (no labels or
+// exiting branches between the head and the store, no labels between the
+// store and the backedge), the only exit is the fall-through past the
+// backedge, and the stored register is not rewritten between the store and
+// the backedge.  Then the register holds the last-stored value at the exit,
+// so storing it there once produces the same slot contents as the original.
+
+/// Register number of a scalar register operand (`w0`/`x19`/`d24`/`s3` →
+/// 0/19/24/3).  The class is ignored: a match on the number alone is a
+/// conservative clobber indication.
+fn reg_operand_num(op: &str) -> Option<u8> {
+    let op = op.trim();
+    let rest = op.strip_prefix(|c| matches!(c, 'w' | 'x' | 'd' | 's' | 'q' | 'b' | 'h'))?;
+    rest.parse::<u8>().ok().filter(|&n| n <= 30)
+}
+
+/// Does this instruction write a register with the given number?
+/// Conservative: the first operand (and the second for `ldp`) counts as a
+/// destination for everything that is not a store, compare, or branch.
+fn instr_clobbers_reg(trimmed: &str, num: u8) -> bool {
+    let mut it = trimmed.splitn(2, char::is_whitespace);
+    let mnem = it.next().unwrap_or("");
+    let ops = it.next().unwrap_or("");
+    if ops.is_empty() {
+        return false; // labels, directives, ret, bare branches
+    }
+    // Stores and comparisons have no register destination.
+    if mnem.starts_with("st")
+        || mnem.starts_with("cmp")
+        || mnem.starts_with("cmn")
+        || mnem.starts_with("tst")
+        || mnem.starts_with("fcmp")
+    {
+        return false;
+    }
+    // Branches.
+    if mnem == "b"
+        || mnem.starts_with("b.")
+        || mnem == "bl"
+        || mnem == "blr"
+        || mnem == "br"
+        || mnem == "cbz"
+        || mnem == "cbnz"
+        || mnem == "tbz"
+        || mnem == "tbnz"
+    {
+        return false;
+    }
+    let mut operands = ops.split(", ");
+    if let Some(first) = operands.next() {
+        if reg_operand_num(first) == Some(num) {
+            return true;
+        }
+    }
+    if mnem == "ldp" {
+        if let Some(second) = operands.next() {
+            if reg_operand_num(second) == Some(num) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Parse `str <reg>, [sp, #off]` for scalar regs (w/x/s/d) → (reg_num, offset).
+fn parse_sp_store_any(trimmed: &str) -> Option<(u8, i32)> {
+    let rest = trimmed.strip_prefix("str ")?;
+    let (reg_str, addr) = rest.split_once(", ")?;
+    let num = reg_operand_num(reg_str)?;
+    let off = parse_sp_offset(addr.trim())?;
+    Some((num, off))
+}
+
+/// Byte size of a scalar `str` register operand (w/s=4, x/d=8).
+fn store_reg_size(trimmed: &str) -> Option<u32> {
+    let rest = trimmed.strip_prefix("str ")?;
+    let (reg_str, _) = rest.split_once(", ")?;
+    let r = reg_str.trim();
+    if r.starts_with('w') || r.starts_with('s') {
+        Some(4)
+    } else if r.starts_with('x') || r.starts_with('d') {
+        Some(8)
+    } else {
+        None
+    }
+}
+
+// ── Overwritten store elimination ────────────────────────────────────────────
+//
+// Local dead-store peephole: `str R, [sp, #off]` followed by another store to
+// the same slot with no intervening read (and no label, branch, call, or
+// unknown memory op between). The first store is dead. This is the store
+// analog of eliminate_overwritten_moves and catches cases the global DSE
+// misses when it bails on a whole function due to one escaped frame pointer.
+fn eliminate_overwritten_stores(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_STORE_DSE").is_ok() {
+        return false;
+    }
+    let mut changed = false;
+    for i in 0..n {
+        let LineKind::StoreSp { offset: off_i, is_word: word_i, .. } = kinds[i] else {
+            continue;
+        };
+        let size_i = if word_i { 4u32 } else { 8 };
+        let mut j = i + 1;
+        let mut steps = 0;
+        while j < n && steps < 40 {
+            steps += 1;
+            if lines[j].contains('\n') {
+                break; // multi-line slot may hide memory ops
+            }
+            match kinds[j] {
+                LineKind::Nop => {
+                    j += 1;
+                    continue;
+                }
+                LineKind::StoreSp { offset: off_j, is_word: word_j, .. } => {
+                    let size_j = if word_j { 4u32 } else { 8 };
+                    if off_j == off_i && size_j >= size_i {
+                        // Fully overwritten with no intervening read.
+                        kinds[i] = LineKind::Nop;
+                        changed = true;
+                    }
+                    if off_j < off_i + size_i as i32 && off_i < off_j + size_j as i32 {
+                        break; // overlapping store: stop either way
+                    }
+                    j += 1;
+                    continue;
+                }
+                LineKind::LoadSp { offset: off_j, is_word: word_j, .. } => {
+                    let size_j = if word_j { 4u32 } else { 8 };
+                    if off_j < off_i + size_i as i32 && off_i < off_j + size_j as i32 {
+                        break; // reads our slot (or overlaps it)
+                    }
+                    j += 1;
+                    continue;
+                }
+                LineKind::LoadswSp { offset: off_j, .. } => {
+                    if off_j < off_i + size_i as i32 && off_i < off_j + 4 {
+                        break;
+                    }
+                    j += 1;
+                    continue;
+                }
+                // Straight-line, non-memory instructions are transparent.
+                LineKind::Move { .. }
+                | LineKind::MoveImm { .. }
+                | LineKind::MoveWide { .. }
+                | LineKind::Sxtw { .. }
+                | LineKind::Compare
+                | LineKind::Alu => {
+                    j += 1;
+                    continue;
+                }
+                // Labels, branches, calls, pair/unknown memory ops, anything
+                // else: stop. `Other` covers unknown instructions that might
+                // touch memory, so it stops the scan too.
+                _ => break,
+            }
+        }
+    }
+    changed
+}
+
+/// Branch target label of a (sub-)line, for plain/conditional/compare branches.
+fn any_branch_target(trimmed: &str) -> Option<&str> {
+    if let Some(rest) = trimmed.strip_prefix("b ") {
+        let t = rest.trim();
+        if t.starts_with('.') {
+            return Some(t);
+        }
+        return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix("b.") {
+        if let Some((_, t)) = rest.split_once(' ') {
+            let t = t.trim();
+            if t.starts_with('.') {
+                return Some(t);
+            }
+        }
+        return None;
+    }
+    for p in ["cbz ", "cbnz ", "tbz ", "tbnz "] {
+        if trimmed.starts_with(p) {
+            if let Some((_, t)) = trimmed.rsplit_once(", ") {
+                let t = t.trim();
+                if t.starts_with('.') {
+                    return Some(t);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn sink_loop_carried_stores(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_STORE_SINK").is_ok() {
+        return false;
+    }
+    // Flatten to virtual sub-lines: rotation leaves multi-line slots whose
+    // embedded latch branches this pass must still see.
+    let mut v: Vec<(usize, usize, String)> = Vec::new(); // (slot, sub_idx, text)
+    for i in 0..n {
+        if kinds[i] == LineKind::Nop {
+            continue;
+        }
+        for (si, sub) in lines[i].split('\n').enumerate() {
+            let t = sub.trim();
+            if !t.is_empty() {
+                v.push((i, si, t.to_string()));
+            }
+        }
+    }
+    let nv = v.len();
+    // Label name -> virtual index.
+    let mut labels: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (vi, (_, _, t)) in v.iter().enumerate() {
+        if let Some(name) = t.strip_suffix(':') {
+            labels.insert(name, vi);
+        }
+    }
+    // Find loop regions: a conditional backward branch ends a bottom-tested
+    // loop whose exit is the fall-through past the branch.
+    let mut regions: Vec<(usize, usize)> = Vec::new(); // (head vi, backedge vi)
+    for vj in 0..nv {
+        let t = &v[vj].2;
+        let conditional = t.starts_with("b.")
+            || t.starts_with("cbz ")
+            || t.starts_with("cbnz ")
+            || t.starts_with("tbz ")
+            || t.starts_with("tbnz ");
+        if !conditional {
+            continue;
+        }
+        let Some(target) = any_branch_target(t) else { continue };
+        let Some(&vi) = labels.get(target) else { continue };
+        if vi < vj {
+            regions.push((vi, vj));
+        }
+    }
+    // Largest regions first: sink each store as far out as possible.
+    regions.sort_by_key(|&(h, j)| std::cmp::Reverse(j - h));
+
+    let mut sunk_slot: Vec<bool> = vec![false; n];
+    // (store slot, store text, backedge slot, backedge sub_idx)
+    let mut edits: Vec<(usize, String, usize, usize)> = Vec::new();
+
+    for &(h, j) in &regions {
+        // Region-level hazards: calls, returns, or branches to unknown labels.
+        let mut region_bad = false;
+        for p in h..=j {
+            let t = &v[p].2;
+            if t.starts_with("bl ") || t.starts_with("blr ") || t == "ret" {
+                region_bad = true;
+                break;
+            }
+            if let Some(tgt) = any_branch_target(t) {
+                if !labels.contains_key(tgt) {
+                    region_bad = true;
+                    break;
+                }
+            }
+        }
+        if region_bad {
+            continue;
+        }
+        // The backedge slot must contain no other backward branch: splicing
+        // would shift the second branch's sub-index.
+        let bslot = v[j].0;
+        let mut other_backedge = false;
+        for p in h..j {
+            if v[p].0 != bslot {
+                continue;
+            }
+            if let Some(tgt) = any_branch_target(&v[p].2) {
+                if let Some(&tp) = labels.get(tgt) {
+                    if tp < p {
+                        other_backedge = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if other_backedge {
+            continue;
+        }
+        // Exit branches: any branch in the region targeting outside it.
+        // (The backedge at j targets the head, which is inside.)
+        let mut exits: Vec<usize> = Vec::new();
+        for p in h..j {
+            if let Some(tgt) = any_branch_target(&v[p].2) {
+                let tp = labels[tgt];
+                if tp < h || tp > j {
+                    exits.push(p);
+                }
+            }
+        }
+        // Candidate stores.
+        for k in (h + 1)..j {
+            let (slot, _, ref text) = v[k];
+            if sunk_slot[slot] || lines[slot].contains('\n') {
+                continue; // already sunk, or not a standalone line
+            }
+            if !matches!(kinds[slot], LineKind::StoreSp { .. } | LineKind::MemOther) {
+                continue;
+            }
+            let Some((num, off)) = parse_sp_store_any(text) else { continue };
+            let debug = std::env::var("CCC_SINK_DEBUG").is_ok();
+            let slot_ref = format!("[sp, #{}]", off);
+            let mut bad = false;
+            // (a) Nothing else in the region references this slot.
+            for p in h..=j {
+                if p == k {
+                    continue;
+                }
+                let t = &v[p].2;
+                if t.contains(&slot_ref) {
+                    bad = true;
+                    break;
+                }
+                // Pair ops cover a range: stp/ldp at base M spans M..M+16.
+                if t.starts_with("stp ") || t.starts_with("ldp ") {
+                    if let Some(base) = extract_sp_offset(t) {
+                        if base <= off && off < base + 16 {
+                            bad = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if bad && debug {
+                eprintln!("sink bail: {} (slot re-referenced in region)", text);
+            }
+            // (b) No exiting branch anywhere (v1: fall-through exit only).
+            if !bad && !exits.is_empty() {
+                bad = true;
+                if debug {
+                    eprintln!("sink bail: {} ({} exit branches)", text, exits.len());
+                }
+            }
+            // (c) No labels between the store and the backedge (no way to
+            // reach the exit without passing the store), and none before the
+            // store either except the head (every path to the exit passes k).
+            if !bad {
+                for p in (h + 1)..j {
+                    if p == k {
+                        continue;
+                    }
+                    if v[p].2.ends_with(':') {
+                        bad = true;
+                        if debug {
+                            eprintln!("sink bail: {} (label {} in region)", text, v[p].2);
+                        }
+                        break;
+                    }
+                }
+            }
+            // (d) The stored register survives to the backedge.
+            if !bad {
+                for p in (k + 1)..=j {
+                    if instr_clobbers_reg(&v[p].2, num) {
+                        bad = true;
+                        if debug {
+                            eprintln!("sink bail: {} (clobbered by {})", text, v[p].2);
+                        }
+                        break;
+                    }
+                }
+            }
+            if bad {
+                continue;
+            }
+            sunk_slot[slot] = true;
+            edits.push((slot, format!("    {}", text), v[j].0, v[j].1));
+            if debug {
+                eprintln!("sink ok: {}", text);
+            }
+        }
+    }
+
+    if edits.is_empty() {
+        return false;
+    }
+    for (slot, _, _, _) in &edits {
+        kinds[*slot] = LineKind::Nop;
+    }
+    // Splice each sunk store into the backedge slot, right after the branch.
+    // Insertions land after the backedge sub-line, so it keeps its original
+    // sub-index no matter how many stores are spliced in.
+    for (_, text, bj, bsub) in &edits {
+        let mut subs: Vec<&str> = lines[*bj].split('\n').collect();
+        subs.insert(bsub + 1, text.as_str());
+        lines[*bj] = subs.join("\n");
+        kinds[*bj] = LineKind::Other;
+    }
+    true
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -3374,5 +3795,96 @@ f:
         // x0 is read after the chain: folding would lose the zext value.
         let result = peephole_optimize(input.to_string());
         assert!(result.contains("mov w0, w0"), "live accumulator blocks fold:\n{}", result);
+    }
+
+    #[test]
+    fn test_sink_loop_carried_store() {
+        // Bottom-tested loop: the slot is never read inside, the value stays
+        // live in x20; the store can be sunk to the fall-through exit.
+        let input = "\
+f:
+    mov x20, #0
+    movz x21, #100
+    b .Lguard
+.Lbody:
+    sxtw x22, w20
+    add x0, x22, x20
+    str x0, [sp, #24]
+    mov x20, x0
+    cmp w20, w21
+    b.le .Lbody
+    b .Lexit
+.Lguard:
+    cmp w20, w21
+    b.le .Lbody
+    b .Lexit
+.Lexit:
+    ldr x0, [sp, #24]
+    ret
+";
+        let result = {
+            let mut lines: Vec<String> = input.lines().map(String::from).collect();
+            let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+            let n = lines.len();
+            let changed = sink_loop_carried_stores(&mut lines, &mut kinds, n);
+            let out = lines
+                .iter()
+                .zip(kinds.iter())
+                .filter(|(_, k)| **k != LineKind::Nop)
+                .map(|(l, _)| l.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(changed, "store should be sunk:\n{}", out);
+            out
+        };
+        // Exactly one store remains, on the exit path after the backedge.
+        assert_eq!(result.matches("str x0, [sp, #24]").count(), 1, "\n{}", result);
+        let be = result.find("b.le .Lbody").unwrap();
+        let st = result.find("str x0, [sp, #24]").unwrap();
+        assert!(st > be, "store after backedge:\n{}", result);
+    }
+
+    #[test]
+    fn test_sink_blocked_when_slot_read_in_loop() {
+        let input = "\
+f:
+    mov x20, #0
+.Lbody:
+    ldr x0, [sp, #24]
+    add x0, x0, x20
+    str x0, [sp, #24]
+    mov x20, x0
+    cmp w20, w21
+    b.le .Lbody
+    ldr x0, [sp, #24]
+    ret
+";
+        let mut lines: Vec<String> = input.lines().map(String::from).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let n = lines.len();
+        assert!(!sink_loop_carried_stores(&mut lines, &mut kinds, n));
+    }
+
+    #[test]
+    fn test_sink_blocked_by_mid_loop_exit() {
+        let input = "\
+f:
+    mov x20, #0
+.Lbody:
+    cmp w20, w22
+    b.gt .Lexit
+    add x0, x20, #1
+    str x0, [sp, #24]
+    mov x20, x0
+    cmp w20, w21
+    b.le .Lbody
+.Lexit:
+    ldr x0, [sp, #24]
+    ret
+";
+        let mut lines: Vec<String> = input.lines().map(String::from).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let n = lines.len();
+        assert!(!sink_loop_carried_stores(&mut lines, &mut kinds, n));
     }
 }

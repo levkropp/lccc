@@ -35,6 +35,33 @@ architectural, not pass-level. This doc records the evidence and the plan.
   horizontal reduce. Legality requires the marching pointer's preheader GEP
   offset == c*elem; the remainder start/limit are shifted by c so coverage is
   exactly [c, n) (loop_patterns -7.2% interleaved A/B).
+- Overwritten-store peephole (eliminate_overwritten_stores): local,
+  block-scoped analog of GDSE for `str R,[sp,#off]` overwritten by a later
+  store with no intervening read. Catches what GDSE misses when it bails on
+  a whole function over one escaped frame base (strlen_bench itoa loop:
+  3 stores -> 1 per iteration).
+- Loop-carried store sinking (sink_loop_carried_stores): a `str R,[sp,#off]`
+  in a bottom-tested loop whose slot is never referenced elsewhere in the
+  loop, with no mid-loop exits, no interior labels, and R surviving to the
+  backedge, moves to the fall-through exit (stored once per loop instead of
+  once per iteration). Fires on sieve's marking loop; most other candidates
+  across the suite fail the strict conditions (mid-loop exits, slot reloads,
+  or interior labels) — extending it needs dedicated-exit-label analysis.
+
+## Latent bug fixed this session (was committed as a0791ef9)
+
+- a0791ef9's direct call-arg staging (skip x9-x16 temps when no int arg
+  source is in x0-x7) loaded int args into x0-x7 FIRST, then emitted FP args
+  — but emit_call_fp_reg_args routes every FP arg through the x0 scratch
+  (`emit_load_arg_to_reg(arg, "x0", ...)` + `fmov dN, x0`). The FP material-
+  ization clobbered the staged format pointer: float_cast/union_type_punning/
+  float_special/varargs_mixed_types segfaulted or miscompiled (correctness
+  44/50 on the real binary). The a0791ef9 validation had run against a STALE
+  binary (virtiofs mtime skip) — lesson: touch changed files and confirm the
+  binary hash changes before trusting suite results. Fix: emit FP args before
+  int-arg staging in the fast path (x0 still free), matching the slow path's
+  ordering guarantee. Correctness back to 48/50.
+
 
 ## Reverted / documented dead-ends (measured, do not retry)
 
@@ -61,6 +88,19 @@ architectural, not pass-level. This doc records the evidence and the plan.
 - fmsub/fnmsub fusion of `a - b*c` on accumulator update chains lengthens
   the serial dependency (fmsub latency > fsub): nbody +13%. Shipped GATED
   (e3b21b8f): accumulator-feeding Subs stay split (mandelbrot -1.4%).
+- 32-bit move propagation in propagate_register_copies: arith_loop -4.5%
+  but qsort +4.5% / hash_table +3.4% (rewriting uses onto the source
+  register extends its live range in tight loops). Net negative; reverted.
+- F64 values in split_call_spanning_ranges (to free the d8-d14 restricted
+  pool from call-spanning constants): segfaults nbody/struct_copy/
+  spectral_norm — the split's store/reload + phi insertion is not F64-safe.
+- Bidirectional real_use propagation for FP copy webs (even restricted to
+  multi-def/loop-carried dests): makes loop-accumulator webs FP-register
+  candidates but crashes matmul/nbody/struct_copy — the phi-coalesce
+  inheritance path is not sound for these webs. The mandelbrot per-iteration
+  accumulator store/fmov remains UNFIXED; it needs either point-level
+  coalesce-conflict validation or the whole-function slot-read analysis
+  (roadmap item 1) so the post-loop read uses the register directly.
 - Exact per-register occupancy lists in the linear scan (replacing the
   free_until approximation so priority-ordered scans reuse registers across
   disjoint windows): initially HUNG fannkuch. Root cause found: the indexed
