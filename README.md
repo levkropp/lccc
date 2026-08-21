@@ -5,7 +5,7 @@
 > and i686. LCCC adds a linear-scan register allocator with hot-loop register steal, phi
 > coalescing for both registers and stack slots, SIMD auto-vectorization (AVX2/SSE2 on x86-64,
 > NEON on AArch64), tail-call and recursion-to-iteration transforms, and per-target peephole
-> optimizers. **~1.3× of GCC -O2** on the 18-benchmark suite (AArch64), **500× faster** on
+> optimizers. **~1.1× of GCC -O2** on the 18-benchmark suite (AArch64), **600× faster** on
 > naive recursive benchmarks, and it compiles real software like SQLite.
 
 **[Documentation](https://levkropp.github.io/lccc/)** ·
@@ -58,42 +58,47 @@ All 18 outputs are byte-identical to GCC.
 
 | Benchmark | LCCC | GCC -O2 | LCCC / GCC |
 |-----------|-----:|--------:|:----------:|
-| `arith_loop` — 32-var arithmetic loop | 0.045 s | 0.031 s | 1.47× |
-| `fib` — fib(40) recursive | <0.001 s | 0.094 s | **~500× faster** |
-| `matmul` — 256×256 matrix multiply | 0.0029 s | 0.0029 s | **1.01× (parity)** |
-| `qsort` — quicksort 1M integers | 0.081 s | 0.072 s | 1.13× |
-| `sieve` — Eratosthenes 10M | 0.025 s | 0.017 s | 1.53× |
-| `tce_sum` — tail-recursive sum(10M) | 0.0002 s | 0.0002 s | 1.0× (GCC const-folds it) |
-| `nbody` — N-body simulation | 0.284 s | 0.172 s | 1.66× |
-| `binary_trees` — malloc/free recursion | 0.934 s | 0.772 s | 1.21× |
-| `spectral_norm` — FP dense loops | 0.175 s | 0.137 s | 1.28× |
-| `mandelbrot` — FP inner loop | 0.820 s | 0.498 s | 1.65× |
-| `hash_table` — pointer chasing | 12.01 s | 9.18 s | 1.31× |
-| `strlen_bench` — string processing | 0.159 s | 0.137 s | 1.16× |
-| `switch_dispatch` — jump tables | 0.444 s | 0.346 s | 1.28× |
-| `struct_copy` — struct copy/field access | 0.027 s | 0.012 s | 2.31× |
-| `loop_patterns` — reduce/transform/prefix | 0.059 s | 0.032 s | 1.83× |
-| `fannkuch` — Fannkuch-Redux | 3.82 s | 1.97 s | 1.94× |
-| `ackermann` — ackermann(3,11) | <0.001 s | 0.097 s | **~500× faster** |
-| `bitops` — popcount/clz/reverse | 0.103 s | 0.172 s | **1.7× faster** |
+| `arith_loop` — 32-var arithmetic loop | 0.035 s | 0.030 s | 1.15× |
+| `fib` — fib(40) recursive | <0.001 s | 0.091 s | **~600× faster** |
+| `matmul` — 256×256 matrix multiply | 0.0024 s | 0.0029 s | **1.17× faster** |
+| `qsort` — quicksort 1M integers | 0.080 s | 0.071 s | 1.12× |
+| `sieve` — Eratosthenes 10M | 0.019 s | 0.016 s | 1.15× |
+| `tce_sum` — tail-recursive sum(10M) | 0.0001 s | 0.0001 s | 1.0× (GCC const-folds it) |
+| `nbody` — N-body simulation | 0.218 s | 0.166 s | 1.31× |
+| `binary_trees` — malloc/free recursion | 0.908 s | 0.755 s | 1.20× |
+| `spectral_norm` — FP dense loops | 0.165 s | 0.139 s | 1.19× |
+| `mandelbrot` — FP inner loop | 0.663 s | 0.502 s | 1.32× |
+| `hash_table` — pointer chasing | 11.47 s | 9.16 s | 1.25× |
+| `strlen_bench` — string processing | 0.160 s | 0.139 s | 1.16× |
+| `switch_dispatch` — jump tables | 0.418 s | 0.348 s | 1.20× |
+| `struct_copy` — struct copy/field access | 0.014 s | 0.011 s | 1.20× |
+| `loop_patterns` — reduce/transform/prefix | 0.030 s | 0.031 s | **1.0× (parity)** |
+| `fannkuch` — Fannkuch-Redux | 3.34 s | 1.81 s | 1.85× |
+| `ackermann` — ackermann(3,11) | <0.001 s | 0.098 s | **~600× faster** |
+| `bitops` — popcount/clz/reverse | 0.092 s | 0.169 s | **1.8× faster** |
 
-**Geometric mean: 0.64× of GCC -O2** overall — skewed by the two ~500×
-recursion-to-iteration wins; excluding those, **~1.34×** across the remaining 16.
+**Geometric mean: 0.55× of GCC -O2** overall — skewed by the two ~600×
+recursion-to-iteration wins; excluding those, **1.12×** across the remaining 16.
 
 What drives the wins:
 
-- **fib / ackermann ~500×**: binary recursion-to-iteration converts exponential O(2^n)
+- **fib / ackermann ~600×**: binary recursion-to-iteration converts exponential O(2^n)
   recursion into an O(n) iterative sliding-window loop. GCC keeps the recursive calls.
-- **matmul 1.0×**: NEON FMA vectorization on AArch64 (AVX2 FMA3 on x86-64), with loop-aware
-  inlining and F64 accumulators promoted into FP registers across the inner loop.
-- **fannkuch 2.7× → 1.94×, arith_loop 2.1× → 1.47×** (recent work): a post-scan *register
+- **matmul 1.17× faster**: NEON FMA vectorization on AArch64 (AVX2 FMA3 on x86-64), with
+  loop-aware inlining and F64 accumulators promoted into FP registers across the inner loop.
+- **loop_patterns 1.83× → parity** (recent work): NEON reduction vectorization now covers
+  plain sums, i32→i64 widening sums (sadalp), dot products (smlal/smlal2 with split
+  accumulators), conditional sums (`smax` clamp), and max reductions (`smax`/`smaxv`).
+- **fannkuch 2.7× → 1.85×, arith_loop 2.1× → 1.15×**: a post-scan *register
   steal* gives hot inner-loop-carried values (IVs, accumulators, carried pointers) callee-saved
   registers that cold function-spanning values would otherwise win purely by starting first —
   done as a conflict-safe full deallocation of the evicted holder, never range splitting.
   *Loop-backedge slot coalescing* gives a spilled loop variable's update the variable's own
   stack slot (proven safe by the phi-coalesce detector), deleting the per-iteration
-  `ldr`+`str` shuffle — 22 instructions/iteration gone in arith_loop alone.
-- **bitops 1.7× faster than GCC**: popcount/clz/reverse lower to single AArch64 instructions.
+  `ldr`+`str` shuffle.
+- **struct_copy 2.31× → 1.20×**: aggregate memcpy-temp forwarding, full unrolling of small
+  constant-trip loops, and ldp/stp adjacent-field pair fusion.
+- **bitops 1.8× faster than GCC**: popcount/clz/reverse lower to single AArch64 instructions.
 
 **Compile time:** LCCC compiles **2–5× faster** than GCC across all benchmarks.
 
@@ -129,11 +134,11 @@ original CCC was 737× slower than GCC on SQLite. LCCC addresses every major iss
 | No function inlining | Loop-aware inlining pass with heuristics |
 | No vectorization | AVX2/SSE2 on x86-64, NEON on AArch64 |
 | 2.78× code bloat | Down to ~1.7× GCC .text on SQLite |
-| 737× slower runtime | ~1.3× of GCC -O2 on the benchmark suite |
+| 737× slower runtime | ~1.1× of GCC -O2 on the benchmark suite |
 | Corrupted frame pointers | CFI directives, frame pointer omission |
 
-Known correctness gaps are tracked by the test suites (6 failures in the 50-test correctness
-suite, 4 in the progressive suite — struct passing, designated initializers, multi-dim arrays,
+Known correctness gaps are tracked by the test suites (5 failures in the 50-test correctness
+suite, 3 in the progressive suite — struct passing, designated initializers, multi-dim arrays,
 string arrays, typedef complexity, void-pointer arithmetic).
 
 ---
@@ -274,22 +279,22 @@ updates/        Historical optimization write-ups (kept for the record)
 
 Current priorities, driven by the benchmark suite:
 
-- **struct_copy (2.31×)** — scalarize struct copies (SRoA-style) instead of memcpy
-- **loop_patterns (1.83×)** — NEON accumulator spill elimination in reduction loops
-- **nbody / mandelbrot (~1.65×)** — FP codegen: fewer GPR↔FP round-trips, better scheduling
-- **sieve (1.53×)** — memory-write loop tightening
-- Correctness: close the 6 remaining correctness-suite failures (struct passing, designated
+- **fannkuch (1.85×)** — loop-nested live-range splitting: inner-loop scalars spill because
+  outer-loop values pin the GPR pool across the whole body
+- **mandelbrot / nbody (~1.3×)** — FP codegen: fewer GPR↔FP round-trips, better scheduling
+- **hash_table (1.25×)** — pointer-chasing load/store tightening
+- Correctness: close the 5 remaining correctness-suite failures (struct passing, designated
   initializers, multi-dim arrays)
 
 The goal is not to beat GCC — it's to make CCC-compiled programs fast enough for real systems
-software, targeting within ~1.5× of GCC on typical workloads.
+software. Typical workloads now run within **~1.12× of GCC -O2**.
 
 ---
 
 ## Testing
 
 ```bash
-# Unit tests (536 pass, 6 ignored)
+# Unit tests (563 pass, 6 ignored)
 cargo test --release
 
 # Correctness suite (50 programs, vs GCC output)

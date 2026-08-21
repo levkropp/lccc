@@ -105,7 +105,7 @@ make CC=/path/to/lccc/target/release/lccc CFLAGS="$GCC_INC -O2"
 ## Run the Test Suites
 
 ```bash
-# Unit tests (536 pass)
+# Unit tests (563 pass)
 cargo test --release
 
 # 18-benchmark suite (performance + correctness + size)

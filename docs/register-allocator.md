@@ -148,7 +148,7 @@ pub struct LinearScanAllocator {
 
 | Benchmark | Δ | Mechanism |
 |-----------|---|-----------|
-| `fannkuch` | 2.69× → **1.94×** vs GCC | Register steal houses flip-loop pointers/IVs |
-| `arith_loop` | 2.09× → **1.47×** vs GCC | Loop-backedge slot coalescing |
-| `spectral_norm` | 1.63× → **1.28×** vs GCC | Steal + F64 loop promotion |
-| `matmul` | **1.01×** (parity) | NEON vector ops + FP register pools |
+| `fannkuch` | 2.69× → **1.85×** vs GCC | Register steal houses flip-loop pointers/IVs |
+| `arith_loop` | 2.09× → **1.15×** vs GCC | Loop-backedge slot coalescing |
+| `spectral_norm` | 1.63× → **1.19×** vs GCC | Steal + F64 loop promotion |
+| `matmul` | **1.17× faster** | NEON vector ops + FP register pools |

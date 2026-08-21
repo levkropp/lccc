@@ -147,7 +147,7 @@ When CCC's phi elimination lowers SSA phi nodes to Copy instructions, it creates
 
 LCCC aliases the backedge update into the phi destination's slot whenever the phi-coalesce detector proves the old value is dead after the update is defined — including the common constant-initializer case, which the earlier sole-use analysis never covered. The Copy becomes a same-slot no-op and is dropped by `generate_copy`.
 
-**Result (AArch64):** `arith_loop`: 2.09× → 1.47× vs GCC (22 instructions/iteration eliminated); also lifts fannkuch and spectral_norm.
+**Result (AArch64):** `arith_loop`: 2.09× → 1.15× vs GCC (22 instructions/iteration eliminated); also lifts fannkuch and spectral_norm.
 
 ## LCCC-Specific: Reduction Vectorization
 

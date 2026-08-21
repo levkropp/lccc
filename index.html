@@ -44,12 +44,12 @@ title: LCCC — Lev's Claude's C Compiler
         </tr>
       </thead>
       <tbody>
-        <tr><td><code>arith_loop</code></td><td>0.045s</td><td>0.031s</td><td class="slower">1.47×</td></tr>
-        <tr><td><code>matmul</code></td><td class="faster">0.0029s</td><td>0.0029s</td><td class="faster">1.01× parity</td></tr>
-        <tr><td><code>spectral_norm</code></td><td>0.175s</td><td>0.137s</td><td class="slower">1.28×</td></tr>
-        <tr><td><code>fib(40)</code></td><td class="faster">0.000s</td><td>0.094s</td><td class="faster">~500× faster</td></tr>
-        <tr><td><code>bitops</code></td><td class="faster">0.103s</td><td>0.172s</td><td class="faster">1.7× faster</td></tr>
-        <tr><td><code>fannkuch</code></td><td>3.82s</td><td>1.97s</td><td class="slower">1.94×</td></tr>
+        <tr><td><code>arith_loop</code></td><td>0.035s</td><td>0.030s</td><td class="slower">1.15×</td></tr>
+        <tr><td><code>matmul</code></td><td class="faster">0.0024s</td><td>0.0029s</td><td class="faster">1.17× faster</td></tr>
+        <tr><td><code>spectral_norm</code></td><td>0.165s</td><td>0.139s</td><td class="slower">1.19×</td></tr>
+        <tr><td><code>fib(40)</code></td><td class="faster">0.000s</td><td>0.091s</td><td class="faster">~600× faster</td></tr>
+        <tr><td><code>bitops</code></td><td class="faster">0.092s</td><td>0.169s</td><td class="faster">1.8× faster</td></tr>
+        <tr><td><code>fannkuch</code></td><td>3.34s</td><td>1.81s</td><td class="slower">1.85×</td></tr>
       </tbody>
     </table>
   </div>
@@ -109,7 +109,7 @@ title: LCCC — Lev's Claude's C Compiler
     <div class="card">
       <div class="card-icon">🔭</div>
       <h3>536 tests passing</h3>
-      <p>536 unit tests, 18/18 benchmark outputs byte-identical to GCC, and the SQLite amalgamation (260K lines) compiles and runs correctly.</p>
+      <p>563 unit tests, 18/18 benchmark outputs byte-identical to GCC, and the SQLite amalgamation (260K lines) compiles and runs correctly.</p>
     </div>
   </div>
 </section>
@@ -176,60 +176,60 @@ raw_aliases.push((backedge_src, phi_dest));  <span class="cm">// certified by de
         <tr>
           <td><code>arith_loop</code></td>
           <td>32-var arithmetic, register pressure</td>
-          <td>0.045s</td>
-          <td class="baseline">0.031s</td>
-          <td class="slower">1.47×</td>
+          <td>0.035s</td>
+          <td class="baseline">0.030s</td>
+          <td class="slower">1.15×</td>
         </tr>
         <tr>
           <td><code>matmul</code></td>
           <td>256×256 double matrix multiply</td>
-          <td class="faster">0.0029s</td>
+          <td class="faster">0.0024s</td>
           <td class="baseline">0.0029s</td>
-          <td class="faster">1.01× parity</td>
+          <td class="faster">1.17× faster</td>
         </tr>
         <tr>
           <td><code>spectral_norm</code></td>
           <td>FP dense loops</td>
-          <td>0.175s</td>
-          <td class="baseline">0.137s</td>
-          <td class="slower">1.28×</td>
+          <td>0.165s</td>
+          <td class="baseline">0.139s</td>
+          <td class="slower">1.19×</td>
         </tr>
         <tr>
           <td><code>fib(40)</code></td>
           <td>Recursive Fibonacci</td>
           <td class="faster">0.000s</td>
-          <td class="baseline">0.094s</td>
-          <td class="faster">~500× faster</td>
+          <td class="baseline">0.091s</td>
+          <td class="faster">~600× faster</td>
         </tr>
         <tr>
           <td><code>bitops</code></td>
           <td>popcount / clz / bit reverse</td>
-          <td class="faster">0.103s</td>
-          <td class="baseline">0.172s</td>
-          <td class="faster">1.7× faster</td>
+          <td class="faster">0.092s</td>
+          <td class="baseline">0.169s</td>
+          <td class="faster">1.8× faster</td>
         </tr>
         <tr>
           <td><code>fannkuch</code></td>
           <td>Fannkuch-Redux permutations</td>
-          <td>3.82s</td>
-          <td class="baseline">1.97s</td>
-          <td class="slower">1.94×</td>
+          <td>3.34s</td>
+          <td class="baseline">1.81s</td>
+          <td class="slower">1.85×</td>
         </tr>
       </tbody>
     </table>
   </div>
 
   <p style="margin-top:1rem">
-    Across the full 18-benchmark suite LCCC is at <strong>~1.34× of GCC -O2</strong>
-    (0.64× geomean including the two ~500× recursion-to-iteration wins), with
-    <code>matmul</code> at parity and <code>bitops</code> faster than GCC.
-    Full table and per-optimization analysis on the
+    Across the full 18-benchmark suite LCCC is at <strong>1.12× of GCC -O2</strong>
+    (0.55× geomean including the two ~600× recursion-to-iteration wins), with
+    <code>matmul</code> and <code>bitops</code> faster than GCC and <code>loop_patterns</code>
+    at parity. Full table and per-optimization analysis on the
     <a href="/lccc/docs/benchmarks">benchmarks page</a>.
   </p>
 
   <div class="badges">
     <span class="badge badge-amber">✓ 18/18 outputs match GCC</span>
-    <span class="badge badge-teal">536 unit tests passing</span>
+    <span class="badge badge-teal">563 unit tests passing</span>
     <span class="badge badge-gray">GCC -O2 · AArch64 Linux</span>
   </div>
 </section>
@@ -242,30 +242,31 @@ raw_aliases.push((backedge_src, phi_dest));  <span class="cm">// certified by de
   <h2>What's new</h2>
   <p>
     Recent work on the AArch64 backend moved the suite geomean from 0.86× to
-    <strong>0.64× of GCC -O2</strong> — including a register steal for hot loop values,
-    loop-backedge stack-slot coalescing, and NEON/F64 loop promotion — plus several
+    <strong>0.55× of GCC -O2</strong> — including a register steal for hot loop values,
+    loop-backedge stack-slot coalescing, NEON/F64 loop promotion, and full reduction
+    vectorization (sums, dot products, conditional sums, max) — plus several
     latent miscompile fixes found along the way.
   </p>
   <div class="cards">
     <div class="card">
       <div class="card-icon">🎯</div>
       <h3>Register steal</h3>
-      <p>Hot inner-loop-carried values (IVs, accumulators, carried pointers) take registers from provably colder scan winners — whole-interval deallocation, never range splitting. fannkuch 2.69× → 1.94×.</p>
+      <p>Hot inner-loop-carried values (IVs, accumulators, carried pointers) take registers from provably colder scan winners — whole-interval deallocation, never range splitting. fannkuch 2.69× → 1.85×.</p>
     </div>
     <div class="card">
       <div class="card-icon">🧩</div>
       <h3>Loop-backedge slot coalescing</h3>
-      <p>A spilled loop variable's update shares the variable's own stack slot, deleting the per-iteration <code>ldr</code>+<code>str</code> shuffle. arith_loop 2.09× → 1.47×.</p>
+      <p>A spilled loop variable's update shares the variable's own stack slot, deleting the per-iteration <code>ldr</code>+<code>str</code> shuffle. arith_loop 2.09× → 1.15×.</p>
     </div>
     <div class="card">
       <div class="card-icon">🧮</div>
-      <h3>NEON + F64 loop promotion</h3>
-      <p>Register-resident F64x2/I32x4 vector ops, <code>fmadd</code> fusion, FP constant hoisting, and loop accumulators promoted into d24–d31. matmul at parity with GCC -O2.</p>
+      <h3>NEON reductions + F64 promotion</h3>
+      <p>Register-resident F64x2/I32x4 vector ops, <code>fmadd</code> fusion, and every reduction shape vectorized — sums (<code>sadalp</code>), dot products (<code>smlal</code>), conditional sums and max (<code>smax</code>/<code>smaxv</code>). matmul 1.17× faster than GCC; loop_patterns at parity.</p>
     </div>
     <div class="card">
       <div class="card-icon">🔁</div>
       <h3>Binary recursion → iteration</h3>
-      <p>Detects <code>f(n) = f(n-1) + f(n-2)</code> and converts exponential O(2ⁿ) recursion to an O(n) iterative loop. <code>fib(40)</code> and <code>ackermann(3,11)</code>: ~500× faster than GCC.</p>
+      <p>Detects <code>f(n) = f(n-1) + f(n-2)</code> and converts exponential O(2ⁿ) recursion to an O(n) iterative loop. <code>fib(40)</code> and <code>ackermann(3,11)</code>: ~600× faster than GCC.</p>
     </div>
   </div>
   <p style="margin-top:1rem">
