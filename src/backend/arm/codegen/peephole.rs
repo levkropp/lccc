@@ -441,6 +441,8 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= eliminate_repeated_slot_loads(&mut lines, &mut kinds, n);
         changed |= fold_destructive_pointer_updates(&mut lines, &mut kinds, n);
         changed |= fuse_branch_over_branch(&mut lines, &mut kinds, n);
+        // After the folds: dead staging movs (their patterns must win first).
+        changed |= eliminate_overwritten_moves(&lines, &mut kinds, n);
         if rotate {
             changed |= rotate_simple_loops(&mut lines, &mut kinds, n);
         }
@@ -482,6 +484,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= fuse_fp_adjacent_pairs(&mut lines, &mut kinds, n);
             changed2 |= eliminate_repeated_slot_loads(&mut lines, &mut kinds, n);
             changed2 |= fold_destructive_pointer_updates(&mut lines, &mut kinds, n);
+            changed2 |= eliminate_overwritten_moves(&lines, &mut kinds, n);
             rounds2 += 1;
         }
     }
@@ -1724,6 +1727,79 @@ fn eliminate_move_chains(lines: &mut [String], kinds: &mut [LineKind], n: usize)
             _ => {}
         }
         i += 1;
+    }
+    changed
+}
+
+// ── Overwritten-move elimination ─────────────────────────────────────────────
+//
+// The accumulator-staging emission leaves dead moves like `mov x0, x22` right
+// before `add x0, x1, x22` (the add overwrites x0 without reading it). Delete
+// any mov/MoveImm whose destination register is provably overwritten before it
+// is read. Same-block, forward scan; any control flow or non-pure-write
+// mention keeps the move.
+fn eliminate_overwritten_moves(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for i in 0..n {
+        let dst = match kinds[i] {
+            LineKind::Move { dst, .. } => dst,
+            LineKind::MoveImm { dst } | LineKind::MoveWide { dst } => dst,
+            _ => continue,
+        };
+        if dst >= 29 {
+            continue; // never touch sp/fp-adjacent registers
+        }
+        let xn = xreg_name(dst);
+        let wn = wreg_name(dst);
+        let mut dead = false;
+        let mut j = i + 1;
+        while j < n {
+            if kinds[j] == LineKind::Nop {
+                j += 1;
+                continue;
+            }
+            match kinds[j] {
+                LineKind::Label | LineKind::Branch | LineKind::CondBranch
+                | LineKind::CmpBranch | LineKind::Call | LineKind::Ret
+                | LineKind::Directive => break,
+                _ => {}
+            }
+            let t = &lines[j];
+            let mentions = t
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .any(|tok| tok == xn || tok == wn);
+            if !mentions {
+                j += 1;
+                continue;
+            }
+            // First mention decides: a pure overwrite (dest written, not read)
+            // makes the earlier move dead; anything else reads it.
+            dead = match kinds[j] {
+                LineKind::Move { dst: d2, src: s2, .. } => d2 == dst && s2 != dst,
+                LineKind::MoveImm { dst: d2 } | LineKind::MoveWide { dst: d2 } => d2 == dst,
+                LineKind::LoadSp { reg, .. } | LineKind::LoadswSp { reg, .. } => reg == dst,
+                LineKind::Alu => {
+                    // Three-operand ALU: first operand is the destination.
+                    // Dead only if dst is that dest and not among the sources.
+                    let t2 = t.trim();
+                    let ops = t2.split_once(' ').map(|x| x.1).unwrap_or("");
+                    let mut parts = ops.splitn(2, ',');
+                    let first = parts.next().unwrap_or("").trim();
+                    let rest = parts.next().unwrap_or("");
+                    let first_is_dst = first == xn || first == wn;
+                    let rest_reads = rest
+                        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                        .any(|tok| tok == xn || tok == wn);
+                    first_is_dst && !rest_reads
+                }
+                _ => false,
+            };
+            break;
+        }
+        if dead {
+            kinds[i] = LineKind::Nop;
+            changed = true;
+        }
     }
     changed
 }
