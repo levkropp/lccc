@@ -90,10 +90,27 @@ architectural, not pass-level. This doc records the evidence and the plan.
 - tail_call_elim::replace_values_in_inst missed Intrinsic::dest_ptr and
   InlineAsm::outputs — dangling uses after substitution passes. Fixed in the
   shared helper.
+- aggregate_copy_forward::eliminate_dead_aggregate_field_stores collapsed
+  unknown pointer offsets (variable GEP, multi-suffix phi) to suffix 0, so a
+  loop reading `long a[N] = {...}` via a marching pointer "covered" only field
+  0 — the 12 remaining init stores were deleted (fib_rec2iter CI failure,
+  correctness 45→48, progressive 19→21). Fixed with an absorbing
+  SUFFIX_UNKNOWN plus periodic coverage analysis: a marching-pointer phi
+  (start s0, constant period p) records loads as the residue classes
+  {s0 + p*j + r}, so stores at unread residues (struct_copy's id/name fields)
+  stay eliminable while same-residue init stores are kept.
+- ARM global_dead_store_elimination resolved loads through sp-derived base
+  registers with a LINEAR text scan: a loop-variant base (marching pointer)
+  contributed only its iteration-0 offset, so init stores covered only by
+  later iterations were deleted. Fixed by marking registers written inside
+  backward-branch regions loop-variant: loads through them count as
+  whole-frame reads and stores through them are never deleted.
 - Lesson: making any pointer-valued SSA value multi-use exercises backend
   fast paths (accumulator reg_cache, text peepholes, fold analyses) that were
   written assuming single-use/immediate consumption. Verify with the
   progressive suite (hash_table_mini catches this class).
+- Lesson: any analysis that maps a pointer register to ONE frame offset is
+  unsound across loop back-edges unless it proves the register loop-invariant.
 
 ## Root cause of the remaining gap (fannkuch 1.95x, struct_copy 1.67x, nbody 1.35x)
 

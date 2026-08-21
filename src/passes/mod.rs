@@ -307,6 +307,19 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str) {
     constant_fold::run(module);
     copy_prop::run(module);
     resolve_asm::resolve_inline_asm_symbols(module);
+    if std::env::var("LCCC_DUMP_IR_PRELOOP").is_ok() {
+        for func in &module.functions {
+            if func.is_declaration { continue; }
+            eprintln!("=== IR(pre-loop) {} ===", func.name);
+            for (bi, b) in func.blocks.iter().enumerate() {
+                eprintln!("  block {} (label {}):", bi, b.label.0);
+                for inst in &b.instructions {
+                    eprintln!("    {:?}", inst);
+                }
+                eprintln!("    term: {:?}", b.terminator);
+            }
+        }
+    }
 }
 
 /// All optimization levels run the same pipeline with the same number of

@@ -33,7 +33,7 @@
 
 // ── Line classification types ────────────────────────────────────────────────
 
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 /// Compact classification of an assembly line.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -459,7 +459,9 @@ pub fn peephole_optimize(asm: String) -> String {
     reuse_stack_loads_within_blocks(&mut lines, &mut kinds, n);
     propagate_register_copies(&mut lines, &mut kinds, n);
     eliminate_dead_call_staging_moves(&lines, &mut kinds, n);
-    global_dead_store_elimination(&lines, &mut kinds, n);
+    if std::env::var("CCC_NO_GDSE").is_err() {
+        global_dead_store_elimination(&lines, &mut kinds, n);
+    }
 
     // Phase 3: Local cleanup after global passes (up to 4 rounds)
     {
@@ -2110,6 +2112,58 @@ fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: us
         return false;
     }
 
+    // Loop-variant base registers: a backward branch means the text between
+    // the label and the branch executes many times, so a register written in
+    // that region takes a different value on every iteration. The linear scan
+    // below sees only one of those values, so resolving a load through such a
+    // register to a single frame range is unsound — reads from later
+    // iterations go unaccounted and the stores they cover get deleted (this
+    // deleted the init stores of `long a[N] = {...}` read via a
+    // marching-pointer loop). Loads through loop-variant bases are treated as
+    // reading the whole frame, and stores through them are never deleted.
+    const WHOLE_FRAME: (i32, i32) = (-(1 << 29), 1 << 30);
+    let mut loop_variant: FxHashSet<u8> = FxHashSet::default();
+    {
+        let mut label_pos: FxHashMap<&str, usize> = FxHashMap::default();
+        for i in 0..n {
+            if kinds[i] == LineKind::Label {
+                label_pos.insert(lines[i].trim().trim_end_matches(':'), i);
+            }
+        }
+        // Prefix-sum the in-loop depth from backward branches.
+        let mut delta = vec![0i32; n + 1];
+        for j in 0..n {
+            let t = lines[j].trim();
+            if !(t.starts_with("b ") || t.starts_with("b.") || t.starts_with("cb") || t.starts_with("tb")) {
+                continue;
+            }
+            let Some(target) = t
+                .split(|c: char| c.is_whitespace() || c == ',')
+                .filter(|s| !s.is_empty())
+                .last()
+            else {
+                continue;
+            };
+            if let Some(&i) = label_pos.get(target) {
+                if i < j {
+                    delta[i] += 1;
+                    delta[j + 1] -= 1;
+                }
+            }
+        }
+        let mut depth = 0i32;
+        for i in 0..n {
+            depth += delta[i];
+            if depth > 0 {
+                for b in 0..29u8 {
+                    if gp_reg_written_broad(&lines[i], b) {
+                        loop_variant.insert(b);
+                    }
+                }
+            }
+        }
+    }
+
     // Phase 1: collect all loaded byte ranges, resolving base-relative forms.
     let mut loaded_ranges: Vec<(i32, i32)> = Vec::new(); // (offset, size)
     let mut base_off: FxHashMap<u8, i32> = FxHashMap::default();
@@ -2121,7 +2175,15 @@ fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: us
             if !is_store {
                 let off = match addr {
                     FpAddr::Sp(off) => Some(off),
-                    FpAddr::Base(b, k) => base_off.get(&b).map(|&o| o + k),
+                    FpAddr::Base(b, k) => {
+                        if loop_variant.contains(&b) {
+                            // Loop-variant base: may read any frame slot.
+                            loaded_ranges.push(WHOLE_FRAME);
+                            None
+                        } else {
+                            base_off.get(&b).map(|&o| o + k)
+                        }
+                    }
                 };
                 if let Some(off) = off {
                     loaded_ranges.push((off, fp_access_width(width)));
@@ -2168,7 +2230,10 @@ fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: us
                         if let Some(bracket) = trimmed.find("[x") {
                             let inner = &trimmed[bracket..];
                             if let Some((b, k)) = parse_base_addr(inner) {
-                                if let Some(&o) = base_off.get(&b) {
+                                if loop_variant.contains(&b) {
+                                    // Loop-variant base: may read any frame slot.
+                                    loaded_ranges.push(WHOLE_FRAME);
+                                } else if let Some(&o) = base_off.get(&b) {
                                     loaded_ranges.push((o + k, sz));
                                 }
                             }
@@ -2194,7 +2259,16 @@ fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: us
                     Some((true, _reg, addr, width)) => {
                         let off = match addr {
                             FpAddr::Sp(off) => Some(off),
-                            FpAddr::Base(b, k) => base_off.get(&b).map(|&o| o + k),
+                            FpAddr::Base(b, k) => {
+                                if loop_variant.contains(&b) {
+                                    // Loop-variant base: the store hits a
+                                    // different slot each iteration — the
+                                    // single recorded range proves nothing.
+                                    None
+                                } else {
+                                    base_off.get(&b).map(|&o| o + k)
+                                }
+                            }
                         };
                         off.map(|o| (o, fp_access_width(width)))
                     }

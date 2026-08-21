@@ -17,34 +17,126 @@ fn type_size(ty: crate::common::types::IrType) -> i64 {
 
 /// Remove stores to fields of non-escaping stack aggregates that are never read.
 fn eliminate_dead_aggregate_field_stores(func: &mut IrFunction) -> usize {
+    if std::env::var("CCC_NO_AGG_DSE").is_ok() {
+        return 0;
+    }
     // Track aggregate roots separately from precise paths. Loop pointer phis
     // commonly merge offsets 0 and 48; they still share the same allocation
     // root even though `pointer_paths` deliberately rejects the differing paths.
+    //
+    // The suffix is the byte offset within the aggregate when it is statically
+    // known. SUFFIX_UNKNOWN marks pointers whose offset cannot be proven
+    // (variable GEP offset, or a phi merging different offsets): a load through
+    // such a pointer may touch ANY field, so the whole aggregate counts as read
+    // and no field store may be deleted. (Collapsing an unknown offset to 0
+    // previously recorded only field 0 as read, deleting the init stores of
+    // `long a[N] = {...}` when the array was read via a marching pointer.)
+    const SUFFIX_UNKNOWN: i64 = i64::MIN;
     let mut root_suffix: FxHashMap<u32, (u32, i64)> = FxHashMap::default();
+    let mut alloca_size: FxHashMap<u32, i64> = FxHashMap::default();
+    // Marching-pointer phis: phi dest -> (start suffix, constant step). A load
+    // through such a phi covers a one-sided range ([start, size) for a positive
+    // step, [0, start] for a negative one) instead of the whole aggregate, so
+    // stores outside the marched region remain eliminable.
+    let mut march_range: FxHashMap<u32, (i64, i64)> = FxHashMap::default();
     for block in &func.blocks { for inst in &block.instructions {
-        if let Instruction::Alloca { dest, .. } = inst { root_suffix.insert(dest.0, (dest.0, 0)); }
+        if let Instruction::Alloca { dest, size, .. } = inst {
+            root_suffix.insert(dest.0, (dest.0, 0));
+            alloca_size.insert(dest.0, *size as i64);
+        }
     }}
     loop {
         let mut changed = false;
         for block in &func.blocks { for inst in &block.instructions {
             let derived = match inst {
-                Instruction::GetElementPtr { dest, base, offset, .. } => root_suffix.get(&base.0).copied().map(|(root, suffix)| {
-                    let next = match offset { Operand::Const(c) => suffix + c.to_i64().unwrap_or(0), Operand::Value(_) => 0 };
-                    (dest.0, (root, next))
-                }),
-                Instruction::Copy { dest, src: Operand::Value(src) } => root_suffix.get(&src.0).copied().map(|p| (dest.0, p)),
+                Instruction::GetElementPtr { dest, base, offset, .. } => {
+                    // A constant-offset GEP off a marched pointer is marched
+                    // with the same period, shifted by the offset.
+                    if let (Some(&m), Operand::Const(c)) = (march_range.get(&base.0), offset) {
+                        if let Some(k) = c.to_i64() {
+                            if march_range.insert(dest.0, (m.0 + k, m.1)).is_none() { changed = true; }
+                        }
+                    }
+                    root_suffix.get(&base.0).copied().map(|(root, suffix)| {
+                        let next = match offset {
+                            _ if suffix == SUFFIX_UNKNOWN => SUFFIX_UNKNOWN,
+                            Operand::Const(c) => suffix + c.to_i64().unwrap_or(0),
+                            Operand::Value(_) => SUFFIX_UNKNOWN,
+                        };
+                        (dest.0, (root, next))
+                    })
+                }
+                Instruction::Copy { dest, src: Operand::Value(src) } => {
+                    if let Some(&m) = march_range.get(&src.0) {
+                        if march_range.insert(dest.0, m).is_none() { changed = true; }
+                    }
+                    root_suffix.get(&src.0).copied().map(|p| (dest.0, p))
+                }
                 Instruction::Phi { dest, incoming, .. } => {
                     let vals: Vec<(u32, i64)> = incoming.iter().filter_map(|(op, _)| match op {
                         Operand::Value(v) => root_suffix.get(&v.0).copied(), _ => None }).collect();
                     if !vals.is_empty() && vals.iter().all(|p| p.0 == vals[0].0) {
-                        let suffix = if vals.iter().all(|p| p.1 == vals[0].1) { vals[0].1 } else { 0 };
+                        let suffix = if vals.iter().all(|p| p.1 == vals[0].1) { vals[0].1 } else { SUFFIX_UNKNOWN };
+                        if suffix == SUFFIX_UNKNOWN && !march_range.contains_key(&dest.0) {
+                            // Differing suffixes: check for a marching-pointer
+                            // phi — non-backedge incoming carry one precise
+                            // start suffix; backedges are GEP(this phi, k).
+                            let is_self_gep = |v: &Value| func.blocks.iter().flat_map(|b| &b.instructions).any(|i| matches!(i,
+                                Instruction::GetElementPtr { dest: d, base, offset: Operand::Const(_), .. }
+                                    if *d == *v && base.0 == dest.0));
+                            let self_gep_step = |v: &Value| func.blocks.iter().flat_map(|b| &b.instructions).find_map(|i| {
+                                if let Instruction::GetElementPtr { dest: d, base, offset: Operand::Const(c), .. } = i {
+                                    if *d == *v && base.0 == dest.0 { return c.to_i64(); }
+                                }
+                                None
+                            });
+                            let mut start: Option<i64> = None;
+                            let mut step: i64 = 0;
+                            let mut ok = true;
+                            for (op, _) in incoming {
+                                let Operand::Value(v) = op else { ok = false; break };
+                                if is_self_gep(v) {
+                                    match self_gep_step(v) {
+                                        Some(k) if k != 0 && (step == 0 || step == k) => step = k,
+                                        _ => { ok = false; break; }
+                                    }
+                                } else if let Some(&(_, s)) = root_suffix.get(&v.0) {
+                                    if s == SUFFIX_UNKNOWN || (start.is_some() && start != Some(s)) {
+                                        ok = false; break;
+                                    }
+                                    start = Some(s);
+                                } else {
+                                    ok = false; break;
+                                }
+                            }
+                            if ok {
+                                if let (Some(s0), true) = (start, step != 0) {
+                                    march_range.insert(dest.0, (s0, step));
+                                    changed = true;
+                                }
+                            }
+                        }
                         Some((dest.0, (vals[0].0, suffix)))
                     } else { None }
                 }
                 _ => None,
             };
             if let Some((dest, path)) = derived {
-                if !root_suffix.contains_key(&dest) { root_suffix.insert(dest, path); changed = true; }
+                match root_suffix.get(&dest) {
+                    None => { root_suffix.insert(dest, path); changed = true; }
+                    Some(&existing) if existing != path => {
+                        // Later information (e.g. a loop backedge not yet mapped
+                        // on the first pass) contradicts the recorded suffix:
+                        // downgrade to the imprecise root-only form. UNKNOWN is
+                        // absorbing, so the fixpoint still terminates.
+                        let downgraded = (existing.0, SUFFIX_UNKNOWN);
+                        if existing != downgraded {
+                            root_suffix.insert(dest, downgraded);
+                            changed = true;
+                        }
+                    }
+                    _ => {}
+                }
             }
         }}
         if !changed { break; }
@@ -54,11 +146,28 @@ fn eliminate_dead_aggregate_field_stores(func: &mut IrFunction) -> usize {
         .collect();
     let mut escaping = FxHashSet::default();
     let mut loaded: FxHashMap<u32, Vec<(i64, i64)>> = FxHashMap::default();
+    // Periodic loads through marching pointers: (root, first offset, period, size).
+    let mut periodic_loads: Vec<(u32, i64, i64, i64)> = Vec::new();
     for block in &func.blocks {
         for inst in &block.instructions {
             if let Instruction::Load { ptr, ty, .. } = inst {
                 if let Some((root, suffix)) = root_suffix.get(&ptr.0) {
-                    loaded.entry(*root).or_default().push((*suffix, type_size(*ty)));
+                    if *suffix == SUFFIX_UNKNOWN {
+                        match march_range.get(&ptr.0).copied() {
+                            // Marching-pointer load with positive period p:
+                            // touches [l0 + p*j, l0 + p*j + size) for j >= 0.
+                            Some((l0, p)) if p > 0 && l0 >= 0 => {
+                                periodic_loads.push((*root, l0, p, type_size(*ty)));
+                            }
+                            _ => {
+                                // Unknown offset: the load may touch any field.
+                                let whole = alloca_size.get(root).copied().unwrap_or(i64::MAX);
+                                loaded.entry(*root).or_default().push((0, whole));
+                            }
+                        }
+                    } else {
+                        loaded.entry(*root).or_default().push((*suffix, type_size(*ty)));
+                    }
                 }
             }
             match inst {
@@ -88,9 +197,18 @@ fn eliminate_dead_aggregate_field_stores(func: &mut IrFunction) -> usize {
         for (ii, inst) in old.into_iter().enumerate() {
             let dead = if let Instruction::Store { ptr, ty, .. } = &inst {
                 if let Some((root, off)) = root_suffix.get(&ptr.0) {
-                    if !volatile_roots.contains(root) && !escaping.contains(root) {
+                    // A store through an unknown-offset pointer cannot be
+                    // classified as a field store — keep it.
+                    if *off == SUFFIX_UNKNOWN {
+                        false
+                    } else if !volatile_roots.contains(root) && !escaping.contains(root) {
                         let size = type_size(*ty);
-                        !loaded.get(root).is_some_and(|ranges| ranges.iter().any(|(lo, ls)| *off < lo + ls && *lo < *off + size))
+                        let hit_precise = loaded.get(root).is_some_and(|ranges| ranges.iter().any(|(lo, ls)| *off < lo + ls && *lo < *off + size));
+                        let whole = alloca_size.get(root).copied().unwrap_or(i64::MAX);
+                        let hit_periodic = periodic_loads.iter().any(|&(r, l0, p, lsz)| {
+                            r == *root && periodic_overlap(l0, p, lsz, *off, size, whole)
+                        });
+                        !(hit_precise || hit_periodic)
                     } else { false }
                 } else { false }
             } else { false };
@@ -102,6 +220,17 @@ fn eliminate_dead_aggregate_field_stores(func: &mut IrFunction) -> usize {
         if has_spans { block.source_spans = spans; }
     }
     changes
+}
+
+/// Does a periodic load covering [l0 + p*j, l0 + p*j + lsz) for integer j >= 0
+/// (bounded to the alloca's [0, size)) overlap the store range [off, off+ssz)?
+/// p must be positive.
+fn periodic_overlap(l0: i64, p: i64, lsz: i64, off: i64, ssz: i64, size: i64) -> bool {
+    // Smallest j >= 0 with l0 + p*j + lsz > off.
+    let j_min = ((off - l0 - lsz).div_euclid(p) + 1).max(0);
+    // Largest j with l0 + p*j < off + ssz.
+    let j_max = (off + ssz - l0 - 1).div_euclid(p);
+    j_min <= j_max && l0 + p * j_min < size
 }
 
 #[derive(Clone)]
