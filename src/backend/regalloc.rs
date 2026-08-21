@@ -889,11 +889,43 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     phi_dest, d_reg.map(|r| r.0), backedge_src, s_reg.map(|r| r.0),
                     f64_value_set.contains(&phi_dest), vector_values.contains(&phi_dest));
             }
-            let (Some(d), Some(s)) = (d_reg, s_reg) else { continue };
-            if d == s {
+            if !f64_value_set.contains(&phi_dest) && !vector_values.contains(&phi_dest) {
                 continue;
             }
-            if !f64_value_set.contains(&phi_dest) && !vector_values.contains(&phi_dest) {
+            // Reverse coalescing: the phi dest (a copy-web accumulator that
+            // only ever ferries the backedge value to the next iteration)
+            // has no register of its own. Give it the backedge source's
+            // register when nothing else holding that register overlaps the
+            // dest's interval — the backedge copy then dies on the chain.
+            if d_reg.is_none() {
+                if std::env::var("CCC_NO_FP_REVERSE_COAL").is_ok() {
+                    continue;
+                }
+                let Some(s) = s_reg else { continue };
+                let Some(dest_iv) = liveness.intervals.iter().find(|iv| iv.value_id == phi_dest)
+                    else { continue };
+                // A caller-saved FP register cannot hold a call-spanning value.
+                if s.0 >= 40 && spans_any_call(dest_iv, call_points) {
+                    continue;
+                }
+                let conflict = liveness.intervals.iter().any(|iv| {
+                    if iv.value_id == phi_dest || iv.value_id == backedge_src {
+                        return false;
+                    }
+                    assignments
+                        .get(&iv.value_id)
+                        .is_some_and(|&o| o.0 == s.0 && iv.start < dest_iv.end && dest_iv.start < iv.end)
+                });
+                if debug {
+                    eprintln!("[FPCOAL] reverse phi={} <- d{} conflict={}", phi_dest, s.0, conflict);
+                }
+                if !conflict {
+                    assignments.insert(phi_dest, s);
+                }
+                continue;
+            }
+            let (Some(d), Some(s)) = (d_reg, s_reg) else { continue };
+            if d == s {
                 continue;
             }
             // Conflict check: no other value assigned d may overlap the src
