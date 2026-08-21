@@ -542,7 +542,8 @@ impl ArmCodegen {
             }
 
             IntrinsicOp::VecAddF64x2 | IntrinsicOp::VecMulF64x2
-            | IntrinsicOp::VecAddI32x4 | IntrinsicOp::VecMulI32x4 => {
+            | IntrinsicOp::VecAddI32x4 | IntrinsicOp::VecMulI32x4
+            | IntrinsicOp::VecSmaxI32x4 => {
                 if let Some(d) = dest {
                     let a = self.load_vector_value_128(&args[0], "q0");
                     let b = self.load_vector_value_128(&args[1], "q1");
@@ -550,6 +551,7 @@ impl ArmCodegen {
                         IntrinsicOp::VecAddF64x2 => ("fadd", "2d"),
                         IntrinsicOp::VecMulF64x2 => ("fmul", "2d"),
                         IntrinsicOp::VecAddI32x4 => ("add", "4s"),
+                        IntrinsicOp::VecSmaxI32x4 => ("smax", "4s"),
                         _ => ("mul", "4s"),
                     };
                     if let Some(name) = self.assigned_vector_reg(d.0) {
@@ -600,6 +602,12 @@ impl ArmCodegen {
             IntrinsicOp::VecHorizontalAddI32x4 => {
                 let a = self.load_vector_value_128(&args[0], "q0");
                 self.state.emit_fmt(format_args!("    addv s0, {}.4s", a));
+                self.state.emit("    fmov w0, s0");
+                if let Some(d) = dest { self.store_x0_to(d); }
+            }
+            IntrinsicOp::VecHorizontalMaxI32x4 => {
+                let a = self.load_vector_value_128(&args[0], "q0");
+                self.state.emit_fmt(format_args!("    smaxv s0, {}.4s", a));
                 self.state.emit("    fmov w0, s0");
                 if let Some(d) = dest { self.store_x0_to(d); }
             }

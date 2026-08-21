@@ -1132,7 +1132,8 @@ impl X86Codegen {
             IntrinsicOp::VecZeroI64x2 |
             IntrinsicOp::VecSadalpI32x4 |
             IntrinsicOp::VecSmlalLoI32x4 | IntrinsicOp::VecSmlalHiI32x4 |
-            IntrinsicOp::VecSmaxZeroI32x4 => {
+            IntrinsicOp::VecSmaxZeroI32x4 |
+            IntrinsicOp::VecSmaxI32x4 | IntrinsicOp::VecHorizontalMaxI32x4 => {
                 // AArch64-only widening reduction intrinsics.
             }
             IntrinsicOp::VecMulI32x4 | IntrinsicOp::VecBroadcastI32x4 |

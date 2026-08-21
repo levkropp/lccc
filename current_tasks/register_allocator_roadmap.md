@@ -28,6 +28,13 @@ architectural, not pass-level. This doc records the evidence and the plan.
   -> fmov), tracking sp-derived base registers (struct_copy -2.7%).
 - Dead-store elimination escape analysis: sp-derived bases that only feed
   address uses no longer bail the pass; dead FP/base-form stores removed.
+- Conditional-sum vectorization (sum_positive): late Select-clamped reduction
+  pass, NEON smax-against-zero + sadalp, 4-wide i32->i64.
+- Max-reduction vectorization (find_max shape `mx = max(mx, arr[i])`, IV init
+  c=1): late pass; broadcast scalar init (`dup`), lane-wise `smax`, `smaxv`
+  horizontal reduce. Legality requires the marching pointer's preheader GEP
+  offset == c*elem; the remainder start/limit are shifted by c so coverage is
+  exactly [c, n) (loop_patterns -7.2% interleaved A/B).
 
 ## Reverted / documented dead-ends (measured, do not retry)
 

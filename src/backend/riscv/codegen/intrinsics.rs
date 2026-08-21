@@ -313,7 +313,8 @@ impl RiscvCodegen {
             IntrinsicOp::VecStoreI32x4 |
             IntrinsicOp::VecSadalpI32x4 |
             IntrinsicOp::VecSmlalLoI32x4 | IntrinsicOp::VecSmlalHiI32x4 |
-            IntrinsicOp::VecSmaxZeroI32x4 => {
+            IntrinsicOp::VecSmaxZeroI32x4 |
+            IntrinsicOp::VecSmaxI32x4 | IntrinsicOp::VecHorizontalMaxI32x4 => {
                 // These are x86-64/AArch64-specific register-based vector operations
                 // RISC-V would use RVV (RISC-V Vector extension) differently
                 unimplemented!("Register-based vector intrinsics not implemented for RISC-V");

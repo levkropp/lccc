@@ -221,6 +221,12 @@ pub enum IntrinsicOp {
     /// NEON smax against zero: dest = max(args[0], 0) per lane (4×I32).
     /// Used to clamp conditional-sum addends: sum(x>0 ? x : 0) == sum(max(x,0)).
     VecSmaxZeroI32x4,
+    /// NEON smax: per-lane max of two 4×I32 vectors (args[0] vs args[1]).
+    /// Integer max is associative, commutative, and idempotent, so lane-order
+    /// reduction matches sequential scalar max bit-for-bit.
+    VecSmaxI32x4,
+    /// NEON smaxv: horizontal max of 4×I32 lanes; dest = scalar I32.
+    VecHorizontalMaxI32x4,
 
     /// Horizontal reduction: %scalar = horizontal_add(%vec) - AVX2 4×F64 → F64
     /// args[0] = source vector value; dest = scalar F64 result
@@ -431,6 +437,7 @@ impl IntrinsicOp {
             | IntrinsicOp::VecSadalpI32x4
             | IntrinsicOp::VecSmlalLoI32x4 | IntrinsicOp::VecSmlalHiI32x4
             | IntrinsicOp::VecSmaxZeroI32x4
+            | IntrinsicOp::VecSmaxI32x4
         )
     }
 }
