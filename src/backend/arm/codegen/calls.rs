@@ -232,6 +232,12 @@ impl ArmCodegen {
             }
         });
         if no_arg_reg_source {
+            // FP args first: their emission routes through the x0 scratch
+            // (emit_call_fp_reg_args loads every FP arg via x0 and `fmov`),
+            // which would clobber integer args already staged in x0-x7.
+            // The slow path stages ints through x9-x16 temps, so x0 is free
+            // there; here the temps are skipped, so x0 must still be free.
+            self.emit_call_fp_reg_args(args, arg_classes, arg_types, slot_adjust, needs_adjusted_load);
             let mut int_reg_idx = 0usize;
             for (i, arg) in args.iter().enumerate() {
                 match arg_classes[i] {
@@ -255,7 +261,6 @@ impl ArmCodegen {
                     _ => {}
                 }
             }
-            self.emit_call_fp_reg_args(args, arg_classes, arg_types, slot_adjust, needs_adjusted_load);
             self.emit_call_i128_reg_args(args, arg_classes, slot_adjust, needs_adjusted_load);
             self.emit_call_struct_byval_reg_args(args, arg_classes, slot_adjust, needs_adjusted_load);
             return;
