@@ -78,6 +78,13 @@ architectural, not pass-level. This doc records the evidence and the plan.
   get registers via the loop-pin steal, cold ones don't matter. Removed.
   Keeping the sources eligible instead (so they get scanned) cost hash_table
   a reproducible +3% (more scan pressure on x19-x28).
+- Leaf-function pool swap (scan caller-saved x4-x8/x13/x14 before the
+  callee-saved pool in call-free functions to skip the prologue spill
+  storm): qsort +15% reproducible, everything else neutral. The stp/ldp
+  save pairs are L1-cached and effectively free; the smaller hot pool just
+  costs allocation quality. Also required fixing the AArch64 FP-pool
+  detection (keyed on x28 in available_regs, which the swap empties).
+  Reverted.
 - Copy-propagating staging movs into cmp/cbz/str first operands (plus
   treating non-sp ldr as a dest-write in eliminate_overwritten_moves):
   folds correctly (cbz x19 directly, dead staging movs removed) but
