@@ -3,7 +3,7 @@
 use crate::ir::reexports::{IrConst, Operand, Value};
 use crate::common::types::IrType;
 use crate::backend::call_abi::{CallAbiConfig, CallArgClass, compute_stack_arg_space};
-use super::emit::{ArmCodegen, callee_saved_name};
+use super::emit::{ArmCodegen, callee_saved_name, is_arm_fp_phys, ARM_ARG_REGS};
 
 impl ArmCodegen {
     pub(super) fn call_abi_config_impl(&self) -> CallAbiConfig {
@@ -210,6 +210,56 @@ impl ArmCodegen {
                           _struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>]) {
         let slot_adjust = if self.state.has_dyn_alloca { 0 } else { total_sp_adjust };
         let needs_adjusted_load = total_sp_adjust > 0;
+
+        // Fast path: when no integer argument's source lives in an argument
+        // register (x0-x7), load each argument directly into its destination
+        // register — the temp staging + temp-to-arg moves exist only to
+        // resolve parallel-move hazards among the arg registers themselves.
+        // Saves two movs per register-sourced argument (hash_table's per-call
+        // staging: `mov x9, x22; mov x0, x9` becomes `mov x0, x22`).
+        let no_arg_reg_source = args.iter().enumerate().all(|(i, arg)| {
+            if !matches!(arg_classes[i], CallArgClass::IntReg { .. }) {
+                return true;
+            }
+            match arg {
+                Operand::Value(v) => match self.reg_assignments.get(&v.0) {
+                    Some(r) => is_arm_fp_phys(*r) || r.0 > 7,
+                    None => true,
+                },
+                // Integer consts load via emit_load_imm64 (no x0 scratch —
+                // x0 may already hold an earlier argument).
+                Operand::Const(c) => c.to_i64().is_some(),
+            }
+        });
+        if no_arg_reg_source {
+            let mut int_reg_idx = 0usize;
+            for (i, arg) in args.iter().enumerate() {
+                match arg_classes[i] {
+                    CallArgClass::I128RegPair { .. } => {
+                        if !int_reg_idx.is_multiple_of(2) { int_reg_idx += 1; }
+                        int_reg_idx += 2;
+                    }
+                    CallArgClass::StructByValReg { size, .. } => {
+                        int_reg_idx += if size <= 8 { 1 } else { 2 };
+                    }
+                    CallArgClass::IntReg { .. } => {
+                        if int_reg_idx < 8 {
+                            if let Operand::Const(c) = arg {
+                                self.emit_load_imm64(ARM_ARG_REGS[int_reg_idx], c.to_i64().unwrap());
+                            } else {
+                                self.emit_load_arg_to_reg(arg, ARM_ARG_REGS[int_reg_idx], slot_adjust, 0, needs_adjusted_load);
+                            }
+                        }
+                        int_reg_idx += 1;
+                    }
+                    _ => {}
+                }
+            }
+            self.emit_call_fp_reg_args(args, arg_classes, arg_types, slot_adjust, needs_adjusted_load);
+            self.emit_call_i128_reg_args(args, arg_classes, slot_adjust, needs_adjusted_load);
+            self.emit_call_struct_byval_reg_args(args, arg_classes, slot_adjust, needs_adjusted_load);
+            return;
+        }
 
         self.emit_call_gp_to_temps(args, arg_classes, slot_adjust, needs_adjusted_load);
         self.emit_call_fp_reg_args(args, arg_classes, arg_types, slot_adjust, needs_adjusted_load);
