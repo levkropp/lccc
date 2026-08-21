@@ -63,11 +63,13 @@ architectural, not pass-level. This doc records the evidence and the plan.
   (e3b21b8f): accumulator-feeding Subs stay split (mandelbrot -1.4%).
 - Exact per-register occupancy lists in the linear scan (replacing the
   free_until approximation so priority-ordered scans reuse registers across
-  disjoint windows): fixes loop_patterns' sequential-loop spill regression
-  but HANGS fannkuch through a phi-coalesce inheritance interaction that
-  survives both all-segment conflict checks and inclusive-boundary semantics
-  (steal-off still hangs; coalesce-off works). Unresolved — do not retry
-  without point-level (not interval-level) conflict validation.
+  disjoint windows): initially HUNG fannkuch. Root cause found: the indexed
+  addressing fold reads the pre-scale index of a Shl/Mul-peeled GEP offset
+  (`[base, index, lsl #k]`), but extend_gep_base_liveness only extended the
+  offset value's liveness — the peeled index died at the Shl and its
+  register was reused for the load's own destination. Fixed by extending
+  liveness through the peel chain (Shl/Mul/widening-Cast) to the Load/Store
+  points. Shipped: occupancy checks + priority-first GPR scan.
 - Read-only loop-invariant F64 load hoisting (nbody bodies[i].x/y/z,
   struct_copy particle fields): needs phi-derived-pointer alias proof and
   pool-aware gating; the 60% affine-LICM regression came from hoisted values

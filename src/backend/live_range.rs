@@ -145,6 +145,13 @@ pub struct LinearScanAllocator {
 
     /// Register subset used for values in `restricted_values`.
     pub restricted_regs: Vec<PhysReg>,
+
+    /// Every interval assigned to each register so far. Unlike the
+    /// `reg_free_until` approximation (valid only for start-ordered scans),
+    /// this permits exact overlap checks in ANY processing order, so a
+    /// priority-ordered scan can still reuse a register for disjoint windows
+    /// (e.g. two sequential loops' values).
+    pub reg_intervals: FxHashMap<PhysReg, Vec<(u32, u32)>>,
 }
 
 impl LinearScanAllocator {
@@ -163,6 +170,17 @@ impl LinearScanAllocator {
             next_reg_idx: 0,
             restricted_values: FxHashSet::default(),
             restricted_regs: Vec::new(),
+            reg_intervals: FxHashMap::default(),
+        }
+    }
+
+    /// Exact per-register occupancy check: true when no interval already
+    /// assigned to `reg` overlaps `range` (inclusive ends; a range starting
+    /// the point after another ends is fine).
+    pub fn reg_free_for(&self, reg: PhysReg, range: &LiveRange) -> bool {
+        match self.reg_intervals.get(&reg) {
+            None => true,
+            Some(ivs) => ivs.iter().all(|&(s, e)| range.start > e || s > range.end),
         }
     }
 
@@ -247,25 +265,9 @@ impl LinearScanAllocator {
         for offset in 0..n {
             let idx = (start + offset) % n;
             let reg = pool[idx];
-            // Check if this register is free at the start of the range
-            if self.is_register_free(reg, range.start) {
-                // Also check that no active interval uses this register
-                let reg_free_throughout = self
-                    .active
-                    .iter()
-                    .filter(|a| {
-                        if let Some(assigned_reg) = self.assignments.get(&a.range.value_id) {
-                            *assigned_reg == reg
-                        } else {
-                            false
-                        }
-                    })
-                    .all(|a| !a.range.overlaps_with(range));
-
-                if reg_free_throughout {
-                    self.next_reg_idx = idx + 1;
-                    return Some(reg);
-                }
+            if self.reg_free_for(reg, range) {
+                self.next_reg_idx = idx + 1;
+                return Some(reg);
             }
         }
 
@@ -329,6 +331,7 @@ impl LinearScanAllocator {
             // Found a free register - assign it
             self.assignments.insert(range.value_id, reg);
             self.occupy_register(reg, range.end + 1);
+            self.reg_intervals.entry(reg).or_default().push((range.start, range.end));
 
             self.active.push(ActiveInterval {
                 range,

@@ -657,9 +657,13 @@ fn extend_gep_base_liveness(
         Index(u32),
     }
     let mut gep_info: FxHashMap<u32, (u32, GepOffset)> = FxHashMap::default(); // gep_dest_id -> (base_id, offset)
+    let mut def_of: FxHashMap<u32, &Instruction> = FxHashMap::default();
 
     for block in &func.blocks {
         for inst in &block.instructions {
+            if let Some(d) = inst.dest() {
+                def_of.insert(d.0, inst);
+            }
             match inst {
                 Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), .. } => {
                     // Constant-offset GEP: foldable into Load/Store addressing mode
@@ -805,6 +809,36 @@ fn extend_gep_base_liveness(
                         // consumed by the folded load/store too — keep it live.
                         if let GepOffset::Index(idx_id) = offset {
                             extend_one(*idx_id, last_use_points, block_gen);
+                            // The indexed-addressing fold peels a Shl/Mul (and a
+                            // widening Cast) off the offset and reads the
+                            // pre-scale index register directly as
+                            // `[base, index, lsl #k]` — that value must stay
+                            // live until the memory op as well (fannkuch
+                            // flip-loop hang: the index died at the Shl and the
+                            // load's own destination reused its register).
+                            let mut cur = *idx_id;
+                            for _ in 0..2 {
+                                let next = match def_of.get(&cur) {
+                                    Some(Instruction::Cast { src: Operand::Value(v), from_ty, to_ty, .. })
+                                        if to_ty.size() >= from_ty.size() => Some(v.0),
+                                    Some(Instruction::BinOp { op: IrBinOp::Shl, lhs: Operand::Value(v), rhs: Operand::Const(c), .. })
+                                        if c.to_i64().is_some_and(|k| (0..=3).contains(&k)) => Some(v.0),
+                                    Some(Instruction::BinOp { op: IrBinOp::Mul, lhs, rhs, .. }) => {
+                                        let (v, c) = if let (Operand::Value(v), Operand::Const(c)) = (lhs, rhs) { (Some(v), Some(c)) }
+                                            else if let (Operand::Const(c), Operand::Value(v)) = (lhs, rhs) { (Some(v), Some(c)) }
+                                            else { (None, None) };
+                                        match (v, c.and_then(|c| c.to_i64())) {
+                                            (Some(v), Some(n)) if n > 0 && (n as u64).is_power_of_two() && n <= 8 => Some(v.0),
+                                            _ => None,
+                                        }
+                                    }
+                                    _ => None,
+                                };
+                                match next {
+                                    Some(v) => { extend_one(v, last_use_points, block_gen); cur = v; }
+                                    None => break,
+                                }
+                            }
                         }
                     }
                 }
