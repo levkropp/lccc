@@ -52,13 +52,22 @@ architectural, not pass-level. This doc records the evidence and the plan.
 - Full unroll for struct_copy: 30ms vs 18.6ms baseline (body bloat).
 - CCC_LOOP_PIN cap sweep on fannkuch: 0->4066, 1->3715, 2->3458, 4->3474,
   6->3417 ms. The default cap of 2 is the sweet spot; more steals evict
-  warm holders. Do not raise.
+  warm holders. Do not raise. (The k>2 miscompile behind this was later
+  root-caused to the indexed-load invalidate_acc bug below and fixed;
+  the priority-first scan then made the steal largely moot.)
 - GVN-style (Copy-inserting) CSE for pointer-valued expressions: hits the
   same stale-base-register landmine that disabled GEP CSE. GlobalAddr CSE
   must be substitution-based (see global_addr_cse.rs).
 - fmsub/fnmsub fusion of `a - b*c` on accumulator update chains lengthens
   the serial dependency (fmsub latency > fsub): nbody +13%. Shipped GATED
   (e3b21b8f): accumulator-feeding Subs stay split (mandelbrot -1.4%).
+- Exact per-register occupancy lists in the linear scan (replacing the
+  free_until approximation so priority-ordered scans reuse registers across
+  disjoint windows): fixes loop_patterns' sequential-loop spill regression
+  but HANGS fannkuch through a phi-coalesce inheritance interaction that
+  survives both all-segment conflict checks and inclusive-boundary semantics
+  (steal-off still hangs; coalesce-off works). Unresolved — do not retry
+  without point-level (not interval-level) conflict validation.
 - Read-only loop-invariant F64 load hoisting (nbody bodies[i].x/y/z,
   struct_copy particle fields): needs phi-derived-pointer alias proof and
   pool-aware gating; the 60% affine-LICM regression came from hoisted values
@@ -111,14 +120,32 @@ architectural, not pass-level. This doc records the evidence and the plan.
   progressive suite (hash_table_mini catches this class).
 - Lesson: any analysis that maps a pointer register to ONE frame offset is
   unsound across loop back-edges unless it proves the register loop-invariant.
+- emit_load_indexed_impl (unassigned int dest) ran store_x0_to(dest) and then
+  invalidate_acc(), wiping the only record of a slot-less value; the next read
+  silently materialized `mov x0, #0` (fannkuch miscompile at CCC_LOOP_PIN>2).
+- Per-segment decisions where assignment is per-value: Phase-1 scanned
+  multi-segment values segment-by-segment (last write wins the assignments
+  map) and Phase-2 filtered call-spanning per segment — both now merge to
+  whole-value spans. Phi-coalesce inheritance checked only the backedge
+  source's FIRST segment for conflicts; now checks all segments.
+- reuse_stack_loads_within_blocks NOPed a stack reload whose register copy
+  propagation had made the sole reader (add x0,x1,x2 -> add x0,x1,x0) —
+  deleting the load left the add reading a stale x0 (strlen_bench segfault
+  under priority-first scan). Now requires the load's register to be
+  provably dead (no reads until its next full overwrite) before NOPing.
+- Lesson: the whole-lifetime assignment model means ANY per-segment or
+  per-site reasoning (span checks, conflict checks, slot packing, text
+  peepholes) must be validated against the value's full segment set.
 
-## Root cause of the remaining gap (fannkuch 1.95x, struct_copy 1.67x, nbody 1.35x)
+## Root cause of the remaining gap (fannkuch 1.17x after priority scan)
 
 The backend's slot-home discipline: every SSA value has a mandatory stack
 slot; register assignment is a steal on top. Per-iteration costs that persist:
 - Loop-carried values that lose the allocation get str/ldr per iteration.
-- Inner-loop temporaries in nested loops (fannkuch) spill because ~15
-  outer-loop values pin all 17 GPRs across the whole body.
+- ~~Inner-loop temporaries in nested loops (fannkuch) spill because ~15
+  outer-loop values pin all 17 GPRs across the whole body~~ ADDRESSED by the
+  priority-first Phase-1 scan (hottest ranges claim registers first; the
+  free-until discipline is order-independent so cold ranges just spill).
 - The linear scan NEVER evicts (a past eviction miscompiled loop accumulators);
   the post-scan steal is capped and phi-dest-only.
 

@@ -677,6 +677,9 @@ fn fold_destructive_pointer_updates(lines: &mut [String], kinds: &mut [LineKind]
 /// either it or the slot is overwritten.  Keep this deliberately local and
 /// clear state for instruction classes whose register effects are ambiguous.
 fn reuse_stack_loads_within_blocks(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_REUSE_STACK_LOADS").is_ok() {
+        return false;
+    }
     let mut cached: Vec<(i32, bool, u8, bool)> = Vec::new();
     let mut changed = false;
     let mut i = 0;
@@ -733,6 +736,45 @@ fn reuse_stack_loads_within_blocks(lines: &mut [String], kinds: &mut [LineKind],
             if let LineKind::Move { dst, src, is_32bit } = kinds[j] {
                 if src == load_reg {
                     if let Some((_, _, source, source_word)) = old.filter(|entry| entry.3 == is_32bit) {
+                        // NOPing the load is only sound if its register has no
+                        // other readers before it is next fully overwritten —
+                        // copy propagation can move an instruction's reference
+                        // onto the load's own register (e.g. rewriting
+                        // `add x0, x1, x2` to read x0), and deleting the load
+                        // would leave that read with stale contents.
+                        let xn = xreg_name(load_reg);
+                        let wn = wreg_name(load_reg);
+                        let mut load_dead_after = false;
+                        let mut k = j + 1;
+                        while k < n {
+                            if kinds[k] == LineKind::Nop { k += 1; continue; }
+                            let t = &lines[k];
+                            let mentions = t
+                                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                                .any(|tok| tok == xn || tok == wn);
+                            if mentions {
+                                // A pure overwrite ends the hazard; anything
+                                // else reads the (soon deleted) register.
+                                load_dead_after = match kinds[k] {
+                                    LineKind::Move { dst, src, .. } => dst == load_reg && src != load_reg,
+                                    LineKind::MoveImm { dst } | LineKind::MoveWide { dst } => dst == load_reg,
+                                    LineKind::LoadSp { reg, .. } | LineKind::LoadswSp { reg, .. } => reg == load_reg,
+                                    _ => false,
+                                };
+                                break;
+                            }
+                            match kinds[k] {
+                                LineKind::Label | LineKind::Branch | LineKind::CondBranch
+                                | LineKind::CmpBranch | LineKind::Call | LineKind::Ret
+                                | LineKind::Directive => break,
+                                _ => {}
+                            }
+                            k += 1;
+                        }
+                        if !load_dead_after {
+                            i += 1;
+                            continue;
+                        }
                         kinds[i] = LineKind::Nop;
                         lines[j] = format!("    mov {}, {}",
                             if is_32bit { wreg_name(dst) } else { xreg_name(dst) },

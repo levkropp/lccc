@@ -370,6 +370,7 @@ pub fn build_live_ranges(
     intervals: &[LiveInterval],
     loop_depth: &[u32],
     func: &IrFunction,
+    priority_first: bool,
 ) -> Vec<LiveRange> {
     // Build map: value_id → defining block index.
     // This fixes a bug where value_id was incorrectly used as an index into
@@ -449,12 +450,27 @@ pub fn build_live_ranges(
         range.calculate_spill_weight();
     }
 
-    // Sort by start point (primary) and by priority (secondary, for tie-breaking)
-    ranges.sort_by(|a, b| {
-        a.start
-            .cmp(&b.start)
-            .then_with(|| b.priority.cmp(&a.priority))
-    });
+    // GPR pools scan priority-first: hot inner-loop values claim registers
+    // before cold function-spanning ones (fannkuch's nested-loop temporaries).
+    // The free-until discipline is order-independent (monotonic per register),
+    // so unassigned ranges simply fall back to their stack slots. The FP pool
+    // keeps start order: priority ordering there books short-lived FP temps
+    // into d-registers and evicts long loop-carried accumulators, producing
+    // FP spill storms (struct_copy 6x, nbody/loop_patterns regressions).
+    if priority_first {
+        ranges.sort_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then_with(|| a.start.cmp(&b.start))
+        });
+    } else {
+        // Sort by start point (primary) and by priority (secondary, for tie-breaking)
+        ranges.sort_by(|a, b| {
+            a.start
+                .cmp(&b.start)
+                .then_with(|| b.priority.cmp(&a.priority))
+        });
+    }
 
     ranges
 }

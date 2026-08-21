@@ -79,7 +79,9 @@ impl ArmCodegen {
         };
         self.state.emit_fmt(format_args!("    {} {}, {}", instr, reg, addr));
         self.store_x0_to(dest);
-        self.state.reg_cache.invalidate_acc();
+        // NOTE: no invalidate_acc() here — store_x0_to just recorded the
+        // accumulator as holding `dest`, and slot-less values have no other
+        // home; wiping the record makes the next read emit a silent `mov x0, #0`.
         true
     }
 

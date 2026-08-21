@@ -78,13 +78,28 @@ fn filter_eligible_intervals(
     liveness: &LivenessResult,
     eligible: &FxHashSet<u32>,
 ) -> Vec<LiveInterval> {
-    liveness
-        .intervals
-        .iter()
-        .filter(|iv| eligible.contains(&iv.value_id))
-        .filter(|iv| iv.end > iv.start)
-        .copied()
-        .collect()
+    // Merge all segments of a value into one span (min start, max end). The
+    // assignment map is keyed per value, so scanning segments independently
+    // makes the last-processed segment's register the value's home for its
+    // ENTIRE lifetime — including other segments' spans, where that register
+    // may already be taken. (Start-order processing mostly hid this; priority
+    // ordering exposed it as a strlen_bench segfault.)
+    let mut merged: FxHashMap<u32, LiveInterval> = FxHashMap::default();
+    for iv in &liveness.intervals {
+        if !eligible.contains(&iv.value_id) || iv.end <= iv.start {
+            continue;
+        }
+        merged
+            .entry(iv.value_id)
+            .and_modify(|m| {
+                m.start = m.start.min(iv.start);
+                m.end = m.end.max(iv.end);
+            })
+            .or_insert(*iv);
+    }
+    let mut out: Vec<LiveInterval> = merged.into_values().collect();
+    out.sort_by_key(|iv| iv.start);
+    out
 }
 
 /// Run the register allocator on a function.
@@ -359,7 +374,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // Phase 1: callee-saved linear scan.
     let phase1_intervals = filter_eligible_intervals(&liveness, &eligible);
     let phase1_ranges =
-        live_range::build_live_ranges(&phase1_intervals, &liveness.block_loop_depth, func);
+        live_range::build_live_ranges(&phase1_intervals, &liveness.block_loop_depth, func, true);
     let mut allocator = LinearScanAllocator::new(phase1_ranges, config.available_regs.clone());
     allocator.run();
 
@@ -504,14 +519,15 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
 
     // Phase 2: caller-saved linear scan for unallocated non-call-spanning values.
     if !config.caller_saved_regs.is_empty() {
-        let phase2_intervals: Vec<LiveInterval> = liveness
-            .intervals
-            .iter()
-            .filter(|iv| eligible.contains(&iv.value_id))
-            .filter(|iv| iv.end > iv.start)
+        // Merged per-value spans (same discipline as Phase 1): the assignment
+        // is per value, so a caller-saved register is only safe when the
+        // value's WHOLE span is call-free — checking individual segments would
+        // let a value keep a caller-saved register across a call that only one
+        // of its segments spans (strlen_bench segfault).
+        let phase2_intervals: Vec<LiveInterval> = filter_eligible_intervals(&liveness, &eligible)
+            .into_iter()
             .filter(|iv| !assignments.contains_key(&iv.value_id))
             .filter(|iv| !spans_any_call(iv, call_points))
-            .copied()
             .collect();
 
         if !phase2_intervals.is_empty() {
@@ -519,6 +535,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 &phase2_intervals,
                 &liveness.block_loop_depth,
                 func,
+                true,
             );
             let mut caller_allocator =
                 LinearScanAllocator::new(phase2_ranges, config.caller_saved_regs.clone());
@@ -567,10 +584,16 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // conflict with other values already assigned to the same register.
     for &(phi_dest, backedge_src) in &phi_coalesce {
         if let Some(&reg) = assignments.get(&phi_dest) {
-            // Find backedge_src's interval
-            let src_interval = liveness.intervals.iter()
-                .find(|iv| iv.value_id == backedge_src);
-            if let Some(src_iv) = src_interval {
+            // Check every live segment of the backedge source — not just the
+            // first — against every segment of other values holding the
+            // register. A multi-segment source whose later segment conflicts
+            // would otherwise inherit the register and clobber/ corrupt the
+            // other value (strlen_bench segfault with priority-ordered scan).
+            let src_segs: Vec<(u32, u32)> = liveness.intervals.iter()
+                .filter(|iv| iv.value_id == backedge_src)
+                .map(|iv| (iv.start, iv.end))
+                .collect();
+            if !src_segs.is_empty() {
                 // The source and phi-destination intervals normally overlap in
                 // linearized loop liveness: the phi is conservatively live for
                 // the whole loop while its replacement is computed near the
@@ -578,13 +601,15 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 // detect_phi_coalesce_groups has already proved that the old phi
                 // value is not used after the replacement is defined.
                 // Check for conflicts with other values in the same register
-                let has_conflict = liveness.intervals.iter().any(|iv| {
-                    if iv.value_id == backedge_src || iv.value_id == phi_dest { return false; }
-                    if let Some(&other_reg) = assignments.get(&iv.value_id) {
-                        other_reg.0 == reg.0 && iv.start < src_iv.end && src_iv.start < iv.end
-                    } else {
-                        false
-                    }
+                let has_conflict = src_segs.iter().any(|&(ss, se)| {
+                    liveness.intervals.iter().any(|iv| {
+                        if iv.value_id == backedge_src || iv.value_id == phi_dest { return false; }
+                        if let Some(&other_reg) = assignments.get(&iv.value_id) {
+                            other_reg.0 == reg.0 && iv.start < se && ss < iv.end
+                        } else {
+                            false
+                        }
+                    })
                 });
                 if !has_conflict {
                     assignments.insert(backedge_src, reg);
@@ -769,6 +794,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 &f64_intervals,
                 &liveness.block_loop_depth,
                 func,
+                false,
             );
             let mut xmm_allocator =
                 LinearScanAllocator::new(f64_ranges, config.xmm_regs.clone());
