@@ -38,6 +38,7 @@ mod resolve_asm;
 pub(crate) mod simplify;
 pub(crate) mod store_load_forward;
 pub(crate) mod loop_unroll;
+pub(crate) mod phi_antidep_split;
 pub(crate) mod quadratic_sr;
 pub(crate) mod tail_call_elim;
 pub(crate) mod outline_switch;
@@ -783,6 +784,14 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
     // per iteration before this.
     if !disabled.contains("intconst") {
         module.for_each_function(int_const_hoist::run);
+    }
+
+    // Split loop-phi anti-dependencies (uses of the phi value after the
+    // backedge value is born) onto an early copy, unblocking the backend's
+    // backedge coalescing so the recurrence copy leaves the dependency chain.
+    // Runs after all loop transforms so the final loop shapes are split.
+    if !disabled.contains("antidep") {
+        module.for_each_function(phi_antidep_split::run);
     }
 
     // Phase 11: Dead static function elimination.

@@ -1728,6 +1728,10 @@ pub(crate) fn detect_phi_coalesce_groups(
                                         }
                                     }
                                     if uses_value(inst2, dest.0) {
+                                        if std::env::var("CCC_DEBUG_PHI_COALESCE").is_ok() {
+                                            eprintln!("[PHI_COALESCE]   used_after hit: dest=v{} src=v{} block={} inst={:?}",
+                                                dest.0, src_val.0, block_idx, inst2);
+                                        }
                                         phi_dest_used_after_src = true;
                                     }
                                 }
@@ -1749,6 +1753,10 @@ pub(crate) fn detect_phi_coalesce_groups(
                                         }
                                     } else {
                                         if uses_value(inst2, dest.0) {
+                                            if std::env::var("CCC_DEBUG_PHI_COALESCE").is_ok() {
+                                                eprintln!("[PHI_COALESCE]   used_after hit (src block {}): dest=v{} src=v{} inst={:?}",
+                                                    sdb, dest.0, src_val.0, inst2);
+                                            }
                                             phi_dest_used_after_src = true;
                                         }
                                     }
