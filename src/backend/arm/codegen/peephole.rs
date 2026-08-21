@@ -433,6 +433,7 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= eliminate_redundant_sxtw(&mut lines, &mut kinds, n);
         changed |= eliminate_redundant_sxtb(&mut lines, &mut kinds, n);
         changed |= eliminate_move_chains(&mut lines, &mut kinds, n);
+        changed |= fold_zext_move_chains(&mut lines, &mut kinds, n);
         changed |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
         changed |= propagate_address_aliases(&mut lines, &mut kinds, n);
         changed |= forward_fp_slot_loads(&mut lines, &mut kinds, n);
@@ -472,6 +473,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_redundant_sxtw(&mut lines, &mut kinds, n);
             changed2 |= eliminate_redundant_sxtb(&mut lines, &mut kinds, n);
             changed2 |= eliminate_move_chains(&mut lines, &mut kinds, n);
+            changed2 |= fold_zext_move_chains(&mut lines, &mut kinds, n);
             changed2 |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
             changed2 |= propagate_address_aliases(&mut lines, &mut kinds, n);
             changed2 |= forward_fp_slot_loads(&mut lines, &mut kinds, n);
@@ -1162,6 +1164,32 @@ fn eliminate_repeated_slot_loads(lines: &mut [String], kinds: &mut [LineKind], n
     changed
 }
 
+/// Strict single-destination form: only the first operand position, and only
+/// when it is the line's sole mention of the register (a read-write like
+/// `add x0, x0, #1` is NOT a pure overwrite).
+fn gp_reg_write_only(line: &str, num: u8) -> bool {
+    let t = line.trim();
+    let Some((mnem, rest)) = t.split_once(' ') else { return false };
+    if matches!(
+        mnem,
+        "str" | "stp" | "strb" | "strh" | "stur" | "sturb" | "sturh" | "stlr"
+            | "stlrb" | "stlrh" | "fcmp" | "fcmpe" | "b" | "bl" | "ret" | "cbz"
+            | "cbnz" | "tbz" | "tbnz" | "cmp" | "cmn"
+    ) || mnem.starts_with("b.")
+    {
+        return false;
+    }
+    let (xa, wa) = (xreg_name(num), wreg_name(num));
+    let first = rest.split(',').next().map(str::trim);
+    if first != Some(xa) && first != Some(wa) {
+        return false;
+    }
+    t.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|tok| *tok == xa || *tok == wa)
+        .count()
+        == 1
+}
+
 fn forward_fp_slot_loads(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     if std::env::var("CCC_NO_FP_SLOT_FWD").is_ok() {
         return false;
@@ -1652,6 +1680,60 @@ fn eliminate_move_chains(lines: &mut [String], kinds: &mut [LineKind], n: usize)
             _ => {}
         }
         i += 1;
+    }
+    changed
+}
+
+// ── Zero-extend move-chain folding ───────────────────────────────────────────
+//
+// `mov xA, xS ; mov wA, wA ; mov xD, xA` — the accumulator-path zero-extension
+// idiom (the 32-bit self-move clears the top half; it is NOT a no-op, so
+// eliminate_self_moves correctly keeps it). The chain computes xD = zext32(wS),
+// exactly `mov wD, wS`. Sound only if A is not read later in the block.
+fn fold_zext_move_chains(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for i in 0..n.saturating_sub(2) {
+        let LineKind::Move { dst: a, src: s, is_32bit: false } = kinds[i] else { continue };
+        let LineKind::Move { dst: a2, src: s2, is_32bit: true } = kinds[i + 1] else { continue };
+        if a2 != a || s2 != a {
+            continue; // middle must be mov wA, wA
+        }
+        let LineKind::Move { dst: d, src: s3, is_32bit: false } = kinds[i + 2] else { continue };
+        if s3 != a || d == a || s == a {
+            continue;
+        }
+        // A must be dead after the chain: no later READ before a boundary.
+        // A write-only line (e.g. `mov x0, #15`) ends the old value's life.
+        let (xa, wa) = (xreg_name(a), wreg_name(a));
+        let mut a_live = false;
+        for j in (i + 3)..n {
+            match kinds[j] {
+                LineKind::Label | LineKind::Branch | LineKind::CondBranch
+                | LineKind::CmpBranch | LineKind::Call | LineKind::Ret => break,
+                LineKind::Nop => continue,
+                _ => {}
+            }
+            let mentions = lines[j]
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .filter(|tok| *tok == xa || *tok == wa)
+                .count();
+            if mentions == 0 {
+                continue;
+            }
+            if gp_reg_write_only(&lines[j], a) {
+                break; // write-only: the chain's value in A is dead here
+            }
+            a_live = true;
+            break;
+        }
+        if a_live {
+            continue;
+        }
+        lines[i] = format!("    mov {}, {}", wreg_name(d), wreg_name(s));
+        kinds[i] = LineKind::Move { dst: d, src: s, is_32bit: true };
+        kinds[i + 1] = LineKind::Nop;
+        kinds[i +2] = LineKind::Nop;
+        changed = true;
     }
     changed
 }
@@ -3069,4 +3151,36 @@ f:
     assert!(!result.contains("stp d22"), "no overlapping re-fusion:\n{}", result);
 }
 
+    // ── Zext move-chain folding ──────────────────────────────────────────
+
+    #[test]
+    fn test_zext_move_chain_folded() {
+        let input = "\
+f:
+    mov x0, x24
+    mov w0, w0
+    mov x26, x0
+    mul w4, w26, w25
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("mov w26, w24"), "chain folded:\n{}", result);
+        assert!(!result.contains("mov w0, w0"));
+    }
+
+    #[test]
+    fn test_zext_move_chain_blocked_when_accumulator_live() {
+        let input = "\
+f:
+    mov x0, x24
+    mov w0, w0
+    mov x26, x0
+    mul w4, w26, w25
+    add w5, w0, #1
+    ret
+";
+        // x0 is read after the chain: folding would lose the zext value.
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("mov w0, w0"), "live accumulator blocks fold:\n{}", result);
+    }
 }
