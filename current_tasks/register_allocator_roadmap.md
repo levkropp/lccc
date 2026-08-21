@@ -72,6 +72,20 @@ architectural, not pass-level. This doc records the evidence and the plan.
   VM, and neither variant beat that band on mandelbrot/fannkuch/
   loop_patterns/strlen_bench. The trampoline jump is effectively free on
   Apple Silicon. Reverted; code deleted.
+- GPR reverse phi coalescing (give an unassigned phi dest the backedge
+  source's register, or allocate both into a proven-free register post-scan):
+  implemented both ways; fires NOWHERE in the suite — hot phi dests already
+  get registers via the loop-pin steal, cold ones don't matter. Removed.
+  Keeping the sources eligible instead (so they get scanned) cost hash_table
+  a reproducible +3% (more scan pressure on x19-x28).
+- Copy-propagating staging movs into cmp/cbz/str first operands (plus
+  treating non-sp ldr as a dest-write in eliminate_overwritten_moves):
+  folds correctly (cbz x19 directly, dead staging movs removed) but
+  hash_table +2.2% reproducibly, binary_trees +0.7%, everything else
+  noise-neutral. Net negative; reverted. Lesson: on Apple Silicon,
+  register movs are rename-eliminated (free), and instruction-count
+  peepholes that do not remove loads, stores, branches, or chain latency
+  cannot win — they only disturb layout.
 - Post-indexed addressing (ldr xN,[xM],#4): neutral-to-slightly-negative on
   Apple Silicon (writeback uop offsets the saved add).
 - ldp/stp pairing of adjacent stack slots: fires too rarely to matter.
