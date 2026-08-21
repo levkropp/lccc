@@ -102,6 +102,28 @@ fn filter_eligible_intervals(
     out
 }
 
+/// Merge every interval segment of each value into one span (min start, max
+/// end). See filter_eligible_intervals for why per-segment scanning is unsafe
+/// with a per-value assignment map.
+fn merge_intervals_by_value(intervals: Vec<LiveInterval>) -> Vec<LiveInterval> {
+    let mut merged: FxHashMap<u32, LiveInterval> = FxHashMap::default();
+    for iv in intervals {
+        if iv.end <= iv.start {
+            continue;
+        }
+        merged
+            .entry(iv.value_id)
+            .and_modify(|m| {
+                m.start = m.start.min(iv.start);
+                m.end = m.end.max(iv.end);
+            })
+            .or_insert(iv);
+    }
+    let mut out: Vec<LiveInterval> = merged.into_values().collect();
+    out.sort_by_key(|iv| iv.start);
+    out
+}
+
 /// Run the register allocator on a function.
 ///
 /// Strategy: We assign callee-saved registers to values with the longest
@@ -758,7 +780,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 }
             })
             .copied()
-            .collect();
+            .collect::<Vec<_>>();
+        // One range per value (the assignment map is per value — see
+        // merge_intervals_by_value). Without this, a multi-segment F64 value's
+        // segments are scanned independently and the last write wins.
+        let f64_intervals = merge_intervals_by_value(f64_intervals);
 
         if std::env::var("CCC_DEBUG_VECREG").is_ok() {
             eprintln!("[VECREG] func={} vector_values={:?}", func.name, vector_values);
@@ -794,10 +820,24 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 &f64_intervals,
                 &liveness.block_loop_depth,
                 func,
-                false,
+                true,
             );
+            // Pool order for the general (non-call-spanning) scan: caller-saved
+            // d16-d31 (ids 40+) first, callee-saved d8-d14 (ids 32-38) last.
+            // Call-spanning F64 values can ONLY use d8-d14 (restricted below),
+            // so general values should prefer the caller-saved pool — but may
+            // overflow into d8-d14 when it is full (reserving d8-d14 entirely
+            // caused FP spill storms in struct_copy's wide loops).
+            let xmm_pool: Vec<PhysReg> = if arm_fp_pool {
+                let mut caller: Vec<PhysReg> = config.xmm_regs.iter().copied().filter(|r| r.0 >= 40).collect();
+                let mut callee: Vec<PhysReg> = config.xmm_regs.iter().copied().filter(|r| (32..=38).contains(&r.0)).collect();
+                caller.append(&mut callee);
+                caller
+            } else {
+                config.xmm_regs.clone()
+            };
             let mut xmm_allocator =
-                LinearScanAllocator::new(f64_ranges, config.xmm_regs.clone());
+                LinearScanAllocator::new(f64_ranges, xmm_pool);
             // Confine call-spanning F64 values to the callee-saved FP subset
             // (allocator IDs 32..=38 → d8-d14) present in the pool; the
             // caller-saved d16-d31 would be clobbered by the spanned call.
