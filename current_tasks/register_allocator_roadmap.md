@@ -65,6 +65,13 @@ architectural, not pass-level. This doc records the evidence and the plan.
 
 ## Reverted / documented dead-ends (measured, do not retry)
 
+- Skip-trampoline straightening (b.cc TA / .Lskip: b TB layouts in loops):
+  both condition inversion (b.inv TB; b TA) and hoisting the single-
+  predecessor target block into the fall-through slot are noise-neutral on
+  the suite — A/B control runs (same binary vs itself) swing +/-2.5% on this
+  VM, and neither variant beat that band on mandelbrot/fannkuch/
+  loop_patterns/strlen_bench. The trampoline jump is effectively free on
+  Apple Silicon. Reverted; code deleted.
 - Post-indexed addressing (ldr xN,[xM],#4): neutral-to-slightly-negative on
   Apple Silicon (writeback uop offsets the saved add).
 - ldp/stp pairing of adjacent stack slots: fires too rarely to matter.
