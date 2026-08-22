@@ -79,6 +79,44 @@ impl ArmCodegen {
         self.store_x0_to(dest);
     }
 
+    pub(super) fn emit_int_fused_mul_sub_impl(
+        &mut self, lhs: &Operand, rhs: &Operand, acc: &Operand, dest: &Value, ty: IrType,
+    ) {
+        // a - b*c → msub dest, b, c, a (single instruction on AArch64).
+        let use_32bit = matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32);
+        let mut materialize = |this: &mut Self, op: &Operand, scratch: &str| -> String {
+            if let Some(reg) = this.operand_reg(op) {
+                if use_32bit { callee_saved_name_32(reg).to_string() }
+                else { callee_saved_name(reg).to_string() }
+            } else {
+                if let Operand::Value(v) = op {
+                    if !this.state.is_alloca(v.0) {
+                        if let Some(slot) = this.state.get_slot(v.0) {
+                            this.emit_load_from_sp(scratch, slot.0, "ldr");
+                            return scratch.to_string();
+                        }
+                    }
+                }
+                this.operand_to_x0(op);
+                let acc_name = if use_32bit { "w0" } else { "x0" };
+                this.state.emit_fmt(format_args!("    mov {}, {}", scratch, acc_name));
+                scratch.to_string()
+            }
+        };
+        let lhs_reg = materialize(self, lhs, if use_32bit { "w1" } else { "x1" });
+        let rhs_reg = materialize(self, rhs, if use_32bit { "w2" } else { "x2" });
+        let acc_reg = materialize(self, acc, if use_32bit { "w3" } else { "x3" });
+        if let Some(dest_phys) = self.dest_reg(dest) {
+            let output = if use_32bit { callee_saved_name_32(dest_phys) } else { callee_saved_name(dest_phys) };
+            self.state.emit_fmt(format_args!("    msub {}, {}, {}, {}", output, lhs_reg, rhs_reg, acc_reg));
+            self.state.reg_cache.invalidate_acc();
+            return;
+        }
+        let output = if use_32bit { "w0" } else { "x0" };
+        self.state.emit_fmt(format_args!("    msub {}, {}, {}, {}", output, lhs_reg, rhs_reg, acc_reg));
+        self.store_x0_to(dest);
+    }
+
     pub(super) fn emit_float_neg_impl(&mut self, ty: IrType) {
         if ty == IrType::F32 {
             self.state.emit("    fmov s0, w0");

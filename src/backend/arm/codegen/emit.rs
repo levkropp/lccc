@@ -1888,6 +1888,10 @@ impl ArchCodegen for ArmCodegen {
                           acc: &Operand, sub_dest: &Value, ty: IrType, mul_is_lhs: bool) {
         if ty == IrType::F32 || ty == IrType::F64 {
             self.emit_fused_mul_sub_impl(mul_dest, mul_lhs, mul_rhs, acc, sub_dest, ty, mul_is_lhs);
+        } else if !mul_is_lhs && std::env::var("CCC_NO_MSUB").is_err() {
+            // a - b*c with the mul on the right: single msub on AArch64
+            // (same latency as the mul, one fewer instruction).
+            self.emit_int_fused_mul_sub_impl(mul_lhs, mul_rhs, acc, sub_dest, ty);
         } else {
             // Integer sub fusion is not profitable here; separate mul + sub.
             self.emit_int_binop(mul_dest, IrBinOp::Mul, mul_lhs, mul_rhs, ty);
