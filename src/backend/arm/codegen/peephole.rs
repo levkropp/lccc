@@ -1700,7 +1700,40 @@ fn eliminate_redundant_sxtw(lines: &mut [String], kinds: &mut [LineKind], n: usi
                 // equals their sign extension, so a later sxtw is redundant.
                 let t = lines[i].trim();
                 let mut nonneg_dst: Option<u8> = None;
-                if let Some(rest) = t.strip_prefix("ubfx ") {
+                // mov/movz with a non-negative constant below 2^31.
+                for pfx in ["mov w", "mov x", "movz w", "movz x"] {
+                    if let Some(rest) = t.strip_prefix(pfx) {
+                        if let Some((reg_s, imm_s)) = rest.split_once(", ") {
+                            if let Some(imm_s) = imm_s.trim().strip_prefix('#') {
+                                // Optional ", lsl #K" second shift component.
+                                let mut val: Option<u64> = None;
+                                if let Some((base, lsl)) = imm_s.split_once(", lsl #") {
+                                    if let (Ok(b), Ok(k)) = (base.parse::<i64>(), lsl.parse::<u32>()) {
+                                        if b >= 0 && k < 32 {
+                                            let v = (b as u64) << k;
+                                            val = Some(v);
+                                        }
+                                    }
+                                } else if let Ok(b) = imm_s.parse::<i64>() {
+                                    if b >= 0 {
+                                        val = Some(b as u64);
+                                    }
+                                }
+                                if let Some(v) = val {
+                                    if v < (1u64 << 31) {
+                                        if let Ok(d) = reg_s.trim().parse::<u8>() {
+                                            if d < 32 {
+                                                nonneg_dst = Some(d);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if nonneg_dst.is_none() {
+                    if let Some(rest) = t.strip_prefix("ubfx ") {
                     // ubfx wD, wS, #K, #N — bit 31 clear when K+N <= 31
                     let parts: Vec<&str> = rest.split(", ").collect();
                     if parts.len() == 4 {
@@ -1735,8 +1768,18 @@ fn eliminate_redundant_sxtw(lines: &mut [String], kinds: &mut [LineKind], n: usi
                             if m >= 0 && m < (1i64 << 31) && d < 32 {
                                 nonneg_dst = Some(d);
                             }
+                        } else {
+                            // Register mask: bit 31 clear when clear in both inputs.
+                            let a = parse_reg(parts[1]);
+                            let b = parse_reg(parts[2]);
+                            if d < 32 && a < 33 && b < 33
+                                && extended[a as usize] && extended[b as usize]
+                            {
+                                nonneg_dst = Some(d);
+                            }
                         }
                     }
+                }
                 }
                 if let Some(d) = nonneg_dst {
                     extended[d as usize] = true;
