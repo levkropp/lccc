@@ -17,10 +17,22 @@ struct Path { root: u32, offset: i64 }
 
 fn pointer_paths(func: &IrFunction) -> FxHashMap<u32, Path> {
     let mut paths = FxHashMap::default();
+    // Global addresses root paths too: a global's storage never overlaps an
+    // alloca's, and same-name globals share a synthetic root so range
+    // separation still applies. Synthetic roots sit above any real value id.
+    let mut global_ids: FxHashMap<&str, u32> = FxHashMap::default();
     for block in &func.blocks {
         for inst in &block.instructions {
-            if let Instruction::Alloca { dest, .. } = inst {
-                paths.insert(dest.0, Path { root: dest.0, offset: 0 });
+            match inst {
+                Instruction::Alloca { dest, .. } => {
+                    paths.insert(dest.0, Path { root: dest.0, offset: 0 });
+                }
+                Instruction::GlobalAddr { dest, name } => {
+                    let next = global_ids.len() as u32 + 1;
+                    let gid = *global_ids.entry(name.as_str()).or_insert(u32::MAX - next);
+                    paths.insert(dest.0, Path { root: gid, offset: 0 });
+                }
+                _ => {}
             }
         }
     }

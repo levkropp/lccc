@@ -326,7 +326,23 @@ pub(crate) fn affine_disjoint(
             store.0, sf.as_ref().map(|f| (f.root, &f.syms, f.konst, f.march)));
     }
     let (Some(cf), Some(sf)) = (cf, sf) else { return false };
-    if cf.root == 0 || cf.root != sf.root { return false; }
+    if cf.root != sf.root {
+        // Different roots can still be provably disjoint by storage kind:
+        // an alloca never coincides with a global or with a parameter's
+        // pointee (its frame slot did not exist when the arguments were
+        // formed), and two distinct globals name distinct storage. A
+        // param/global pair can genuinely alias (f(&g)); anything involving
+        // an opaque or constant root stays conservative.
+        if cf.root == 0 || sf.root == 0 { return false; }
+        let kind = |r: u64| {
+            if (0x1_0000_0000..0x2_0000_0000).contains(&r) { 1 }      // alloca
+            else if (0x2_0000_0000..0x3_0000_0000).contains(&r) { 2 } // param
+            else if (0x3_0000_0000..0x4_0000_0000).contains(&r) { 3 } // opaque
+            else { 4 }                                               // global name hash
+        };
+        let (a, b) = (kind(cf.root), kind(sf.root));
+        return matches!((a, b), (1, 4) | (4, 1) | (1, 2) | (2, 1)) || (a == 4 && b == 4);
+    }
 
     let (cand_sz, store_sz) = (byte_size(cand_ty), byte_size(store_ty));
     if sf.march == 0 && cf.march == 0 {
