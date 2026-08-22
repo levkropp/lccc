@@ -110,6 +110,12 @@ module text with shared state — function-local reasoning is unsafe there.
   costs allocation quality. Also required fixing the AArch64 FP-pool
   detection (keyed on x28 in available_regs, which the swap empties).
   Reverted.
+- GPR point-precise copy-web coalescing (the FP version of 6b8fa0b5 for
+  integer/pointer webs): segfaults strlen_bench even restricted to
+  callee-saved targets — late assignment of a GPR to a formerly slot-homed
+  pointer flips GEP-fold/addressing emission decisions made under different
+  assumptions. FP values have uniform emission; GPR values entangle with
+  address generation. Reverted; FP-only stands.
 - SLP pairing of adjacent F64 fields (nbody dx,dy as .2d vectors): measured
   ceiling ~1% via a hand-written vector advance loop (178 vs 176ms). The
   inner loop is bound by the fsqrt+fdiv serial chain (~26 cycles/iter), not
