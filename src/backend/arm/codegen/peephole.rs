@@ -1615,7 +1615,7 @@ fn fold_shift_mask_ubfx(lines: &mut [String], kinds: &mut [LineKind], n: usize) 
             continue;
         }
         lines[i] = format!("    ubfx {}, {}, #{}, #{}", parts[0], parts[2], shift, width);
-        kinds[i] = LineKind::Other;
+        kinds[i] = LineKind::Alu;
         changed = true;
     }
     changed
@@ -1696,7 +1696,51 @@ fn eliminate_redundant_sxtw(lines: &mut [String], kinds: &mut [LineKind], n: usi
                 }
             }
             _ => {
-                if let Some(dst) = written_gp_register(&lines[i], kinds[i]) {
+                // Producers of values with bit 31 clear: their 64-bit form
+                // equals their sign extension, so a later sxtw is redundant.
+                let t = lines[i].trim();
+                let mut nonneg_dst: Option<u8> = None;
+                if let Some(rest) = t.strip_prefix("ubfx ") {
+                    // ubfx wD, wS, #K, #N — bit 31 clear when K+N <= 31
+                    let parts: Vec<&str> = rest.split(", ").collect();
+                    if parts.len() == 4 {
+                        let d = parse_reg(parts[0]);
+                        let k = parts[2].strip_prefix('#').and_then(|v| v.parse::<u32>().ok());
+                        let wd = parts[3].strip_prefix('#').and_then(|v| v.parse::<u32>().ok());
+                        if let (Some(k), Some(wd)) = (k, wd) {
+                            if k + wd <= 31 && d < 32 {
+                                nonneg_dst = Some(d);
+                            }
+                        }
+                    }
+                } else if let Some(rest) = t.strip_prefix("lsr ") {
+                    // lsr wD, wS, #K with K >= 1: bit 31 clear
+                    let parts: Vec<&str> = rest.split(", ").collect();
+                    if parts.len() == 3 {
+                        let d = parse_reg(parts[0]);
+                        let k = parts[2].strip_prefix('#').and_then(|v| v.parse::<u32>().ok());
+                        if let Some(k) = k {
+                            if k >= 1 && d < 32 {
+                                nonneg_dst = Some(d);
+                            }
+                        }
+                    }
+                } else if let Some(rest) = t.strip_prefix("and ") {
+                    // and wD, wS, #imm with imm's bit 31 clear
+                    let parts: Vec<&str> = rest.split(", ").collect();
+                    if parts.len() == 3 {
+                        let d = parse_reg(parts[0]);
+                        let m = parts[2].strip_prefix('#').and_then(|v| v.parse::<i64>().ok());
+                        if let Some(m) = m {
+                            if m >= 0 && m < (1i64 << 31) && d < 32 {
+                                nonneg_dst = Some(d);
+                            }
+                        }
+                    }
+                }
+                if let Some(d) = nonneg_dst {
+                    extended[d as usize] = true;
+                } else if let Some(dst) = written_gp_register(&lines[i], kinds[i]) {
                     if dst < 32 {
                         extended[dst as usize] = false;
                     }
