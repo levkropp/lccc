@@ -443,6 +443,7 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= fuse_fp_adjacent_pairs(&mut lines, &mut kinds, n);
         changed |= eliminate_repeated_slot_loads(&mut lines, &mut kinds, n);
         changed |= fold_destructive_pointer_updates(&mut lines, &mut kinds, n);
+        changed |= fold_csel_increment(&mut lines, &mut kinds, n);
         changed |= fuse_branch_over_branch(&mut lines, &mut kinds, n);
         // After the folds: dead staging movs (their patterns must win first).
         changed |= eliminate_overwritten_moves(&lines, &mut kinds, n);
@@ -496,6 +497,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= fuse_fp_adjacent_pairs(&mut lines, &mut kinds, n);
             changed2 |= eliminate_repeated_slot_loads(&mut lines, &mut kinds, n);
             changed2 |= fold_destructive_pointer_updates(&mut lines, &mut kinds, n);
+            changed2 |= fold_csel_increment(&mut lines, &mut kinds, n);
             changed2 |= eliminate_overwritten_moves(&lines, &mut kinds, n);
             changed2 |= eliminate_overwritten_stores(&lines, &mut kinds, n);
             rounds2 += 1;
@@ -4741,3 +4743,199 @@ f:
         assert!(!sink_loop_carried_stores(&mut lines, &mut kinds, n));
     }
 }
+/// Fold an increment-feeding-csel into a single csinc:
+///   add wA, wB, #1            add wA, wB, #1
+///   ...                       ...
+///   csel wD, wA, wB, cc   OR  csel wD, wB, wA, cc
+/// becomes `csinc wD, wB, wB, !cc` / `csinc wD, wB, wB, cc` and the add is
+/// deleted. Fires on if-converted `if (x) count++` loops (sieve's prime
+/// count loop) where the select's separate increment occupies an extra
+/// dispatch slot in a branch-throughput-bound loop.
+///
+/// Soundness: the add's dest A must have no other mentions anywhere in the
+/// function text (w- and x-names alias the same register), B must not be
+/// rewritten between the add and the csel, and the scan stays within one
+/// basic block (any label/branch/call stops it). csel and csinc read flags
+/// identically and neither writes flags; the deleted add is the
+/// flag-neutral form (not `adds`).
+fn fold_csel_increment(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    fn mentions(line: &str, reg: u8) -> bool {
+        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|tok| tok == xreg_name(reg) || tok == wreg_name(reg))
+    }
+    fn canonical_cond(cc: &str) -> Option<&'static str> {
+        Some(match cc {
+            "eq" => "eq",
+            "ne" => "ne",
+            "lt" => "lt",
+            "ge" => "ge",
+            "gt" => "gt",
+            "le" => "le",
+            "hi" => "hi",
+            "ls" => "ls",
+            "hs" | "cs" => "hs",
+            "lo" | "cc" => "lo",
+            "mi" => "mi",
+            "pl" => "pl",
+            "vs" => "vs",
+            "vc" => "vc",
+            _ => return None,
+        })
+    }
+    let mut changed = false;
+    for i in 0..n {
+        if kinds[i] != LineKind::Alu {
+            continue;
+        }
+        let t = lines[i].trim().to_string();
+        let Some(rest) = t.strip_prefix("add ") else { continue };
+        let mut parts = rest.split(", ");
+        let (Some(a_str), Some(b_str), Some(imm)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if parts.next().is_some() || imm.trim() != "#1" {
+            continue;
+        }
+        let a_str = a_str.trim();
+        let b_str = b_str.trim();
+        let is_32 = a_str.starts_with('w');
+        let prefix = if is_32 { 'w' } else { 'x' };
+        if !a_str.starts_with(prefix) || !b_str.starts_with(prefix) {
+            continue;
+        }
+        let a = parse_reg(a_str);
+        let b = parse_reg(b_str);
+        if a == REG_NONE || b == REG_NONE || a >= 29 || b >= 29 {
+            continue;
+        }
+        // Find the consuming csel in the same basic block.
+        let mut found: Option<(usize, u8, &'static str)> = None;
+        let mut j = i + 1;
+        while j < n {
+            match kinds[j] {
+                LineKind::Nop | LineKind::Directive => {}
+                LineKind::Label
+                | LineKind::Branch
+                | LineKind::CondBranch
+                | LineKind::CmpBranch
+                | LineKind::Ret
+                | LineKind::Call => break,
+                _ => {
+                    // B must survive unchanged from the add to the csel.
+                    if gp_reg_written_broad(&lines[j], b) {
+                        break;
+                    }
+                    let tj = lines[j].trim();
+                    if let Some(rest) = tj.strip_prefix("csel ") {
+                        let mut p = rest.split(", ");
+                        if let (Some(d_s), Some(x_s), Some(y_s), Some(cc_s)) =
+                            (p.next(), p.next(), p.next(), p.next())
+                        {
+                            let d = parse_reg(d_s.trim());
+                            let x = parse_reg(x_s.trim());
+                            let y = parse_reg(y_s.trim());
+                            let cc_s = cc_s.trim();
+                            let width_ok = d_s.trim().starts_with(prefix)
+                                && x_s.trim().starts_with(prefix)
+                                && y_s.trim().starts_with(prefix);
+                            if width_ok && d != REG_NONE {
+                                if x == a && y == b {
+                                    // True arm is B+1: csinc D, B, B, !cc
+                                    if let Some(inv) = invert_condition(cc_s) {
+                                        found = Some((j, d, inv));
+                                    }
+                                    break;
+                                } else if x == b && y == a {
+                                    // False arm is B+1: csinc D, B, B, cc
+                                    if let Some(cc) = canonical_cond(cc_s) {
+                                        found = Some((j, d, cc));
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            j += 1;
+        }
+        let Some((cj, d, cc)) = found else { continue };
+        // Prove A dead after the csel: scan to the end of the function's
+        // text; the next mention of A must be a write that does not read it
+        // (mov/load-dest), or the function must end first. Mirrors the
+        // discipline of propagate_address_aliases.
+        let mut dead = false;
+        let mut k = cj + 1;
+        while k < n {
+            let lk = lines[k].trim_end();
+            // Column-0 identifier label: end of the function's text.
+            if lk.ends_with(':') && lk.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+                dead = true;
+                break;
+            }
+            match kinds[k] {
+                LineKind::Nop | LineKind::Directive | LineKind::Label | LineKind::Ret => {}
+                LineKind::Call => break,
+                _ => {
+                    if mentions(&lines[k], a) {
+                        let trusted_write = match kinds[k] {
+                            LineKind::Move { dst, .. }
+                            | LineKind::MoveImm { dst }
+                            | LineKind::MoveWide { dst }
+                            | LineKind::LoadSp { reg: dst, .. }
+                            | LineKind::LoadswSp { reg: dst, .. } => dst == a,
+                            LineKind::LoadPairSp => {
+                                // `ldp xA, xB, [...]` writes both dests,
+                                // reads neither.
+                                let tk = lines[k].trim();
+                                match tk.split_once(' ') {
+                                    Some((_, rest)) => rest
+                                        .split(',')
+                                        .take(2)
+                                        .any(|op| {
+                                            let op = op.trim();
+                                            op == xreg_name(a) || op == wreg_name(a)
+                                        }),
+                                    None => false,
+                                }
+                            }
+                            LineKind::Alu => {
+                                // `op wA, ...` with A only as the first operand
+                                let tk = lines[k].trim();
+                                match tk.split_once(',') {
+                                    Some((first, rest)) => {
+                                        let dest_is_a = first
+                                            .split_whitespace()
+                                            .last()
+                                            .is_some_and(|t| t == xreg_name(a) || t == wreg_name(a));
+                                        dest_is_a && !mentions(rest, a)
+                                    }
+                                    None => false,
+                                }
+                            }
+                            _ => false,
+                        };
+                        if trusted_write {
+                            dead = true;
+                        }
+                        break;
+                    }
+                }
+            }
+            k += 1;
+        }
+        if k == n {
+            dead = true;
+        }
+        if !dead {
+            continue;
+        }
+        lines[cj] = format!("    csinc {}{}, {}{}, {}{}, {}", prefix, d, prefix, b, prefix, b, cc);
+        kinds[cj] = LineKind::Alu;
+        kinds[i] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
