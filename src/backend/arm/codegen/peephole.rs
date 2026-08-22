@@ -471,6 +471,8 @@ pub fn peephole_optimize(asm: String) -> String {
     // After rotation (phase 1) and dead-store cleanup: sink loop-carried
     // slot-home stores out of bottom-tested loops.
     sink_loop_carried_stores(&mut lines, &mut kinds, n);
+    // Defer callee-saves past clean early returns (binary_trees check).
+    shrink_wrap_early_returns(&mut lines, &mut kinds, n);
 
     // Phase 3: Local cleanup after global passes (up to 4 rounds)
     {
@@ -2334,6 +2336,384 @@ fn retarget_move_imm(line: &str, new_dst: u8) -> Option<String> {
         }
     }
     None
+}
+
+// ── Shrink-wrap: defer callee-saves past a clean early return ───────────────
+//
+// Recursive early-exit functions like binary_trees' check save every
+// callee-saved register at entry, then the null-child path (half the calls)
+// returns immediately — paying 5 stp + 5 ldp for nothing:
+//
+//   check:
+//     stp x29, x30, [sp, #-96]!
+//     stp x19, x20, [sp, #16]   ... 5 saves ...
+//     mov x20, x0; ldr x0, [x0]; mov x19, x0; cmp x19, #0
+//     b.eq .LBB5                (early: return 1, with full restores)
+//     b .LBB6                   (continuation: calls check twice)
+//
+// When the entry region before the first conditional branch is short, the
+// early-exit block is a clean return (no calls), and the continuation has a
+// single predecessor, move the save/restore pairs onto the continuation
+// path. Entry-region uses of saved registers are remapped to free scratch
+// registers (x9-x15) and re-homed with movs after the deferred saves.
+fn shrink_wrap_early_returns(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_SHRINK_WRAP").is_ok() {
+        return false;
+    }
+    let mentions_reg = |text: &str, r: u8| {
+        text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|tok| tok == xreg_name(r) || tok == wreg_name(r))
+    };
+    let mut changed = false;
+    let mut i = 0;
+    while i < n {
+        // Prologue: stp x29, x30, [sp, #-N]! ... mov x29, sp
+        let is_prologue_stp = {
+            let t = lines[i].trim();
+            t.starts_with("stp x29, x30, [sp, #-") && t.ends_with("]!")
+        };
+        if !is_prologue_stp {
+            i += 1;
+            continue;
+        }
+        // Walk to `mov x29, sp`, skipping cfi directives.
+        let mut p = i + 1;
+        while p < n && (kinds[p] == LineKind::Directive || lines[p].trim().starts_with(".cfi_")) {
+            p += 1;
+        }
+        if p >= n || lines[p].trim() != "mov x29, sp" {
+            i += 1;
+            continue;
+        }
+        // Collect consecutive callee-saved GPR stores (skip cfi between).
+        let mut saves: Vec<usize> = Vec::new(); // line indices
+        let mut saved_regs: Vec<u8> = Vec::new();
+        let mut q = p + 1;
+        loop {
+            while q < n && kinds[q] == LineKind::Directive {
+                q += 1;
+            }
+            if q >= n {
+                break;
+            }
+            let t = lines[q].trim().to_string();
+            let mut regs_in_save: Vec<u8> = Vec::new();
+            if let Some(rest) = t.strip_prefix("stp ") {
+                if let Some((regs, addr)) = rest.split_once(", [sp, #") {
+                    if addr.ends_with(']') && !addr.contains("]!") {
+                        let mut it = regs.split(", ");
+                        if let (Some(a), Some(b)) = (it.next(), it.next()) {
+                            let (pa, pb) = (parse_reg(a.trim()), parse_reg(b.trim()));
+                            if (19..=28).contains(&pa) && (19..=28).contains(&pb) {
+                                regs_in_save = vec![pa, pb];
+                            }
+                        }
+                    }
+                }
+            } else if let Some(rest) = t.strip_prefix("str ") {
+                if let Some((reg, addr)) = rest.split_once(", [sp, #") {
+                    if addr.ends_with(']') {
+                        let pr = parse_reg(reg.trim());
+                        if (19..=28).contains(&pr) {
+                            regs_in_save = vec![pr];
+                        }
+                    }
+                }
+            }
+            if !regs_in_save.is_empty() {
+                saves.push(q);
+                saved_regs.extend(regs_in_save);
+                q += 1;
+            } else {
+                break;
+            }
+        }
+        if saves.len() < 2 {
+            i += 1;
+            continue; // nothing worth deferring
+        }
+        // Entry region: q .. first CondBranch e. No labels/branches/calls/ret.
+        let mut e = q;
+        let mut region_ok = true;
+        let mut entry_lines: Vec<usize> = Vec::new();
+        while e < n {
+            match kinds[e] {
+                LineKind::CondBranch => break,
+                LineKind::Nop | LineKind::Directive => {}
+                LineKind::Label | LineKind::Branch | LineKind::CmpBranch | LineKind::Call
+                | LineKind::Ret => {
+                    region_ok = false;
+                    break;
+                }
+                _ => {
+                    if lines[e].contains('\n') {
+                        region_ok = false;
+                        break;
+                    }
+                    entry_lines.push(e);
+                }
+            }
+            e += 1;
+        }
+        if !region_ok || e >= n || e == q {
+            i += 1;
+            continue;
+        }
+        let Some((_, early_lbl)) = cond_branch_parts(lines[e].trim_start()) else {
+            i += 1;
+            continue;
+        };
+        // After e: optional `.Lskip:` + `b .Lcont`, then the early block label.
+        let next_live = |from: usize| (from..n).find(|&j| kinds[j] != LineKind::Nop && kinds[j] != LineKind::Directive);
+        let Some(mut cont_lbl) = next_live(e + 1).map(|j| lines[j].trim().to_string()) else {
+            i += 1;
+            continue;
+        };
+        // Skip a trampoline (label + unconditional branch) to find both blocks.
+        let mut early_pos = None;
+        let mut cont_pos = None;
+        {
+            // If the line after e is a Label followed by an unconditional
+            // branch (the .Lskip trampoline), the branch target is the
+            // continuation block.
+            let mut fall = next_live(e + 1);
+            if let Some(jl) = fall {
+                if kinds[jl] == LineKind::Label {
+                    if let Some(jb) = next_live(jl + 1) {
+                        if kinds[jb] == LineKind::Branch {
+                            if let Some(t) = branch_target(lines[jb].trim_start()) {
+                                cont_lbl = t.to_string();
+                                fall = next_live(jb + 1);
+                            }
+                        }
+                    }
+                }
+            }
+            let _ = fall;
+            let early_with_colon = format!("{}:", early_lbl);
+            let cont_with_colon = format!("{}:", cont_lbl);
+            let mut j = e + 1;
+            while j < n {
+                if kinds[j] == LineKind::Label {
+                    let nm = lines[j].trim();
+                    if nm == early_with_colon {
+                        early_pos = Some(j);
+                    }
+                    if nm == cont_with_colon {
+                        cont_pos = Some(j);
+                    }
+                    if early_pos.is_some() && cont_pos.is_some() {
+                        break;
+                    }
+                }
+                // Stop at the next function.
+                let t = lines[j].trim();
+                if t.starts_with("stp x29, x30, [sp, #-") {
+                    break;
+                }
+                j += 1;
+            }
+        }
+        let (Some(ep), Some(cp)) = (early_pos, cont_pos) else {
+            i += 1;
+            continue;
+        };
+        if cp <= ep {
+            i += 1; // expect continuation after the early block textually
+            continue;
+        }
+        // Early block: [ep+1, cp) — must be a clean return: one ret at end,
+        // no calls, restores exactly the saved regs, no other saved-reg use.
+        let mut early_ok = true;
+        let mut early_restores: Vec<usize> = Vec::new();
+        let mut early_ret = None;
+        for j in ep + 1..cp {
+            if kinds[j] == LineKind::Nop || kinds[j] == LineKind::Directive {
+                continue;
+            }
+            let t = lines[j].trim();
+            match kinds[j] {
+                LineKind::Call | LineKind::Label | LineKind::Branch | LineKind::CondBranch
+                | LineKind::CmpBranch => {
+                    early_ok = false;
+                    break;
+                }
+                LineKind::Ret => {
+                    early_ret = Some(j);
+                }
+                _ => {
+                    let is_restore = (t.starts_with("ldp ") || t.starts_with("ldr "))
+                        && t.contains("[sp");
+                    if is_restore {
+                        // The frame teardown (ldp x29, x30, [sp], #N) stays;
+                        // only callee-saved register restores are deferred.
+                        if t.contains("x30") {
+                            continue;
+                        }
+                        // Must restore only saved regs.
+                        let mut regs_ok = true;
+                        for part in t.split(|c| [',', '[', ']'].contains(&c)) {
+                            let part = part.trim();
+                            if part.starts_with('x') || part.starts_with('w') || part.starts_with('d') {
+                                if let Some(rnum) = part.trim_start_matches(|c| c == 'x' || c == 'w' || c == 'd').parse::<u8>().ok() {
+                                    if (19..=28).contains(&rnum) && !saved_regs.contains(&rnum) {
+                                        regs_ok = false;
+                                    }
+                                }
+                            }
+                        }
+                        if !regs_ok {
+                            early_ok = false;
+                            break;
+                        }
+                        early_restores.push(j);
+                    } else {
+                        // Plain instruction: may not mention saved regs.
+                        if saved_regs.iter().any(|&r| mentions_reg(t, r)) {
+                            early_ok = false;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if !early_ok || early_ret.is_none() {
+            i += 1;
+            continue;
+        }
+        // Continuation: single predecessor (the trampoline from the entry
+        // region) and not the target of any backward branch.
+        let cont_name = cont_lbl.as_str();
+        let mut preds = 0;
+        let mut backward = false;
+        for j in q..n {
+            let t = lines[j].trim();
+            if t.starts_with("stp x29, x30, [sp, #-") && j > cp {
+                break; // next function
+            }
+            for sub in t.split('\n') {
+                if any_branch_target(sub.trim()) == Some(cont_name) {
+                    preds += 1;
+                    // backward if the branch is after the continuation label
+                    if j > cp {
+                        backward = true;
+                    }
+                }
+            }
+        }
+        if preds != 1 || backward {
+            i += 1;
+            continue;
+        }
+        // Remap entry-region uses of saved regs to scratch registers.
+        // Every saved reg mentioned must be written before it is read.
+        let mut used_scratches: Vec<u8> = Vec::new();
+        for r in 9..=15u8 {
+            let used = entry_lines.iter().any(|&j| mentions_reg(lines[j].trim(), r))
+                || mentions_reg(lines[e].trim_start(), r);
+            if !used {
+                used_scratches.push(r);
+            }
+        }
+        let mut remap: Vec<(u8, u8)> = Vec::new(); // (saved, scratch)
+        {
+            let mut first_is_write: FxHashMap<u8, bool> = FxHashMap::default();
+            for &j in &entry_lines {
+                let t = lines[j].trim();
+                for &r in &saved_regs {
+                    if mentions_reg(t, r) && !first_is_write.contains_key(&r) {
+                        first_is_write.insert(r, instr_clobbers_reg(t, r));
+                    }
+                }
+            }
+            let cond_t = lines[e].trim_start();
+            for &r in &saved_regs {
+                if mentions_reg(cond_t, r) && !first_is_write.contains_key(&r) {
+                    first_is_write.insert(r, false); // condbranch reads
+                }
+            }
+            let mut ok = true;
+            for (&r, &is_write) in &first_is_write {
+                if !is_write {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok || first_is_write.len() > used_scratches.len() {
+                i += 1;
+                continue;
+            }
+            let mut order: Vec<u8> = first_is_write.keys().copied().collect();
+            order.sort();
+            for (k, &r) in order.iter().enumerate() {
+                remap.push((r, used_scratches[k]));
+            }
+        }
+        // Apply the rewrite.
+        for &j in &saves {
+            kinds[j] = LineKind::Nop;
+        }
+        for &j in &early_restores {
+            kinds[j] = LineKind::Nop;
+        }
+        // Remap entry region + the conditional branch.
+        let remap_text = |text: &str, remap: &[(u8, u8)]| -> String {
+            let mut out = String::new();
+            let mut last = 0;
+            let bytes = text.as_bytes();
+            let mut idx = 0;
+            while idx < bytes.len() {
+                let c = bytes[idx] as char;
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    let start = idx;
+                    while idx < bytes.len() && (bytes[idx] as char).is_ascii_alphanumeric() || idx < bytes.len() && bytes[idx] == b'_' {
+                        idx += 1;
+                    }
+                    let tok = &text[start..idx];
+                    let mut replaced = None;
+                    for &(from, to) in remap {
+                        if tok == xreg_name(from) {
+                            replaced = Some(xreg_name(to));
+                            break;
+                        }
+                        if tok == wreg_name(from) {
+                            replaced = Some(wreg_name(to));
+                            break;
+                        }
+                    }
+                    if let Some(rep) = replaced {
+                        out.push_str(&text[last..start]);
+                        out.push_str(rep);
+                        last = idx;
+                    }
+                } else {
+                    idx += 1;
+                }
+            }
+            out.push_str(&text[last..]);
+            out
+        };
+        for &j in &entry_lines {
+            lines[j] = remap_text(&lines[j].clone(), &remap);
+            kinds[j] = classify_line(&lines[j]);
+        }
+        lines[e] = remap_text(&lines[e].clone(), &remap);
+        // Insert saves + re-home movs after the continuation label.
+        let mut insert = String::new();
+        for &j in &saves {
+            insert.push('\n');
+            insert.push_str(&lines[j]);
+        }
+        for &(from, to) in &remap {
+            insert.push('\n');
+            insert.push_str(&format!("    mov {}, {}", xreg_name(from), xreg_name(to)));
+        }
+        lines[cp] = format!("{}{}", lines[cp], insert);
+        kinds[cp] = LineKind::Other;
+        changed = true;
+        i = cp; // continue scanning after this function's continuation
+    }
+    changed
 }
 
 // ── Pass 5: Branch-over-branch fusion ────────────────────────────────────────
