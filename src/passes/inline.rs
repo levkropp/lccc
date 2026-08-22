@@ -40,6 +40,20 @@ const MAX_INLINE_BLOCKS_NO_LOOPS: usize = 12;
 /// Prevents exponential blowup from recursive inlining chains.
 const MAX_INLINE_BUDGET_PER_CALLER: usize = 800;
 
+/// Maximum number of self-recursive call copies to inline into a single
+/// function. Bounded self-inlining unrolls the top levels of small recursive
+/// traversals (e.g. binary_trees' check/make), matching GCC's recursive
+/// inlining. Each unrolled level doubles the remaining self-call sites, so
+/// 15 copies unroll ~4 levels. Unlike inlining large foreign callees into a
+/// recursive caller (which the caller_is_recursive guards below restrict),
+/// self-inlined copies share the caller's frame, so the static copy cap
+/// bounds both code size and per-frame stack growth.
+const MAX_SELF_INLINE_COPIES: usize = 15;
+
+/// Maximum instruction count for a self-call's own body to be eligible for
+/// self-inlining. Only small, loop-free recursive functions are unrolled.
+const MAX_SELF_INLINE_INSTRUCTIONS: usize = 40;
+
 /// Maximum total instruction count for a caller function after inlining.
 /// When the caller exceeds this threshold, normal (non-always_inline) inlining
 /// stops. This prevents stack frame bloat: in CCC's codegen model, each SSA
@@ -233,6 +247,8 @@ fn select_inline_site(
     caller_at_absolute_cap: bool,
     caller_has_section: bool,
     caller_is_recursive: bool,
+    caller_name: &str,
+    self_copies_remaining: usize,
     budget_remaining: usize,
     always_inline_budget_remaining: usize,
     loop_blocks: &FxHashSet<usize>,
@@ -274,6 +290,18 @@ fn select_inline_site(
         let is_static_inline_eligible = callee_data.is_static_inline
             && callee_inst_count <= MAX_INLINE_INSTRUCTIONS
             && callee_data.blocks.len() <= callee_block_limit;
+        // Bounded self-inlining: unroll small, loop-free self-recursive calls
+        // up to MAX_SELF_INLINE_COPIES times (see the constant's doc comment).
+        if site.callee_name == caller_name {
+            if self_copies_remaining > 0
+                && !callee_data.has_loops
+                && callee_inst_count <= MAX_SELF_INLINE_INSTRUCTIONS
+                && !caller_at_hard_cap
+            {
+                return Some((site.clone(), callee_inst_count, false));
+            }
+            continue;
+        }
         // For recursive callers, only inline tiny callees and always_inline callees.
         // Inlining larger callees into recursive functions multiplies the stack frame
         // increase by the recursion depth, easily causing stack overflow.
@@ -292,6 +320,11 @@ fn select_inline_site(
         let callee_inst_count: usize = callee_data.blocks.iter()
             .map(|b| b.instructions.len())
             .sum();
+        // Self-calls are only inlined via the bounded self-inlining path in
+        // the first pass.
+        if site.callee_name == caller_name {
+            continue;
+        }
         // For recursive callers, skip non-tiny, non-always_inline callees.
         // (Tiny callees were handled in the first pass.)
         if caller_is_recursive && !callee_data.is_always_inline {
@@ -426,6 +459,8 @@ pub fn run(module: &mut IrModule) -> usize {
         };
         let mut budget_remaining = MAX_INLINE_BUDGET_PER_CALLER;
         let mut always_inline_budget_remaining = MAX_ALWAYS_INLINE_BUDGET_PER_CALLER;
+        let caller_name = module.functions[func_idx].name.clone();
+        let mut self_copies_inlined: usize = 0;
         // Iterate to handle chains of inlined calls (A calls B calls C, all small inline).
         // Limit iterations to prevent infinite loops from recursive inline functions.
         let max_rounds = 200;
@@ -477,6 +512,8 @@ pub fn run(module: &mut IrModule) -> usize {
                 caller_at_absolute_cap,
                 caller_has_section,
                 caller_is_recursive,
+                &caller_name,
+                MAX_SELF_INLINE_COPIES.saturating_sub(self_copies_inlined),
                 budget_remaining,
                 always_inline_budget_remaining,
                 &loop_blocks,
@@ -539,6 +576,9 @@ pub fn run(module: &mut IrModule) -> usize {
                     }
                 } else {
                     budget_remaining = budget_remaining.saturating_sub(callee_inst_count);
+                }
+                if site.callee_name == caller_name {
+                    self_copies_inlined += 1;
                 }
                 total_inlined += 1;
                 module.functions[func_idx].has_inlined_calls = true;
@@ -1299,24 +1339,23 @@ fn find_inline_call_sites(
         for (inst_idx, inst) in block.instructions.iter().enumerate() {
             if let Instruction::Call { func: callee_name, info } = inst {
                 if let Some(callee_data) = callee_map.get(callee_name) {
-                    // Don't inline recursive calls
-                    if callee_name != &func.name {
-                        // Skip functions listed in CCC_INLINE_SKIP
-                        if skip_list.iter().any(|s| s == callee_name) {
-                            continue;
-                        }
-                        // Skip callees that exceed normal limits unless caller has a section
-                        if callee_data.exceeds_normal_limits && !caller_has_section {
-                            continue;
-                        }
-                        sites.push(InlineCallSite {
-                            block_idx,
-                            inst_idx,
-                            callee_name: callee_name.clone(),
-                            dest: info.dest,
-                            args: info.args.clone(),
-                        });
+                    // Self-recursive calls are collected too; select_inline_site
+                    // gates them through the bounded self-inlining path.
+                    // Skip functions listed in CCC_INLINE_SKIP
+                    if skip_list.iter().any(|s| s == callee_name) {
+                        continue;
                     }
+                    // Skip callees that exceed normal limits unless caller has a section
+                    if callee_data.exceeds_normal_limits && !caller_has_section {
+                        continue;
+                    }
+                    sites.push(InlineCallSite {
+                        block_idx,
+                        inst_idx,
+                        callee_name: callee_name.clone(),
+                        dest: info.dest,
+                        args: info.args.clone(),
+                    });
                 }
             }
         }
