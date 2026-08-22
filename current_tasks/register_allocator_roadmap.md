@@ -79,6 +79,16 @@ architectural, not pass-level. This doc records the evidence and the plan.
   No static heuristic separates shallow tree recursion from deep numeric/
   degenerate recursion. Do not retry without a frame model that keeps
   inlined-copy locals out of the recursive frame.
+- Backedge PRE (a08f6768, src/passes/backedge_pre.rs): a loop-top BinOp
+  over a header phi that matches a loop-bottom BinOp over the phi's
+  backedge value becomes a new phi carrying the bottom value across the
+  backedge (GCC reaches the same shape via rotation+CSE). Fusion-aware
+  profitability: the top expr must be a really-emitted instruction and the
+  bottom expr must not be fusion-captured (adding the phi use would break
+  its fmadd/fmsub). mandelbrot hot loop 8 -> 7 FP ops, 1.186 -> 1.084.
+  This is the loop-carried-CSE piece the "rotation is neutral" dead-end
+  did not cover: rotation alone moves branches, PRE removes a multiply
+  from the recurrence's issue count.
 
 ## Latent GDSE bug fixed (2fdf496e)
 

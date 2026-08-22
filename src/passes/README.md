@@ -893,6 +893,7 @@ behavior across iterations.
 | File                     | Description                                            |
 |--------------------------|--------------------------------------------------------|
 | `mod.rs`                 | Pipeline orchestration, dirty tracking, shared analysis |
+| `backedge_pre.rs`        | Backedge PRE: carry loop-bottom exprs to phi-top uses  |
 | `cfg_simplify.rs`        | CFG simplification (branch folding, jump threading)    |
 | `constant_fold.rs`       | Constant expression evaluation at compile time         |
 | `copy_prop.rs`           | Copy propagation with path compression                 |
