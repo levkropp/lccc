@@ -47,6 +47,31 @@ architectural, not pass-level. This doc records the evidence and the plan.
   once per iteration). Fires on sieve's marking loop; most other candidates
   across the suite fail the strict conditions (mid-loop exits, slot reloads,
   or interior labels) — extending it needs dedicated-exit-label analysis.
+- Reverse FP phi coalescing (c3d66f9a): copy-web accumulator phi dests
+  excluded by the real_use filter inherit the backedge source's FP register
+  when conflict-free (nbody -10.7%).
+- phi_antidep_split pass (89ec59c5): rewrites uses of the loop-phi value
+  that occur after the backedge value is born onto an early copy, unblocking
+  backedge coalescing — the exact shape GCC emits (mandelbrot -16%).
+- adr (not adrp+add) for jump-table bases; shift-mask-to-ubfx peephole;
+  wzr/xzr zero stores; FP copies staged through x0 folded to fmov dB, dA.
+- Small-leaf caller-saved-first pool swap (2fdf496e): tiny call-free
+  functions (<=40 IR insts) scan x4-x8/x13/x14 first — qsort's cmp callback
+  lost its 5-pair save storm (qsort -12%, at GCC parity). Critical details:
+  disable the pure-scalar pool extension (x9-x12/x15 are emitter scratch a
+  caller may hold live across the call), param pre-stores to x4-x8 only
+  with <=4 GP params, recompute used_callee_saved from assignments.
+
+## Latent GDSE bug fixed (2fdf496e)
+
+GDSE (module-wide) only resolved ldr/ldp/ldur through tracked base
+registers; ldrsw/ldrsb/ldrsh/ldrb/ldrh via a base were never accounted as
+loads, so stores covering those slots were deletable. Masked for a long
+time because an escape bail usually fired first; the leaf swap changed
+classify's text enough to expose it (ternary_chains). Fix also brought
+correctness to 49/50 (void_pointer_arith). NOTE: GDSE runs on the whole
+module text with shared state — function-local reasoning is unsafe there.
+
 
 ## Latent bug fixed this session (was committed as a0791ef9)
 
