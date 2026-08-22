@@ -72,6 +72,37 @@ fn eliminate_dead_aggregate_field_stores(func: &mut IrFunction) -> usize {
                     }
                     root_suffix.get(&src.0).copied().map(|p| (dest.0, p))
                 }
+                // Pointer arithmetic lowered as an integer-style BinOp
+                // (e.g. `(char*)p + k` becomes `Add ptr, k` with an integer
+                // type). The offset is not a GEP path, so be conservative:
+                // same root, unknown suffix — a load through the result reads
+                // the whole aggregate. Without this, initializer stores to an
+                // array read only through cast-pointer arithmetic were deleted
+                // as unread (void_pointer_arith). Pointer subtraction of two
+                // tracked pointers yields an integer, not a pointer — not
+                // tracked.
+                Instruction::BinOp { dest, op, lhs, rhs, .. }
+                    if matches!(op, crate::ir::reexports::IrBinOp::Add | crate::ir::reexports::IrBinOp::Sub) =>
+                {
+                    let side = |o: &Operand| match o {
+                        Operand::Value(v) => root_suffix.get(&v.0).copied(),
+                        _ => None,
+                    };
+                    match (side(lhs), side(rhs)) {
+                        (Some((root, _)), None) => Some((dest.0, (root, SUFFIX_UNKNOWN))),
+                        (None, Some((root, _)))
+                            if matches!(op, crate::ir::reexports::IrBinOp::Add) =>
+                        {
+                            Some((dest.0, (root, SUFFIX_UNKNOWN)))
+                        }
+                        _ => None,
+                    }
+                }
+                // Pointer-cast derivations (`(char*)p`, `(void*)p`) preserve the
+                // address; track them with the same suffix.
+                Instruction::Cast { dest, src: Operand::Value(src), .. } => {
+                    root_suffix.get(&src.0).copied().map(|p| (dest.0, p))
+                }
                 Instruction::Phi { dest, incoming, .. } => {
                     let vals: Vec<(u32, i64)> = incoming.iter().filter_map(|(op, _)| match op {
                         Operand::Value(v) => root_suffix.get(&v.0).copied(), _ => None }).collect();

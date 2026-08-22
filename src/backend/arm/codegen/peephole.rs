@@ -3300,10 +3300,23 @@ fn track_sp_bases(line: &str, kind: LineKind, base_off: &mut FxHashMap<u8, i32>)
                         return;
                     }
                     if let Some(&off) = base_off.get(&src) {
+                        // Derivation/adjustment of a tracked base: the source
+                        // is only READ (its lineage continues) and the
+                        // destination joins the lineage. Must return here:
+                        // falling through to the write-scan would mis-flag the
+                        // source operand as clobbered and delete the freshly
+                        // inserted destination (two-step sp derivations like
+                        // `add x23, x0, #8` never survived, so loads through
+                        // them went unrecorded and live stores were deleted —
+                        // void_pointer_arith).
                         if dst < 29 {
                             base_off.insert(dst, off + signed);
                         }
+                        return;
                     }
+                    // Non-base source: the write ends any lineage of dst.
+                    base_off.remove(&dst);
+                    return;
                 }
             }
         }
@@ -3319,6 +3332,7 @@ fn track_sp_bases(line: &str, kind: LineKind, base_off: &mut FxHashMap<u8, i32>)
             }
             let src = parse_reg(src_s);
             if let Some(&off) = base_off.get(&src) {
+                // mov xM, xN: xM joins the lineage; xN is only read.
                 if dst < 29 {
                     base_off.insert(dst, off);
                 }
@@ -3326,6 +3340,8 @@ fn track_sp_bases(line: &str, kind: LineKind, base_off: &mut FxHashMap<u8, i32>)
                 // mov xN, <non-base>: clobbered, lineage ends.
                 base_off.remove(&dst);
             }
+            // Same early-return requirement as the add/sub branch above.
+            return;
         }
     }
     // Calls clobber caller-saved registers: end those lineages.
