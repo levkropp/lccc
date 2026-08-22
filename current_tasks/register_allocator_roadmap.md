@@ -113,13 +113,17 @@ module text with shared state — function-local reasoning is unsafe there.
   get registers via the loop-pin steal, cold ones don't matter. Removed.
   Keeping the sources eligible instead (so they get scanned) cost hash_table
   a reproducible +3% (more scan pressure on x19-x28).
-- Leaf-function pool swap (scan caller-saved x4-x8/x13/x14 before the
-  callee-saved pool in call-free functions to skip the prologue spill
-  storm): qsort +15% reproducible, everything else neutral. The stp/ldp
-  save pairs are L1-cached and effectively free; the smaller hot pool just
-  costs allocation quality. Also required fixing the AArch64 FP-pool
-  detection (keyed on x28 in available_regs, which the swap empties).
-  Reverted.
+- Leaf-function pool swap, UNRESTRICTED (scan caller-saved before the
+  callee-saved pool in all call-free functions): qsort +15% reproducible —
+  the smaller hot pool costs allocation quality. The RESTRICTED version
+  (<=40 IR instructions, with the scratch-pool exclusion and param
+  pre-store fixes) landed in 2fdf496e and is a win.
+- Whole-function never-read move elimination (to kill staging movs like
+  sieve's mov x24, x0): the whole-function variant (all reads before all
+  writes) is sound but fires nowhere useful; the per-write variant (no read
+  until the next textual write) is UNSOUND without dominance — a read on a
+  branch path that bypasses the next write still sees our value. Mass
+  miscompiles; reverted. Needs real dominator-based liveness to revisit.
 - Relaxing the swap-cycle rule in detect_phi_coalesce_groups to allow
   multi-def sources when no reverse copy exists (targeting mandelbrot's
   residual latch fmov): mandelbrot +15% immediately — the exclusion is
