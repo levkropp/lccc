@@ -1087,16 +1087,17 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     }
 
     // GPR copy-web coalescing with the same all-holders point-precise rule.
-    // Callee-saved targets only: caller-saved registers are written by
-    // call-site argument staging even when a value's interval does not
-    // strictly contain the call point. Newly assigned callee-saved registers
-    // join used_regs_set so the prologue saves them.
+    // Newly assigned callee-saved registers join used_regs_set so the
+    // prologue saves them. Caller-saved targets (x4-x7, x13, x14) are allowed
+    // only for values that do not span a call.
     // CCC_NO_WEB_POINT_GPR disables.
     if config.xmm_regs.first().is_some_and(|r| r.0 == 40)
         && std::env::var("CCC_NO_WEB_POINT_GPR").is_err()
         && !liveness.block_live_in.is_empty()
     {
         let diag = std::env::var("CCC_WEB_DIAG").is_ok();
+        let is_gpr_reg = |r: &PhysReg| (4..=7).contains(&r.0) || r.0 == 13 || r.0 == 14 || (19..=28).contains(&r.0);
+        let caller_only = |r: &PhysReg| (4..=7).contains(&r.0) || r.0 == 13 || r.0 == 14;
         for _round in 0..8 {
             let mut any = false;
             for block in &func.blocks {
@@ -1105,13 +1106,21 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         if !eligible.contains(&dest.0) || !eligible.contains(&src_v.0) {
                             continue;
                         }
-                        let d_reg = assignments.get(&dest.0).copied().filter(|r| (19..=28).contains(&r.0));
-                        let s_reg = assignments.get(&src_v.0).copied().filter(|r| (19..=28).contains(&r.0));
+                        let d_reg = assignments.get(&dest.0).copied().filter(|r| is_gpr_reg(r));
+                        let s_reg = assignments.get(&src_v.0).copied().filter(|r| is_gpr_reg(r));
                         let (_a, u, reg) = match (d_reg, s_reg) {
                             (Some(_), Some(_)) | (None, None) => continue,
                             (Some(r), None) => (dest.0, src_v.0, r),
                             (None, Some(r)) => (src_v.0, dest.0, r),
                         };
+                        if caller_only(&reg) {
+                            let spans = liveness.intervals.iter().any(|iv| {
+                                iv.value_id == u && call_points.iter().any(|&cp| iv.start < cp && cp < iv.end)
+                            });
+                            if spans {
+                                continue;
+                            }
+                        }
                         let holders: Vec<u32> = assignments.iter()
                             .filter(|(_, &r)| r.0 == reg.0)
                             .map(|(&v, _)| v)
@@ -1121,7 +1130,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                                 eprintln!("[WEBPOINT-GPR] func={} merge v{} into x{}", func.name, u, reg.0);
                             }
                             assignments.insert(u, reg);
-                            used_regs_set.insert(reg.0);
+                            if (19..=28).contains(&reg.0) {
+                                used_regs_set.insert(reg.0);
+                            }
                             any = true;
                         }
                     }
