@@ -28,28 +28,29 @@ An 18-benchmark suite covering integer, FP, memory-bound, and call-heavy workloa
 
 | Benchmark | Workload | LCCC | GCC | Ratio |
 |-----------|----------|-----:|----:|:-----:|
-| `arith_loop` | 32-var arithmetic loop | 0.035s | 0.030s | 1.15× |
-| `fib` | fib(40) recursive | <0.001s | 0.091s | **~600× faster** |
-| `matmul` | 256×256 FP matrix multiply | 0.0024s | 0.0029s | **1.17× faster** |
-| `qsort` | quicksort 1M integers | 0.080s | 0.071s | 1.12× |
-| `sieve` | Eratosthenes 10M | 0.019s | 0.016s | 1.15× |
+| `arith_loop` | 32-var arithmetic loop | 0.034s | 0.031s | 1.12× |
+| `fib` | fib(40) recursive | <0.001s | 0.090s | **~600× faster** |
+| `matmul` | 256×256 FP matrix multiply | 0.0026s | 0.0030s | **1.15× faster** |
+| `qsort` | quicksort 1M integers | 0.070s | 0.073s | **1.04× faster** |
+| `sieve` | Eratosthenes 10M | 0.019s | 0.017s | 1.16× |
 | `tce_sum` | tail-recursive sum(10M) | 0.0001s | 0.0001s | 1.0× |
-| `nbody` | N-body FP simulation | 0.218s | 0.166s | 1.31× |
-| `binary_trees` | malloc/free recursion | 0.908s | 0.755s | 1.20× |
-| `spectral_norm` | FP dense loops | 0.165s | 0.139s | 1.19× |
-| `mandelbrot` | FP inner loop | 0.663s | 0.502s | 1.32× |
-| `hash_table` | pointer chasing | 11.47s | 9.16s | 1.25× |
-| `strlen_bench` | string processing | 0.160s | 0.139s | 1.16× |
-| `switch_dispatch` | jump tables | 0.418s | 0.348s | 1.20× |
-| `struct_copy` | struct copy/field access | 0.014s | 0.011s | 1.20× |
-| `loop_patterns` | reduce/transform/prefix | 0.030s | 0.031s | **1.0× parity** |
-| `fannkuch` | Fannkuch-Redux permutations | 3.34s | 1.81s | 1.85× |
+| `nbody` | N-body FP simulation | 0.186s | 0.165s | 1.13× |
+| `binary_trees` | malloc/free recursion | 0.835s | 0.730s | 1.14× |
+| `spectral_norm` | FP dense loops | 0.130s | 0.135s | **1.04× faster** |
+| `mandelbrot` | FP inner loop | 0.555s | 0.495s | 1.12× |
+| `hash_table` | pointer chasing | 9.84s | 8.08s | 1.22× |
+| `strlen_bench` | string processing | 0.147s | 0.136s | 1.08× |
+| `switch_dispatch` | jump tables | 0.402s | 0.349s | 1.15× |
+| `struct_copy` | struct copy/field access | 0.013s | 0.012s | 1.08× |
+| `loop_patterns` | reduce/transform/prefix | 0.032s | 0.032s | **1.0× parity** |
+| `fannkuch` | Fannkuch-Redux permutations | 2.035s | 1.981s | 1.03× |
 | `ackermann` | ackermann(3,11) | <0.001s | 0.098s | **~600× faster** |
 | `bitops` | popcount/clz/reverse | 0.092s | 0.169s | **1.8× faster** |
 
-**Geometric mean: 0.55× of GCC -O2** across all 18 — skewed by the two ~600×
-recursion-to-iteration wins; excluding `fib` and `ackermann`, **1.12×** across the
-remaining 16.
+**Geometric mean: 0.50× of GCC -O2** across all 18 — skewed by the two ~600×
+recursion-to-iteration wins; excluding `fib` and `ackermann`, **1.06×** across the
+remaining 16 (qsort, spectral_norm, matmul, loop_patterns, tce_sum at or past
+parity).
 
 **Compile time:** LCCC compiles 2–5× faster than GCC across the suite.
 
@@ -87,10 +88,25 @@ copy becomes a same-slot no-op. arith_loop: 2.09× → 1.15× (22 instructions/i
 
 The inner loop of matmul is auto-vectorized with NEON (F64x2/I32x4 register-resident vector
 ops, fused `fmadd`), F64 loop accumulators are promoted into dedicated FP registers
-(d24–d31), and FP constants are hoisted out of loops. matmul runs 1.17× faster than GCC -O2.
+(d24–d31), and FP constants are hoisted out of loops. matmul runs 1.15× faster than GCC -O2.
 Reduction vectorization covers plain and widening sums (`sadalp`), dot products
 (`smlal`/`smlal2` with split accumulators), conditional sums (`smax` clamp), and max
 reductions (`smax`/`smaxv`) — loop_patterns went from 1.83× to parity.
+
+### FP recurrence scheduling and coalescing (`mandelbrot`, `nbody`)
+
+Loop-phi anti-dependency splitting moves the old-value copy off the recurrence's serial
+chain (the exact shape GCC -O2 emits), and reverse FP phi coalescing gives copy-web
+accumulators the backedge source's register when conflict-free — the backedge `fmov`
+dies. mandelbrot 1.32× → 1.12×, nbody 1.31× → 1.13×.
+
+### Small-leaf caller-saved allocation and shrink-wrapping (`qsort`, `binary_trees`)
+
+Call-free functions up to a few dozen IR instructions scan the caller-saved pool
+(x4–x8, x13–x14) first: no prologue save storm for hot callbacks — qsort's `cmp`
+callback dropped from 18 instructions plus five save/restore pairs to 7 instructions,
+putting qsort at parity with GCC. Callee-saves are also shrink-wrapped past clean
+early returns, so binary_trees' null-child path skips the restore storm.
 
 ### Bit manipulation (`bitops` — 1.8× faster than GCC)
 

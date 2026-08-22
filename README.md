@@ -58,27 +58,27 @@ All 18 outputs are byte-identical to GCC.
 
 | Benchmark | LCCC | GCC -O2 | LCCC / GCC |
 |-----------|-----:|--------:|:----------:|
-| `arith_loop` — 32-var arithmetic loop | 0.035 s | 0.030 s | 1.15× |
-| `fib` — fib(40) recursive | <0.001 s | 0.091 s | **~600× faster** |
-| `matmul` — 256×256 matrix multiply | 0.0024 s | 0.0029 s | **1.17× faster** |
-| `qsort` — quicksort 1M integers | 0.080 s | 0.071 s | 1.12× |
-| `sieve` — Eratosthenes 10M | 0.019 s | 0.016 s | 1.15× |
+| `arith_loop` — 32-var arithmetic loop | 0.034 s | 0.031 s | 1.12× |
+| `fib` — fib(40) recursive | <0.001 s | 0.090 s | **~600× faster** |
+| `matmul` — 256×256 matrix multiply | 0.0026 s | 0.0030 s | **1.15× faster** |
+| `qsort` — quicksort 1M integers | 0.070 s | 0.073 s | **1.04× faster** |
+| `sieve` — Eratosthenes 10M | 0.019 s | 0.017 s | 1.16× |
 | `tce_sum` — tail-recursive sum(10M) | 0.0001 s | 0.0001 s | 1.0× (GCC const-folds it) |
-| `nbody` — N-body simulation | 0.218 s | 0.166 s | 1.31× |
-| `binary_trees` — malloc/free recursion | 0.908 s | 0.755 s | 1.20× |
-| `spectral_norm` — FP dense loops | 0.165 s | 0.139 s | 1.19× |
-| `mandelbrot` — FP inner loop | 0.663 s | 0.502 s | 1.32× |
-| `hash_table` — pointer chasing | 11.47 s | 9.16 s | 1.25× |
-| `strlen_bench` — string processing | 0.160 s | 0.139 s | 1.16× |
-| `switch_dispatch` — jump tables | 0.418 s | 0.348 s | 1.20× |
-| `struct_copy` — struct copy/field access | 0.014 s | 0.011 s | 1.20× |
-| `loop_patterns` — reduce/transform/prefix | 0.030 s | 0.031 s | **1.0× (parity)** |
-| `fannkuch` — Fannkuch-Redux | 3.34 s | 1.81 s | 1.85× |
+| `nbody` — N-body simulation | 0.186 s | 0.165 s | 1.13× |
+| `binary_trees` — malloc/free recursion | 0.835 s | 0.730 s | 1.14× |
+| `spectral_norm` — FP dense loops | 0.130 s | 0.135 s | **1.04× faster** |
+| `mandelbrot` — FP inner loop | 0.555 s | 0.495 s | 1.12× |
+| `hash_table` — pointer chasing | 9.84 s | 8.08 s | 1.22× |
+| `strlen_bench` — string processing | 0.147 s | 0.136 s | 1.08× |
+| `switch_dispatch` — jump tables | 0.402 s | 0.349 s | 1.15× |
+| `struct_copy` — struct copy/field access | 0.013 s | 0.012 s | 1.08× |
+| `loop_patterns` — reduce/transform/prefix | 0.032 s | 0.032 s | **1.0× (parity)** |
+| `fannkuch` — Fannkuch-Redux | 2.035 s | 1.981 s | 1.03× |
 | `ackermann` — ackermann(3,11) | <0.001 s | 0.098 s | **~600× faster** |
 | `bitops` — popcount/clz/reverse | 0.092 s | 0.169 s | **1.8× faster** |
 
-**Geometric mean: 0.55× of GCC -O2** overall — skewed by the two ~600×
-recursion-to-iteration wins; excluding those, **1.12×** across the remaining 16.
+**Geometric mean: 0.50× of GCC -O2** overall — skewed by the two ~600×
+recursion-to-iteration wins; excluding those, **1.06×** across the remaining 16.
 
 What drives the wins:
 
@@ -89,14 +89,21 @@ What drives the wins:
 - **loop_patterns 1.83× → parity** (recent work): NEON reduction vectorization now covers
   plain sums, i32→i64 widening sums (sadalp), dot products (smlal/smlal2 with split
   accumulators), conditional sums (`smax` clamp), and max reductions (`smax`/`smaxv`).
-- **fannkuch 2.7× → 1.85×, arith_loop 2.1× → 1.15×**: a post-scan *register
+- **fannkuch 2.7× → 1.03×, arith_loop 2.1× → 1.12×**: a post-scan *register
   steal* gives hot inner-loop-carried values (IVs, accumulators, carried pointers) callee-saved
   registers that cold function-spanning values would otherwise win purely by starting first —
   done as a conflict-safe full deallocation of the evicted holder, never range splitting.
   *Loop-backedge slot coalescing* gives a spilled loop variable's update the variable's own
   stack slot (proven safe by the phi-coalesce detector), deleting the per-iteration
   `ldr`+`str` shuffle.
-- **struct_copy 2.31× → 1.20×**: aggregate memcpy-temp forwarding, full unrolling of small
+- **mandelbrot 1.32× → 1.12×, nbody 1.31× → 1.13×**: loop-phi anti-dependency
+  splitting moves the old-value copy off the FP recurrence's serial chain, and reverse FP
+  phi coalescing gives copy-web accumulators the backedge source's register when
+  conflict-free.
+- **qsort 1.12× → faster than GCC**: small leaf functions scan the caller-saved pool
+  first — the hot `cmp` callback no longer pays a five-pair save/restore storm per call.
+  Callee-saves are also shrink-wrapped past clean early returns (binary_trees' null path).
+- **struct_copy 2.31× → 1.08×**: aggregate memcpy-temp forwarding, full unrolling of small
   constant-trip loops, and ldp/stp adjacent-field pair fusion.
 - **bitops 1.8× faster than GCC**: popcount/clz/reverse lower to single AArch64 instructions.
 
