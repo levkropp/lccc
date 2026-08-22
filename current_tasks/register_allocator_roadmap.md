@@ -61,6 +61,16 @@ architectural, not pass-level. This doc records the evidence and the plan.
   disable the pure-scalar pool extension (x9-x12/x15 are emitter scratch a
   caller may hold live across the call), param pre-stores to x4-x8 only
   with <=4 GP params, recompute used_callee_saved from assignments.
+- Point-precise copy-web coalescing (6b8fa0b5 FP, 38a85795+c710ed4a GPR):
+  the interval-overlap conflict check over-reports interference inside
+  loops, so merges now use per-block live sets with a backward point walk
+  (point_merge_ok): a candidate joins a register iff no program point has
+  it live together with ANY current holder (the pair copies excepted, and
+  any def while the other side is live-after is a clobber). The all-holders
+  part is load-bearing: pair-only checking segfaulted strlen_bench via a
+  transitive merge. GPR merges restrict to non-call-spanning values for
+  caller-saved targets. mandelbrot's per-pixel middle-loop shuffles gone;
+  nbody another -9% (0.82 cumulative); strlen 0.889 cumulative.
 
 ## Latent GDSE bug fixed (2fdf496e)
 
@@ -110,12 +120,12 @@ module text with shared state — function-local reasoning is unsafe there.
   costs allocation quality. Also required fixing the AArch64 FP-pool
   detection (keyed on x28 in available_regs, which the swap empties).
   Reverted.
-- GPR point-precise copy-web coalescing (the FP version of 6b8fa0b5 for
-  integer/pointer webs): segfaults strlen_bench even restricted to
-  callee-saved targets — late assignment of a GPR to a formerly slot-homed
-  pointer flips GEP-fold/addressing emission decisions made under different
-  assumptions. FP values have uniform emission; GPR values entangle with
-  address generation. Reverted; FP-only stands.
+- Relaxing the swap-cycle rule in detect_phi_coalesce_groups to allow
+  multi-def sources when no reverse copy exists (targeting mandelbrot's
+  residual latch fmov): mandelbrot +15% immediately — the exclusion is
+  load-bearing beyond literal swap pairs. Reverted. The remaining latch
+  copy (v92 vs v12 web contention for d42) needs cost-based FP eviction,
+  which is not worth it for ~0.06% geomean.
 - SLP pairing of adjacent F64 fields (nbody dx,dy as .2d vectors): measured
   ceiling ~1% via a hand-written vector advance loop (178 vs 176ms). The
   inner loop is bound by the fsqrt+fdiv serial chain (~26 cycles/iter), not
