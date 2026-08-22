@@ -1634,10 +1634,119 @@ fn fold_shift_mask_ubfx(lines: &mut [String], kinds: &mut [LineKind], n: usize) 
 // cleared at labels, branches, and calls.
 
 fn eliminate_redundant_sxtw(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    // Function boundaries (the peephole sees the whole module's text).
+    let mut fn_start = vec![false; n];
+    let mut fn_end = vec![false; n];
+    for i in 0..n {
+        let t = lines[i].trim();
+        if t.starts_with(".cfi_startproc") {
+            fn_start[i] = true;
+        } else if t.starts_with(".cfi_endproc") {
+            fn_end[i] = true;
+        }
+    }
+    // Single-write constant registers within the current function: the
+    // hoisted loop-invariant masks from int_const_hoist. Their value is known
+    // even across block boundaries where extended[] conservatively resets.
+    let mut const_nonneg = [false; 33];
     let mut extended = [false; 33];
     extended[32] = true; // xzr is always "extended" (sxtw xD, wzr ≡ mov xD, xzr)
     let mut changed = false;
     for i in 0..n {
+        if fn_start[i] {
+            // (Re)build the per-function constant-register map. A register is
+            // a known constant when it has exactly one mov/movz immediate
+            // write at position p, no other write after p and before its last
+            // use, and no non-store use before p (prologue saves read the
+            // caller's value; epilogue restores land after all uses).
+            const_nonneg = [false; 33];
+            let mut mov_pos = [usize::MAX; 33];
+            let mut mov_val = [0u64; 33];
+            let mut mov_cnt = [0u8; 33];
+            let mut other_write = [false; 33]; // non-mov write seen (position checked later)
+            let mut other_write_pos = [usize::MAX; 33];
+            let mut max_use = [0usize; 33];
+            let mut early_bad_use = [false; 33];
+            let mut j = i;
+            while j < n && !fn_end[j] {
+                if kinds[j] != LineKind::Nop {
+                    for sub in lines[j].split('\n') {
+                        let t = sub.trim();
+                        if t.is_empty() || t.ends_with(':') || t.starts_with('.') {
+                            continue;
+                        }
+                        let is_store = t.starts_with("st");
+                        // mov/movz immediate write?
+                        let mut is_const_mov = false;
+                        for pfx in ["mov w", "mov x", "movz w", "movz x"] {
+                            if let Some(rest) = t.strip_prefix(pfx) {
+                                if let Some((reg_s, imm_s)) = rest.split_once(", ") {
+                                    if let Some(imm_s) = imm_s.trim().strip_prefix('#') {
+                                        let v = if let Some((base, lsl)) = imm_s.split_once(", lsl #") {
+                                            match (base.parse::<i64>(), lsl.parse::<u32>()) {
+                                                (Ok(b), Ok(k)) if b >= 0 && k < 32 => Some((b as u64) << k),
+                                                _ => None,
+                                            }
+                                        } else {
+                                            imm_s.parse::<i64>().ok().filter(|&b| b >= 0).map(|b| b as u64)
+                                        };
+                                        if let (Ok(d), Some(v)) = (reg_s.trim().parse::<u8>(), v) {
+                                            if d < 33 {
+                                                mov_cnt[d as usize] = mov_cnt[d as usize].saturating_add(1);
+                                                mov_pos[d as usize] = j;
+                                                mov_val[d as usize] = v;
+                                                is_const_mov = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        for b in 0..33u8 {
+                            let written = gp_reg_written_broad(t, b);
+                            let mentioned = written
+                                || t.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                                    .any(|tok| tok == xreg_name(b) || tok == wreg_name(b));
+                            if !mentioned {
+                                continue;
+                            }
+                            if written && !is_const_mov {
+                                other_write[b as usize] = true;
+                                if other_write_pos[b as usize] == usize::MAX || j > other_write_pos[b as usize] {
+                                    // track writes after the mov below via max_use
+                                }
+                                other_write_pos[b as usize] = j;
+                            }
+                            if !written || is_store {
+                                // a use (stores read the register)
+                                if j > max_use[b as usize] {
+                                    max_use[b as usize] = j;
+                                }
+                                if !is_store && mov_cnt[b as usize] == 0 {
+                                    early_bad_use[b as usize] = true;
+                                }
+                            }
+                            if written && is_const_mov {
+                                // the mov itself also "uses" nothing
+                            }
+                        }
+                        let _ = is_const_mov;
+                    }
+                }
+                j += 1;
+            }
+            for b in 0..33usize {
+                if mov_cnt[b] == 1 && mov_val[b] < (1u64 << 31) && !early_bad_use[b] {
+                    // Any other write must land after the last use.
+                    if !other_write[b] || other_write_pos[b] > max_use[b] {
+                        const_nonneg[b] = true;
+                    }
+                }
+            }
+        }
+        if fn_end[i] {
+            const_nonneg = [false; 33];
+        }
         match kinds[i] {
             // Control-flow barriers: nothing is known across them.
             LineKind::Label | LineKind::Branch | LineKind::CondBranch
@@ -1769,12 +1878,14 @@ fn eliminate_redundant_sxtw(lines: &mut [String], kinds: &mut [LineKind], n: usi
                                 nonneg_dst = Some(d);
                             }
                         } else {
-                            // Register mask: bit 31 clear when clear in both inputs.
+                            // Register mask: bit 31 of the result is clear
+                            // when clear in EITHER input (and = bitwise &).
                             let a = parse_reg(parts[1]);
                             let b = parse_reg(parts[2]);
-                            if d < 32 && a < 33 && b < 33
-                                && extended[a as usize] && extended[b as usize]
-                            {
+                            let nonneg = |r: u8| {
+                                (r < 33 && extended[r as usize]) || (r < 33 && const_nonneg[r as usize])
+                            };
+                            if d < 32 && a < 33 && b < 33 && (nonneg(a) || nonneg(b)) {
                                 nonneg_dst = Some(d);
                             }
                         }
