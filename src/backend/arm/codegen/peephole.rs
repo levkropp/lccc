@@ -432,6 +432,7 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= eliminate_self_moves(&mut kinds, n);
         changed |= eliminate_redundant_sxtw(&mut lines, &mut kinds, n);
         changed |= eliminate_redundant_sxtb(&mut lines, &mut kinds, n);
+        changed |= fold_shift_mask_ubfx(&mut lines, &mut kinds, n);
         changed |= eliminate_move_chains(&mut lines, &mut kinds, n);
         changed |= fold_zext_move_chains(&mut lines, &mut kinds, n);
         changed |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
@@ -480,6 +481,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_self_moves(&mut kinds, n);
             changed2 |= eliminate_redundant_sxtw(&mut lines, &mut kinds, n);
             changed2 |= eliminate_redundant_sxtb(&mut lines, &mut kinds, n);
+            changed2 |= fold_shift_mask_ubfx(&mut lines, &mut kinds, n);
             changed2 |= eliminate_move_chains(&mut lines, &mut kinds, n);
             changed2 |= fold_zext_move_chains(&mut lines, &mut kinds, n);
             changed2 |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
@@ -1513,6 +1515,104 @@ fn eliminate_self_moves(kinds: &mut [LineKind], n: usize) -> bool {
                 changed = true;
             }
         }
+    }
+    changed
+}
+
+// ── Shift-mask to ubfx folding ───────────────────────────────────────────────
+//
+// `(x >> K) & ((1<<N)-1)` lowers to `mov wM, #mask; and wD, wM, wS, lsr #K`
+// because the shifted-and form needs the mask in a register. When K+N fits
+// the 32-bit lane, this is exactly `ubfx wD, wS, #K, #N` — one instruction,
+// no constant materialization (switch_dispatch's dispatch loop).
+fn fold_shift_mask_ubfx(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_UBFX").is_ok() {
+        return false;
+    }
+    let mut changed = false;
+    for i in 0..n {
+        if kinds[i] != LineKind::Alu || lines[i].contains('\n') {
+            continue;
+        }
+        let t = lines[i].trim();
+        let Some(ops) = t.strip_prefix("and ") else { continue };
+        let parts: Vec<&str> = ops.split(", ").collect();
+        if parts.len() != 4 {
+            continue;
+        }
+        let Some(shift) = parts[3]
+            .strip_prefix("lsr #")
+            .and_then(|v| v.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if shift == 0 || shift >= 32 {
+            continue;
+        }
+        // Both operands must be plain w-regs (no xzr/sp games).
+        let Some(dst) = parts[0].strip_prefix('w').and_then(|v| v.parse::<u8>().ok()) else { continue };
+        let Some(mask_reg) = parts[1].strip_prefix('w').and_then(|v| v.parse::<u8>().ok()) else { continue };
+        if !parts[2].starts_with('w') || dst > 30 || mask_reg > 30 {
+            continue;
+        }
+        // Find the mask register's defining mov immediate earlier in the
+        // block (stop at any barrier or rewrite of the register).
+        let mut mask: Option<u64> = None;
+        let mut j = i;
+        while j > 0 {
+            j -= 1;
+            match kinds[j] {
+                LineKind::Nop => continue,
+                LineKind::Label
+                | LineKind::Branch
+                | LineKind::CondBranch
+                | LineKind::CmpBranch
+                | LineKind::Call
+                | LineKind::Ret
+                | LineKind::Directive => break,
+                _ => {}
+            }
+            if lines[j].contains('\n') {
+                break;
+            }
+            let tj = lines[j].trim();
+            let mut found = false;
+            for pfx in ["mov w", "mov x", "movz w", "movz x"] {
+                if let Some(rest) = tj.strip_prefix(pfx) {
+                    if let Some((reg_s, imm_s)) = rest.split_once(", ") {
+                        let reg_num = reg_s.trim().parse::<u8>().ok();
+                        if reg_num == Some(mask_reg) {
+                            if let Some(imm) = imm_s.trim().strip_prefix('#') {
+                                if let Ok(m) = imm.parse::<i64>() {
+                                    if m >= 0 {
+                                        mask = Some(m as u64);
+                                    }
+                                }
+                            }
+                            found = true;
+                        }
+                    }
+                }
+            }
+            if found {
+                break;
+            }
+            if instr_clobbers_reg(tj, mask_reg) {
+                break;
+            }
+        }
+        let Some(m) = mask else { continue };
+        if m == 0 || (m & (m + 1)) != 0 {
+            continue; // not 2^N - 1
+        }
+        let width = 64 - (m + 1).leading_zeros(); // log2(m+1)
+        let width = width - 1;
+        if width == 0 || shift + width > 32 {
+            continue;
+        }
+        lines[i] = format!("    ubfx {}, {}, #{}, #{}", parts[0], parts[2], shift, width);
+        kinds[i] = LineKind::Other;
+        changed = true;
     }
     changed
 }

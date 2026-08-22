@@ -1972,8 +1972,9 @@ impl ArchCodegen for ArmCodegen {
         self.state.emit_fmt(format_args!("    b.lo {}", range_skip));
         self.state.emit_fmt(format_args!("    b {}", default_label));
         self.state.emit_fmt(format_args!("{}:", range_skip));
-        self.state.emit_fmt(format_args!("    adrp x17, {}", table_label));
-        self.state.emit_fmt(format_args!("    add x17, x17, :lo12:{}", table_label));
+        // The table is emitted immediately below (same translation unit, a
+        // few bytes away), so a single adr always reaches it — no adrp+add.
+        self.state.emit_fmt(format_args!("    adr x17, {}", table_label));
         self.state.emit("    ldr w16, [x17, x0, lsl #2]");
         self.state.emit("    add x17, x17, w16, sxtw");
         self.state.emit("    br x17");
