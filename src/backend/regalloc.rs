@@ -902,19 +902,32 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     continue;
                 }
                 let Some(s) = s_reg else { continue };
-                let Some(dest_iv) = liveness.intervals.iter().find(|iv| iv.value_id == phi_dest)
-                    else { continue };
-                // A caller-saved FP register cannot hold a call-spanning value.
-                if s.0 >= 40 && spans_any_call(dest_iv, call_points) {
+                // Check EVERY segment of the dest — not just the first —
+                // against every segment of the register's other holders
+                // (same discipline as the forward path; a later-segment
+                // conflict would corrupt the other value).
+                let dest_segs: Vec<(u32, u32)> = liveness.intervals.iter()
+                    .filter(|iv| iv.value_id == phi_dest)
+                    .map(|iv| (iv.start, iv.end))
+                    .collect();
+                if dest_segs.is_empty() {
                     continue;
                 }
-                let conflict = liveness.intervals.iter().any(|iv| {
-                    if iv.value_id == phi_dest || iv.value_id == backedge_src {
-                        return false;
-                    }
-                    assignments
-                        .get(&iv.value_id)
-                        .is_some_and(|&o| o.0 == s.0 && iv.start < dest_iv.end && dest_iv.start < iv.end)
+                // A caller-saved FP register cannot hold a call-spanning value.
+                if s.0 >= 40 && dest_segs.iter().any(|&(ds, de)| {
+                    call_points.iter().any(|&cp| ds < cp && cp < de)
+                }) {
+                    continue;
+                }
+                let conflict = dest_segs.iter().any(|&(ds, de)| {
+                    liveness.intervals.iter().any(|iv| {
+                        if iv.value_id == phi_dest || iv.value_id == backedge_src {
+                            return false;
+                        }
+                        assignments
+                            .get(&iv.value_id)
+                            .is_some_and(|&o| o.0 == s.0 && iv.start < de && ds < iv.end)
+                    })
                 });
                 if debug {
                     eprintln!("[FPCOAL] reverse phi={} <- d{} conflict={}", phi_dest, s.0, conflict);
