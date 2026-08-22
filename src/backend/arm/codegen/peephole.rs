@@ -2907,6 +2907,28 @@ use crate::backend::peephole_common::{replace_source_reg_in_instruction, replace
 // to register moves, leaving the original stores dead.
 
 fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
+    // Process each function independently: the tracked state (derived bases,
+    // escapes, loop-variant sets, loaded ranges) is only meaningful within
+    // one stack frame, and a single escape in one function must not disable
+    // the pass for the rest of the module.
+    if std::env::var("CCC_NO_GDSE_FN_SCOPE").is_ok() {
+        return gdse_range(lines, kinds, 0, n);
+    }
+    let mut changed = false;
+    let mut start = 0usize;
+    for i in 0..n {
+        if lines[i].trim().starts_with(".cfi_endproc") {
+            changed |= gdse_range(lines, kinds, start, i + 1);
+            start = i + 1;
+        }
+    }
+    if start < n {
+        changed |= gdse_range(lines, kinds, start, n);
+    }
+    changed
+}
+
+fn gdse_range(lines: &[String], kinds: &mut [LineKind], start: usize, end: usize) -> bool {
     // Safety: stack slots can be accessed through sp-derived pointer registers
     // (`add xN, sp, #off` etc.). Instead of bailing on any address-of-sp, track
     // the derived bases: as long as every use of a base is an address use
@@ -2924,7 +2946,7 @@ fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: us
     // Collect candidate bases and check for escapes.
     let mut base_off: FxHashMap<u8, i32> = FxHashMap::default();
     let mut escaped = false;
-    for i in 0..n {
+    for i in start..end {
         if escaped {
             break;
         }
@@ -3075,14 +3097,14 @@ fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: us
     let mut loop_variant: FxHashSet<u8> = FxHashSet::default();
     {
         let mut label_pos: FxHashMap<&str, usize> = FxHashMap::default();
-        for i in 0..n {
+        for i in start..end {
             if kinds[i] == LineKind::Label {
                 label_pos.insert(lines[i].trim().trim_end_matches(':'), i);
             }
         }
         // Prefix-sum the in-loop depth from backward branches.
-        let mut delta = vec![0i32; n + 1];
-        for j in 0..n {
+        let mut delta = vec![0i32; end + 1];
+        for j in start..end {
             let t = lines[j].trim();
             if !(t.starts_with("b ") || t.starts_with("b.") || t.starts_with("cb") || t.starts_with("tb")) {
                 continue;
@@ -3102,7 +3124,7 @@ fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: us
             }
         }
         let mut depth = 0i32;
-        for i in 0..n {
+        for i in start..end {
             depth += delta[i];
             if depth > 0 {
                 for b in 0..29u8 {
@@ -3118,7 +3140,7 @@ fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: us
     let mut loaded_ranges: Vec<(i32, i32)> = Vec::new(); // (offset, size)
     let mut base_off: FxHashMap<u8, i32> = FxHashMap::default();
 
-    for i in 0..n {
+    for i in start..end {
         track_sp_bases(&lines[i], kinds[i], &mut base_off);
         // FP loads/stores and base forms.
         if let Some((is_store, _reg, addr, width)) = parse_fp_mem(&lines[i]) {
@@ -3202,7 +3224,7 @@ fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: us
     // Covers GP sp stores and FP sp/base-form stores alike.
     let mut changed = false;
     let mut base_off: FxHashMap<u8, i32> = FxHashMap::default();
-    for i in 0..n {
+    for i in start..end {
         track_sp_bases(&lines[i], kinds[i], &mut base_off);
         let range: Option<(i32, i32)> = match kinds[i] {
             LineKind::StoreSp { offset, is_word, .. } => {
