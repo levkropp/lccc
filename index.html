@@ -183,16 +183,16 @@ raw_aliases.push((backedge_src, phi_dest));  <span class="cm">// certified by de
         <tr>
           <td><code>matmul</code></td>
           <td>256×256 double matrix multiply</td>
-          <td class="faster">0.0026s</td>
-          <td class="baseline">0.0030s</td>
+          <td class="faster">0.0025s</td>
+          <td class="baseline">0.0029s</td>
           <td class="faster">1.15× faster</td>
         </tr>
         <tr>
           <td><code>spectral_norm</code></td>
           <td>FP dense loops</td>
-          <td class="faster">0.130s</td>
-          <td class="baseline">0.135s</td>
-          <td class="faster">1.04× faster</td>
+          <td>0.133s</td>
+          <td class="baseline">0.133s</td>
+          <td>1.0× parity</td>
         </tr>
         <tr>
           <td><code>fib(40)</code></td>
@@ -204,33 +204,33 @@ raw_aliases.push((backedge_src, phi_dest));  <span class="cm">// certified by de
         <tr>
           <td><code>bitops</code></td>
           <td>popcount / clz / bit reverse</td>
-          <td class="faster">0.092s</td>
+          <td class="faster">0.089s</td>
           <td class="baseline">0.169s</td>
-          <td class="faster">1.8× faster</td>
+          <td class="faster">1.9× faster</td>
         </tr>
         <tr>
           <td><code>fannkuch</code></td>
           <td>Fannkuch-Redux permutations</td>
-          <td>2.035s</td>
-          <td class="baseline">1.981s</td>
-          <td class="slower">1.03×</td>
+          <td>2.010s</td>
+          <td class="baseline">1.973s</td>
+          <td class="slower">1.02×</td>
         </tr>
       </tbody>
     </table>
   </div>
 
   <p style="margin-top:1rem">
-    Across the full 18-benchmark suite LCCC is at <strong>1.06× of GCC -O2</strong>
-    (0.50× geomean including the two ~600× recursion-to-iteration wins), with
+    Across the full 18-benchmark suite LCCC is at <strong>1.01× of GCC -O2 — statistical parity</strong>
+    (0.49× geomean including the two ~600× recursion-to-iteration wins), with
     <code>matmul</code>, <code>bitops</code>, <code>qsort</code> and
-    <code>spectral_norm</code> faster than GCC and <code>loop_patterns</code>
+    <code>loop_patterns</code> faster than GCC and <code>spectral_norm</code>
     at parity. Full table and per-optimization analysis on the
     <a href="/lccc/docs/benchmarks">benchmarks page</a>.
   </p>
 
   <div class="badges">
     <span class="badge badge-amber">✓ 18/18 outputs match GCC</span>
-    <span class="badge badge-teal">563 unit tests passing</span>
+    <span class="badge badge-teal">566 unit tests passing</span>
     <span class="badge badge-gray">GCC -O2 · AArch64 Linux</span>
   </div>
 </section>
@@ -243,12 +243,12 @@ raw_aliases.push((backedge_src, phi_dest));  <span class="cm">// certified by de
   <h2>What's new</h2>
   <p>
     Recent work on the AArch64 backend moved the suite geomean from 0.86× to
-    <strong>0.50× of GCC -O2</strong> — including a register steal for hot loop values,
+    <strong>0.49× of GCC -O2</strong> — including a register steal for hot loop values,
     loop-backedge stack-slot coalescing, NEON/F64 loop promotion, reduction
     vectorization, FP recurrence anti-dependency splitting and reverse phi
-    coalescing, caller-saved-first allocation for small leaf functions, and
-    shrink-wrapped callee saves — plus several latent miscompile fixes found
-    along the way.
+    coalescing, backedge PRE, a csinc select fold, caller-saved-first allocation
+    for small leaf functions, and shrink-wrapped callee saves — plus several
+    latent miscompile fixes found along the way.
   </p>
   <div class="cards">
     <div class="card">

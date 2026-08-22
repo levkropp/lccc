@@ -89,6 +89,25 @@ architectural, not pass-level. This doc records the evidence and the plan.
   This is the loop-carried-CSE piece the "rotation is neutral" dead-end
   did not cover: rotation alone moves branches, PRE removes a multiply
   from the recurrence's issue count.
+- csinc fold (24200ab4, fold_csel_increment in arm peephole): `add wA,wB,#1`
+  + later `csel wD,wA,wB,cc` -> `csinc wD,wB,wB,!cc`. sieve's prime-count
+  loop is dispatch/branch-throughput bound (not dependency bound), so the
+  removed instruction is worth 13% there (1.152 -> 1.002). KEY REFINEMENT
+  of the "instruction-count peepholes can't win" rule: that rule was
+  measured on dependency-bound loops; in throughput-bound loops (<=12
+  instrs, 1-2 cycles/iter) dispatch slots are the binding constraint and
+  count peepholes DO pay.
+- sieve split-timing: the marking loop is at GCC parity (1.004); the
+  entire residual gap was the count loop (scalar both; GCC 5 instrs/iter
+  at ~0.65 cycles, we were 12 at ~2 cycles). Post-csinc sieve is 1.002.
+- switch_dispatch (1.15) and arith_loop (1.12) residual gaps are
+  architectural, not pass-level: switch pays 5 taken branches/iter vs
+  GCC's 3 (top-test + trampoline + case-merge; indirect-branch mispredict
+  dominates regardless), arith_loop spills ~10 of 32 rotating accumulators
+  with single ldr/str while GCC houses ~20 (caller-saved regs + LR in a
+  call-free loop) and pairs the rest (ldp/stp). Both need the register-
+  allocator rewrite (pool extension past emitter-scratch x9-x15, slot
+  pairing), not more peepholes.
 
 ## Latent GDSE bug fixed (2fdf496e)
 

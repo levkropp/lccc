@@ -53,32 +53,33 @@ ELF executable
 
 ## Benchmarks
 
-18-benchmark suite, LCCC vs GCC -O2, best-of-5 wall-clock, AArch64 Linux (same-run ratios).
+18-benchmark suite, LCCC vs GCC -O2, best-of-9 wall-clock, AArch64 Linux (same-run ratios).
 All 18 outputs are byte-identical to GCC.
 
 | Benchmark | LCCC | GCC -O2 | LCCC / GCC |
 |-----------|-----:|--------:|:----------:|
-| `arith_loop` — 32-var arithmetic loop | 0.034 s | 0.031 s | 1.12× |
+| `arith_loop` — 32-var arithmetic loop | 0.034 s | 0.030 s | 1.12× |
 | `fib` — fib(40) recursive | <0.001 s | 0.090 s | **~600× faster** |
-| `matmul` — 256×256 matrix multiply | 0.0026 s | 0.0030 s | **1.15× faster** |
-| `qsort` — quicksort 1M integers | 0.070 s | 0.073 s | **1.04× faster** |
-| `sieve` — Eratosthenes 10M | 0.019 s | 0.017 s | 1.16× |
+| `matmul` — 256×256 matrix multiply | 0.0025 s | 0.0029 s | **1.15× faster** |
+| `qsort` — quicksort 1M integers | 0.070 s | 0.071 s | **1.02× faster** |
+| `sieve` — Eratosthenes 10M | 0.017 s | 0.016 s | 1.06× |
 | `tce_sum` — tail-recursive sum(10M) | 0.0001 s | 0.0001 s | 1.0× (GCC const-folds it) |
-| `nbody` — N-body simulation | 0.186 s | 0.165 s | 1.13× |
-| `binary_trees` — malloc/free recursion | 0.835 s | 0.730 s | 1.14× |
-| `spectral_norm` — FP dense loops | 0.130 s | 0.135 s | **1.04× faster** |
-| `mandelbrot` — FP inner loop | 0.555 s | 0.495 s | 1.12× |
-| `hash_table` — pointer chasing | 9.84 s | 8.08 s | 1.22× |
-| `strlen_bench` — string processing | 0.147 s | 0.136 s | 1.08× |
-| `switch_dispatch` — jump tables | 0.402 s | 0.349 s | 1.15× |
-| `struct_copy` — struct copy/field access | 0.013 s | 0.012 s | 1.08× |
+| `nbody` — N-body simulation | 0.185 s | 0.165 s | 1.12× |
+| `binary_trees` — malloc/free recursion | 0.848 s | 0.751 s | 1.13× |
+| `spectral_norm` — FP dense loops | 0.133 s | 0.133 s | **1.0× (parity)** |
+| `mandelbrot` — FP inner loop | 0.553 s | 0.491 s | 1.13× |
+| `hash_table` — pointer chasing | 8.62 s | 7.91 s | 1.09× |
+| `strlen_bench` — string processing | 0.145 s | 0.140 s | 1.04× |
+| `switch_dispatch` — jump tables | 0.404 s | 0.350 s | 1.16× |
+| `struct_copy` — struct copy/field access | 0.013 s | 0.012 s | 1.10× |
 | `loop_patterns` — reduce/transform/prefix | 0.032 s | 0.032 s | **1.0× (parity)** |
-| `fannkuch` — Fannkuch-Redux | 2.035 s | 1.981 s | 1.03× |
+| `fannkuch` — Fannkuch-Redux | 2.010 s | 1.973 s | 1.02× |
 | `ackermann` — ackermann(3,11) | <0.001 s | 0.098 s | **~600× faster** |
-| `bitops` — popcount/clz/reverse | 0.092 s | 0.169 s | **1.8× faster** |
+| `bitops` — popcount/clz/reverse | 0.089 s | 0.169 s | **1.9× faster** |
 
-**Geometric mean: 0.50× of GCC -O2** overall — skewed by the two ~600×
-recursion-to-iteration wins; excluding those, **1.06×** across the remaining 16.
+**Geometric mean: 0.49× of GCC -O2** overall — skewed by the two ~600×
+recursion-to-iteration wins; excluding those, **1.01× (statistical parity)**
+across the remaining 16.
 
 What drives the wins:
 
@@ -96,10 +97,15 @@ What drives the wins:
   *Loop-backedge slot coalescing* gives a spilled loop variable's update the variable's own
   stack slot (proven safe by the phi-coalesce detector), deleting the per-iteration
   `ldr`+`str` shuffle.
-- **mandelbrot 1.32× → 1.12×, nbody 1.31× → 1.13×**: loop-phi anti-dependency
-  splitting moves the old-value copy off the FP recurrence's serial chain, and reverse FP
+- **mandelbrot 1.32× → 1.13×, nbody 1.31× → 1.12×**: loop-phi anti-dependency
+  splitting moves the old-value copy off the FP recurrence's serial chain, reverse FP
   phi coalescing gives copy-web accumulators the backedge source's register when
-  conflict-free.
+  conflict-free, and *backedge PRE* carries a loop-bottom expression (mandelbrot's
+  `zr²`) into the matching loop-top use through a new phi — one `fmul` fewer per
+  iteration, the shape GCC reaches via loop rotation + CSE.
+- **sieve 1.16× → 1.06×**: the prime-count loop is dispatch/branch-throughput bound,
+  and a `csinc` peephole (increment-feeding-`csel` fusion) removed enough dispatch
+  slots to bring it from 2× GCC's per-iteration cost to parity.
 - **qsort 1.12× → faster than GCC**: small leaf functions scan the caller-saved pool
   first — the hot `cmp` callback no longer pays a five-pair save/restore storm per call.
   Callee-saves are also shrink-wrapped past clean early returns (binary_trees' null path).
