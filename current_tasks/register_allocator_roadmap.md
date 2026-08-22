@@ -110,6 +110,14 @@ module text with shared state — function-local reasoning is unsafe there.
   costs allocation quality. Also required fixing the AArch64 FP-pool
   detection (keyed on x28 in available_regs, which the swap empties).
   Reverted.
+- SLP pairing of adjacent F64 fields (nbody dx,dy as .2d vectors): measured
+  ceiling ~1% via a hand-written vector advance loop (178 vs 176ms). The
+  inner loop is bound by the fsqrt+fdiv serial chain (~26 cycles/iter), not
+  FP issue slots — packed and scalar FP ops cost the same on Apple Silicon.
+  Not worth the IR feature. Also: binary_trees' edge over us is recursive
+  inlining (GCC unrolls check ~5 levels), and loop-top .p2align is neutral
+  here, and hoisting loop-invariant slot loads is neutral (L1 hits are free).
+  Only dependency-chain and call-count reductions move this machine.
 - Copy-propagating staging movs into cmp/cbz/str first operands (plus
   treating non-sp ldr as a dest-write in eliminate_overwritten_moves):
   folds correctly (cbz x19 directly, dead staging movs removed) but
