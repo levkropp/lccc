@@ -13,6 +13,7 @@ pub(crate) mod cfg_simplify;
 pub(crate) mod bit_idioms;
 pub(crate) mod aggregate_copy_forward;
 pub(crate) mod alias;
+pub(crate) mod backedge_pre;
 pub(crate) mod block_layout;
 pub(crate) mod constant_fold;
 pub(crate) mod copy_prop;
@@ -784,6 +785,15 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
     // per iteration before this.
     if !disabled.contains("intconst") {
         module.for_each_function(int_const_hoist::run);
+    }
+
+    // Backedge PRE: replace a loop-top expression over a phi with a phi over
+    // the matching loop-bottom expression (carries e.g. mandelbrot's zr^2
+    // across the backedge, one fmul fewer per iteration). Runs after all
+    // loop transforms so final loop shapes are visible, before the antidep
+    // split (whose copies must see the final phi set).
+    if !disabled.contains("bepre") {
+        module.for_each_function(backedge_pre::run);
     }
 
     // Split loop-phi anti-dependencies (uses of the phi value after the
