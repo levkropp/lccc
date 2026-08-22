@@ -71,12 +71,14 @@ architectural, not pass-level. This doc records the evidence and the plan.
   transitive merge. GPR merges restrict to non-call-spanning values for
   caller-saved targets. mandelbrot's per-pixel middle-loop shuffles gone;
   nbody another -9% (0.82 cumulative); strlen 0.889 cumulative.
-- Bounded self-recursive inlining (49b7e085): small (<=40 IR inst),
-  loop-free self-calls inline up to 15 copies (~4 levels), matching GCC's
-  recursive inlining (binary_trees' check/make/destroy). Self-copies share
-  the caller's frame, so the static cap bounds code/stack growth; the 500-
-  inst caller hard cap is the backstop. 31 copies added nothing over 15.
-  binary_trees 1.167 -> 1.133 vs GCC (interleaved A/B, 9 reps best-of).
+- Bounded self-recursive inlining (49b7e085, REVERTED): unrolling small
+  self-calls ~4 levels gave binary_trees 1.167 -> 1.133, but recursion
+  depth is runtime data and CCC's slot-per-SSA-value frame model multiplies
+  the frame by the copy count: tce_sum (depth 1e7) stack-overflowed (empty
+  output) and ackermann (depth ~1e4) went 6.5x slower on stack-page faults.
+  No static heuristic separates shallow tree recursion from deep numeric/
+  degenerate recursion. Do not retry without a frame model that keeps
+  inlined-copy locals out of the recursive frame.
 
 ## Latent GDSE bug fixed (2fdf496e)
 

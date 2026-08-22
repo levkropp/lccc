@@ -231,10 +231,7 @@ functions.
 **Eligibility.** Not all functions can be inlined. Variadic functions, functions
 containing `VaStart`/`VaEnd`/`VaArg`, `DynAlloca`, `StackSave`/`StackRestore`,
 `IndirectBranch`, or static locals with label references are excluded.
-`__attribute__((noinline))` functions are also excluded. Recursive calls are
-not inlined, with one exception: small (≤40 instructions), loop-free
-self-recursive calls are unrolled up to 15 copies (~4 levels), matching GCC's
-bounded recursive inlining (e.g. binary_trees' `check`).
+`__attribute__((noinline))` functions and recursive calls are also excluded.
 
 **Heuristics.** The inliner uses a tiered size-based heuristic:
 
