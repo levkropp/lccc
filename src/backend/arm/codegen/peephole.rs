@@ -433,6 +433,7 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= eliminate_redundant_sxtw(&mut lines, &mut kinds, n);
         changed |= eliminate_redundant_sxtb(&mut lines, &mut kinds, n);
         changed |= fold_shift_mask_ubfx(&mut lines, &mut kinds, n);
+        changed |= fold_zero_stores(&mut lines, &mut kinds, n);
         changed |= eliminate_move_chains(&mut lines, &mut kinds, n);
         changed |= fold_zext_move_chains(&mut lines, &mut kinds, n);
         changed |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
@@ -482,6 +483,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_redundant_sxtw(&mut lines, &mut kinds, n);
             changed2 |= eliminate_redundant_sxtb(&mut lines, &mut kinds, n);
             changed2 |= fold_shift_mask_ubfx(&mut lines, &mut kinds, n);
+            changed2 |= fold_zero_stores(&mut lines, &mut kinds, n);
             changed2 |= eliminate_move_chains(&mut lines, &mut kinds, n);
             changed2 |= fold_zext_move_chains(&mut lines, &mut kinds, n);
             changed2 |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
@@ -1770,6 +1772,78 @@ fn eliminate_redundant_sxtb(lines: &mut [String], kinds: &mut [LineKind], n: usi
                         extb[dst as usize] = false;
                     }
                 }
+            }
+        }
+    }
+    changed
+}
+
+// ── Zero-store via wzr/xzr ───────────────────────────────────────────────────
+//
+// Storing a literal zero goes through a materialization: `mov x0, #0` then
+// `strb w0, [x9]`. The zero register does it for free: `strb wzr, [x9]`.
+// The mov is left for dead-move elimination (it may have other uses).
+fn fold_zero_stores(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for i in 0..n {
+        let zr_reg = match kinds[i] {
+            LineKind::MoveImm { dst } | LineKind::MoveWide { dst } if dst <= 30 => {
+                let t = lines[i].trim();
+                // movn #0 is -1, not zero; symbol operands fail the int parse.
+                if t.starts_with("movn") || lines[i].contains('\n') {
+                    continue;
+                }
+                let zero = t
+                    .rsplit_once(", ")
+                    .and_then(|(_, imm)| imm.trim().strip_prefix('#'))
+                    .is_some_and(|v| v.parse::<i64>() == Ok(0));
+                if zero {
+                    dst
+                } else {
+                    continue;
+                }
+            }
+            _ => continue,
+        };
+        let (xname, wname) = (xreg_name(zr_reg), wreg_name(zr_reg));
+        // Rewrite the value operand of the next store that reads R, stopping
+        // at the first barrier, rewrite of R, or memory op.
+        for j in (i + 1)..n {
+            match kinds[j] {
+                LineKind::Nop => continue,
+                LineKind::Move { .. }
+                | LineKind::MoveImm { .. }
+                | LineKind::MoveWide { .. }
+                | LineKind::Alu
+                | LineKind::Compare => {
+                    if instr_clobbers_reg(lines[j].trim_start(), zr_reg) {
+                        break;
+                    }
+                    continue;
+                }
+                LineKind::StoreSp { .. } | LineKind::MemOther | LineKind::StorePairSp => {
+                    let t = lines[j].trim_start().to_string();
+                    if !(t.starts_with("str") || t.starts_with("stp")) {
+                        break; // a load: stop
+                    }
+                    if let Some((mnem, rest)) = t.split_once(' ') {
+                        if let Some((first, suffix)) = rest.split_once(',') {
+                            let first = first.trim();
+                            let zr = if first == xname {
+                                "xzr"
+                            } else if first == wname {
+                                "wzr"
+                            } else {
+                                break;
+                            };
+                            lines[j] = format!("    {} {},{}", mnem, zr, suffix);
+                            kinds[j] = classify_line(&lines[j]);
+                            changed = true;
+                        }
+                    }
+                    break;
+                }
+                _ => break,
             }
         }
     }
