@@ -434,6 +434,7 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= eliminate_redundant_sxtb(&mut lines, &mut kinds, n);
         changed |= fold_shift_mask_ubfx(&mut lines, &mut kinds, n);
         changed |= fold_zero_stores(&mut lines, &mut kinds, n);
+        changed |= fold_fp_gpr_roundtrips(&mut lines, &mut kinds, n);
         changed |= eliminate_move_chains(&mut lines, &mut kinds, n);
         changed |= fold_zext_move_chains(&mut lines, &mut kinds, n);
         changed |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
@@ -484,6 +485,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_redundant_sxtb(&mut lines, &mut kinds, n);
             changed2 |= fold_shift_mask_ubfx(&mut lines, &mut kinds, n);
             changed2 |= fold_zero_stores(&mut lines, &mut kinds, n);
+            changed2 |= fold_fp_gpr_roundtrips(&mut lines, &mut kinds, n);
             changed2 |= eliminate_move_chains(&mut lines, &mut kinds, n);
             changed2 |= fold_zext_move_chains(&mut lines, &mut kinds, n);
             changed2 |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
@@ -1774,6 +1776,79 @@ fn eliminate_redundant_sxtb(lines: &mut [String], kinds: &mut [LineKind], n: usi
                 }
             }
         }
+    }
+    changed
+}
+
+// ── FP copy staging through x0 ───────────────────────────────────────────────
+//
+// FP copies between unassigned values stage through a GPR: `fmov x0, dA` /
+// `fmov dB, x0`. Each GP<->FP fmov costs multiple cycles; the pair is just
+// `fmov dB, dA`. Fires when the two are adjacent in a block and the GPR is
+// dead after the pair (its next mention is a write or a barrier).
+fn fold_fp_gpr_roundtrips(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_FP_ROUNDTRIP").is_ok() {
+        return false;
+    }
+    let mut changed = false;
+    for i in 0..n.saturating_sub(1) {
+        if kinds[i] == LineKind::Nop || lines[i].contains('\n') {
+            continue;
+        }
+        let t = lines[i].trim();
+        let Some(rest) = t.strip_prefix("fmov x") else { continue };
+        let Some((gpr_s, fps)) = rest.split_once(", ") else { continue };
+        let Some(fps) = fps.strip_prefix('d') else { continue };
+        let (Ok(gpr), Ok(fpa)) = (gpr_s.parse::<u8>(), fps.parse::<u8>()) else { continue };
+        if gpr > 30 {
+            continue;
+        }
+        // Next live line must be `fmov dB, x<gpr>`.
+        let Some(j) = ((i + 1)..n).find(|&k| kinds[k] != LineKind::Nop) else { continue };
+        if lines[j].contains('\n') {
+            continue;
+        }
+        let tj = lines[j].trim();
+        let Some(restj) = tj.strip_prefix("fmov d") else { continue };
+        let Some((fpb_s, gpr_s2)) = restj.split_once(", ") else { continue };
+        let Some(gpr_s2) = gpr_s2.strip_prefix('x') else { continue };
+        let (Ok(fpb), Ok(gpr2)) = (fpb_s.parse::<u8>(), gpr_s2.parse::<u8>()) else { continue };
+        if gpr2 != gpr {
+            continue;
+        }
+        // The GPR must be dead after line j: scan to the block end; the first
+        // mention (x or w form) must be a write.
+        let xn = xreg_name(gpr);
+        let wn = wreg_name(gpr);
+        let mut dead = true;
+        for k in (j + 1)..n {
+            match kinds[k] {
+                LineKind::Nop => continue,
+                LineKind::Label
+                | LineKind::Branch
+                | LineKind::CondBranch
+                | LineKind::CmpBranch
+                | LineKind::Call
+                | LineKind::Ret
+                | LineKind::Directive => break,
+                _ => {}
+            }
+            let mentions = lines[k]
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .any(|tok| tok == xn || tok == wn);
+            if mentions {
+                // A write (destination) ends the value's life; a read keeps it.
+                dead = instr_clobbers_reg(lines[k].trim_start(), gpr);
+                break;
+            }
+        }
+        if !dead {
+            continue;
+        }
+        lines[i] = format!("    fmov d{}, d{}", fpb, fpa);
+        kinds[i] = LineKind::Other;
+        kinds[j] = LineKind::Nop;
+        changed = true;
     }
     changed
 }
