@@ -2597,7 +2597,11 @@ fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: us
                         if let Some(off) = extract_sp_offset(trimmed) {
                             loaded_ranges.push((off, sz));
                         }
-                    } else if trimmed.starts_with("ldr ") || trimmed.starts_with("ldp ") || trimmed.starts_with("ldur ") {
+                    } else if trimmed.starts_with("ldr ") || trimmed.starts_with("ldp ") || trimmed.starts_with("ldur ")
+                        || trimmed.starts_with("ldrsw ") || trimmed.starts_with("ldrsb ")
+                        || trimmed.starts_with("ldrsh ") || trimmed.starts_with("ldrb ")
+                        || trimmed.starts_with("ldrh ") || trimmed.starts_with("ldurs")
+                    {
                         // Load through a tracked base register.
                         if let Some(bracket) = trimmed.find("[x") {
                             let inner = &trimmed[bracket..];

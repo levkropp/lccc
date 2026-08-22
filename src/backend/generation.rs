@@ -1636,9 +1636,14 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
             // alongside the 2 register-allocated temp channels (r12, rbx).
             if let Instruction::BinOp { dest, op: crate::ir::reexports::IrBinOp::Mul, lhs, rhs, ty } = inst {
                 if mul_add_fusions.contains(&(idx + 1)) {
-                    // Only fuse if the multiply temp is NOT register-allocated.
-                    // If it IS registered, the standard register-direct path is better.
-                    if cg.get_phys_reg_for_value(dest.0).is_none() || ty.is_float() {
+                    // Float always fuses (native fmadd). Integer fuses when the
+                    // mul temp is slot-homed; with CCC_INT_MADD_REG it also
+                    // fuses register-allocated temps — one madd replaces
+                    // mul+add on the recurrence chain (madd latency equals mul
+                    // latency on Apple Silicon, so fusion never lengthens the
+                    // chain and frees the temp's register).
+                    if cg.get_phys_reg_for_value(dest.0).is_none() || ty.is_float()
+                        || std::env::var("CCC_INT_MADD_REG").is_ok() {
                         match block.instructions.get(idx + 1) {
                             Some(Instruction::BinOp { dest: add_dest, op: crate::ir::reexports::IrBinOp::Add,
                                                       lhs: add_lhs, rhs: add_rhs, ty: add_ty, .. }) => {
