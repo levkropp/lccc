@@ -15,7 +15,7 @@
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::analysis;
-use crate::ir::reexports::{Instruction, IrConst, IrFunction, Operand, Value};
+use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
 use super::loop_analysis;
 
 /// Run integer-constant hoisting on a function. Returns the number of
@@ -47,8 +47,8 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
         let mut seen: FxHashSet<u64> = FxHashSet::default();
         for &bi in &lp.body {
             for inst in &func.blocks[bi].instructions {
-                for_each_int_operand(inst, &mut |op| {
-                    if let Some(bits) = large_int_const(op) {
+                for_each_int_operand(inst, &mut |op, needs_reg| {
+                    if let Some(bits) = large_int_const(op, needs_reg) {
                         if seen.insert(bits) {
                             consts.push(bits);
                         }
@@ -88,7 +88,9 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
 /// An integer constant that is NOT encodable as an AArch64 add/cmp immediate
 /// (imm12 0..=4095, or the cmn negative range -4095..=-1) and so would be
 /// materialized with movz/movk. Returns the value as u64 bits.
-fn large_int_const(op: &Operand) -> Option<u64> {
+/// With `needs_reg` (mul/div/rem operands — those have no immediate form at
+/// all), any constant qualifies: even `mov w0, #26` per iteration is waste.
+fn large_int_const(op: &Operand, needs_reg: bool) -> Option<u64> {
     let v: i64 = match op {
         Operand::Const(IrConst::I8(v)) => *v as i64,
         Operand::Const(IrConst::I16(v)) => *v as i64,
@@ -96,34 +98,56 @@ fn large_int_const(op: &Operand) -> Option<u64> {
         Operand::Const(IrConst::I64(v)) => *v,
         _ => return None,
     };
-    if (-4095..=4095).contains(&v) {
+    if !needs_reg && (-4095..=4095).contains(&v) {
         return None; // imm12 / cmn encodable — free already
     }
     Some(v as u64)
 }
 
-/// Visit operands of the instruction forms with range-limited immediate encodings.
-fn for_each_int_operand(inst: &Instruction, f: &mut dyn FnMut(&Operand)) {
+/// Visit operands of the instruction forms with range-limited immediate
+/// encodings. The bool is true when the operand position has no immediate
+/// encoding at all (mul/div/rem), so even small constants pay a materialization.
+fn for_each_int_operand(inst: &Instruction, f: &mut dyn FnMut(&Operand, bool)) {
     match inst {
-        Instruction::BinOp { lhs, rhs, .. } | Instruction::Cmp { lhs, rhs, .. } => {
-            f(lhs);
-            f(rhs);
+        Instruction::BinOp { op, lhs, rhs, .. } => {
+            let needs_reg = matches!(
+                op,
+                IrBinOp::Mul | IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
+            );
+            f(lhs, needs_reg);
+            f(rhs, needs_reg);
+        }
+        Instruction::Cmp { lhs, rhs, .. } => {
+            f(lhs, false);
+            f(rhs, false);
         }
         _ => {}
     }
 }
 
 /// Replace operands equal to the constant `bits` with the hoisted value.
+/// Uses the same per-position immediate-encodability rule as the collector:
+/// a constant that is free as an add/cmp immediate keeps its immediate form
+/// there even when it was force-hoisted for a mul operand elsewhere.
 fn rewrite_int_operands(inst: &mut Instruction, bits: u64, new_val: u32) {
-    let sub = |op: &mut Operand| {
-        if large_int_const(op) == Some(bits) {
-            *op = Operand::Value(Value(new_val));
-        }
-    };
     match inst {
-        Instruction::BinOp { lhs, rhs, .. } | Instruction::Cmp { lhs, rhs, .. } => {
-            sub(lhs);
-            sub(rhs);
+        Instruction::BinOp { op, lhs, rhs, .. } => {
+            let needs_reg = matches!(
+                op,
+                IrBinOp::Mul | IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
+            );
+            for opnd in [lhs, rhs] {
+                if large_int_const(opnd, needs_reg) == Some(bits) {
+                    *opnd = Operand::Value(Value(new_val));
+                }
+            }
+        }
+        Instruction::Cmp { lhs, rhs, .. } => {
+            for opnd in [lhs, rhs] {
+                if large_int_const(opnd, false) == Some(bits) {
+                    *opnd = Operand::Value(Value(new_val));
+                }
+            }
         }
         _ => {}
     }
