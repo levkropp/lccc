@@ -49,6 +49,12 @@ pub struct LivenessResult {
     /// Depth 0 = not in any loop. Depth 1 = in one loop. Depth 2 = nested, etc.
     /// Used by the register allocator to weight uses inside loops more heavily.
     pub block_loop_depth: Vec<u32>,
+    /// Per-block live-in/live-out sets (dense value indices), retained for
+    /// point-precise coalescing checks. Empty when the function has no values.
+    pub block_live_in: Vec<BitSet>,
+    pub block_live_out: Vec<BitSet>,
+    /// Value id -> dense index map for the live sets.
+    pub dense_of_value: FxHashMap<u32, usize>,
 }
 
 // ── Compact bitset for dataflow ──────────────────────────────────────────────
@@ -56,7 +62,7 @@ pub struct LivenessResult {
 /// A compact bitset stored as a contiguous slice of u64 words.
 /// Supports O(1) insert/contains and O(n/64) union/difference/equality.
 #[derive(Clone)]
-struct BitSet {
+pub(crate) struct BitSet {
     words: Vec<u64>,
 }
 
@@ -75,7 +81,7 @@ impl BitSet {
     }
 
     #[inline(always)]
-    fn contains(&self, idx: usize) -> bool {
+    pub(crate) fn contains(&self, idx: usize) -> bool {
         let word = idx / 64;
         let bit = idx % 64;
         (self.words[word] >> bit) & 1 != 0
@@ -153,7 +159,7 @@ struct ProgramPointState {
 pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
     let num_blocks = func.blocks.len();
     if num_blocks == 0 {
-        return LivenessResult { intervals: Vec::new(), call_points: Vec::new(), block_loop_depth: Vec::new() };
+        return LivenessResult { intervals: Vec::new(), call_points: Vec::new(), block_loop_depth: Vec::new(), block_live_in: Vec::new(), block_live_out: Vec::new(), dense_of_value: FxHashMap::default() };
     }
 
     // Debug: trace phi references for GetToken return value
@@ -163,7 +169,7 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
 
     let num_values = value_ids.len();
     if num_values == 0 {
-        return LivenessResult { intervals: Vec::new(), call_points: Vec::new(), block_loop_depth: Vec::new() };
+        return LivenessResult { intervals: Vec::new(), call_points: Vec::new(), block_loop_depth: Vec::new(), block_live_in: Vec::new(), block_live_out: Vec::new(), dense_of_value: FxHashMap::default() };
     }
 
     // Phase 1: Assign program points and build gen/kill sets.
@@ -225,6 +231,9 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
         intervals,
         call_points: ps.call_points,
         block_loop_depth,
+        block_live_in: live_in,
+        block_live_out: live_out,
+        dense_of_value: id_to_dense,
     }
 }
 

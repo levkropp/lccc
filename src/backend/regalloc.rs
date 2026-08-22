@@ -1026,6 +1026,115 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
 
+    // Point-precise copy-web coalescing: for copy edges where exactly one
+    // side has an FP register and interval-level checks blocked the merge,
+    // walk per-block live sets — the pair can share the register iff no
+    // program point has both live (the copy points themselves excepted).
+    // Interval liveness over-reports interference inside loops (the phi is
+    // "live for the whole loop" while its replacement is computed near the
+    // backedge), which is what blocks mandelbrot's middle-loop shuffles.
+    // CCC_NO_WEB_POINT disables; CCC_WEB_DIAG prints the decisions.
+    if arm_fp_pool && std::env::var("CCC_NO_WEB_POINT").is_err() && !liveness.block_live_in.is_empty() {
+        let diag = std::env::var("CCC_WEB_DIAG").is_ok();
+        let dense = &liveness.dense_of_value;
+        for _round in 0..8 {
+            let mut any = false;
+            for (bi, block) in func.blocks.iter().enumerate() {
+                for inst in &block.instructions {
+                    if let Instruction::Copy { dest, src: Operand::Value(src_v) } = inst {
+                        let is_fp = |v: u32| f64_value_set.contains(&v) || vector_values.contains(&v);
+                        if !is_fp(dest.0) || !is_fp(src_v.0) {
+                            continue;
+                        }
+                        let d_reg = assignments.get(&dest.0).copied().filter(|r| (32..=55).contains(&r.0));
+                        let s_reg = assignments.get(&src_v.0).copied().filter(|r| (32..=55).contains(&r.0));
+                        let (a, u, reg) = match (d_reg, s_reg) {
+                            (Some(_), Some(_)) | (None, None) => continue,
+                            (Some(r), None) => (dest.0, src_v.0, r),
+                            (None, Some(r)) => (src_v.0, dest.0, r),
+                        };
+                        // A is the registered value, U the slot-homed one.
+                        // Caller-saved FP registers cannot hold call-spanning values.
+                        if reg.0 >= 40 {
+                            let spans = liveness.intervals.iter().any(|iv| {
+                                iv.value_id == u && call_points.iter().any(|&cp| iv.start < cp && cp < iv.end)
+                            });
+                            if spans {
+                                continue;
+                            }
+                        }
+                        let (Some(&da), Some(&du)) = (dense.get(&a), dense.get(&u)) else { continue };
+                        let mut point_conflict = false;
+                        'blocks: for (bj, b) in func.blocks.iter().enumerate() {
+                            let mut live_a = liveness.block_live_out[bj].contains(da);
+                            let mut live_u = liveness.block_live_out[bj].contains(du);
+                            if term_uses(b, a) {
+                                live_a = true;
+                            }
+                            if term_uses(b, u) {
+                                live_u = true;
+                            }
+                            for inst2 in b.instructions.iter().rev() {
+                                let is_pair_copy = matches!(inst2,
+                                    Instruction::Copy { dest, src: Operand::Value(s) }
+                                    if (dest.0 == a && s.0 == u) || (dest.0 == u && s.0 == a));
+                                if live_a && live_u && !is_pair_copy {
+                                    point_conflict = true;
+                                    break 'blocks;
+                                }
+                                // A non-pair def of either value overwrites the
+                                // shared register while the other is live after
+                                // it — a clobber even when the def is dead.
+                                if !is_pair_copy {
+                                    if let Some(d) = inst2.dest() {
+                                        if (d.0 == u && live_a) || (d.0 == a && live_u) {
+                                            point_conflict = true;
+                                            break 'blocks;
+                                        }
+                                    }
+                                }
+                                if let Some(d) = inst2.dest() {
+                                    if d.0 == a {
+                                        live_a = false;
+                                    }
+                                    if d.0 == u {
+                                        live_u = false;
+                                    }
+                                }
+                                let mut uses: Vec<u32> = Vec::new();
+                                inst2.for_each_used_value(|v| uses.push(v));
+                                for v in uses {
+                                    if v == a {
+                                        live_a = true;
+                                    }
+                                    if v == u {
+                                        live_u = true;
+                                    }
+                                }
+                            }
+                            if !point_conflict
+                                && liveness.block_live_in[bj].contains(da)
+                                && liveness.block_live_in[bj].contains(du)
+                            {
+                                point_conflict = true;
+                            }
+                        }
+                        if diag && !point_conflict {
+                            eprintln!("[WEBPOINT] func={} merge v{} into d{}", func.name, u, reg.0);
+                        }
+                        if !point_conflict {
+                            assignments.insert(u, reg);
+                            any = true;
+                        }
+                    }
+                }
+            }
+            if !any {
+                break;
+            }
+        }
+    }
+
     let mut used_regs: Vec<PhysReg> = used_regs_set.iter().map(|&r| PhysReg(r)).collect();
     used_regs.sort_by_key(|r| r.0);
 
@@ -1806,6 +1915,16 @@ pub(crate) fn detect_phi_coalesce_groups(
     }
 
     groups
+}
+
+/// Check if a block terminator uses a given value ID.
+fn term_uses(block: &crate::ir::reexports::BasicBlock, val_id: u32) -> bool {
+    match &block.terminator {
+        Terminator::CondBranch { cond, .. } => matches!(cond, Operand::Value(v) if v.0 == val_id),
+        Terminator::Return(Some(op)) => matches!(op, Operand::Value(v) if v.0 == val_id),
+        Terminator::Switch { val, .. } => matches!(val, Operand::Value(v) if v.0 == val_id),
+        _ => false,
+    }
 }
 
 /// Check if an instruction uses a given value ID as an operand (not as dest).
