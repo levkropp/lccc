@@ -10,21 +10,41 @@
 //! optimizer and catch issues early.
 
 pub(crate) mod cfg_simplify;
+pub(crate) mod bit_idioms;
+pub(crate) mod aggregate_copy_forward;
+pub(crate) mod alias;
+pub(crate) mod backedge_pre;
+pub(crate) mod block_layout;
 pub(crate) mod constant_fold;
 pub(crate) mod copy_prop;
 pub(crate) mod dce;
 mod dead_statics;
 pub(crate) mod div_by_const;
+pub(crate) mod fp_const_hoist;
+pub(crate) mod global_addr_cse;
+pub(crate) mod int_const_hoist;
 pub(crate) mod gvn;
 pub(crate) mod if_convert;
 pub(crate) mod inline;
 pub(crate) mod ipcp;
 pub(crate) mod iv_strength_reduce;
 pub(crate) mod licm;
+pub(crate) mod load_forward;
 pub(crate) mod loop_analysis;
+pub(crate) mod loop_memory_promote;
+pub(crate) mod redundant_loads;
+pub(crate) mod univsr;
 pub(crate) mod narrow;
 mod resolve_asm;
 pub(crate) mod simplify;
+pub(crate) mod store_load_forward;
+pub(crate) mod loop_unroll;
+pub(crate) mod phi_antidep_split;
+pub(crate) mod quadratic_sr;
+pub(crate) mod tail_call_elim;
+pub(crate) mod outline_switch;
+pub(crate) mod recursion_to_iter;
+pub(crate) mod vectorize;
 
 use crate::ir::analysis::CfgAnalysis;
 use crate::ir::reexports::{IrFunction, IrModule};
@@ -139,14 +159,24 @@ fn run_gvn_licm_ivsr_shared(
             }
         }
 
-        // Run IVSR with shared analysis.
-        // LICM hoists instructions to preheaders but does not add/remove blocks,
-        // so CFG analysis is still valid.
+        // Run IVSR with shared analysis. The transformation now explicitly
+        // rejects loop-variant GEP bases, avoiding the historical nested-loop
+        // double-offset bug while retaining pointer induction for invariant
+        // array bases.
         if run_ivsr {
             let t0 = if time_passes { Some(std::time::Instant::now()) } else { None };
-            let n = iv_strength_reduce::ivsr_with_analysis(func, &cfg);
+            // One transformation can expose another independent pointer IV in
+            // the same loop (notably the two source/destination GEPs created by
+            // vectorization). Iterate locally; IVSR changes instructions and
+            // phis but not CFG edges, so the shared analysis remains valid.
+            let mut n = 0;
+            for _ in 0..4 {
+                let round = iv_strength_reduce::ivsr_with_analysis(func, &cfg);
+                n += round;
+                if round == 0 { break; }
+            }
             if let Some(t0) = t0 {
-                eprintln!("[PASS] iter={} iv_strength_reduce (func {}): {:.4}s ({} changes)", iter, func.name, t0.elapsed().as_secs_f64(), n);
+                eprintln!("[PASS] iter={} ivsr (func {}): {:.4}s ({} changes)", iter, func.name, t0.elapsed().as_secs_f64(), n);
             }
             if n > 0 {
                 ivsr_total += n;
@@ -191,6 +221,7 @@ struct DisabledPasses {
     ifconv: bool,
     dce: bool,
     ipcp: bool,
+    unroll: bool,
 }
 
 impl DisabledPasses {
@@ -206,6 +237,7 @@ impl DisabledPasses {
             ifconv: disabled.contains("ifconv"),
             dce: disabled.contains("dce"),
             ipcp: disabled.contains("ipcp"),
+            unroll: disabled.contains("unroll"),
         }
     }
 }
@@ -216,6 +248,22 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str) {
         return;
     }
     inline::run(module);
+
+
+    // TEMP debug: dump IR right after inlining.
+    if std::env::var("LCCC_DUMP_IR_INLINE").is_ok() {
+        for func in &module.functions {
+            if func.is_declaration { continue; }
+            eprintln!("=== IR(post-inline) {} ===", func.name);
+            for (bi, b) in func.blocks.iter().enumerate() {
+                eprintln!("  block {} (label {}):", bi, b.label.0);
+                for inst in &b.instructions {
+                    eprintln!("    {:?}", inst);
+                }
+                eprintln!("    term: {:?}", b.terminator);
+            }
+        }
+    }
 
     // After inlining, convert extern inline gnu_inline functions to declarations.
     // These function bodies were only needed for inlining; they must not be emitted
@@ -233,10 +281,47 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str) {
     crate::ir::mem2reg::promote_allocas_with_params(module);
     constant_fold::run(module);
     copy_prop::run(module);
+    // Copy forwarding can expose another temporary in a copy chain
+    // (`object -> tmp1 -> tmp2 -> field load`), so run to a small fixed point.
+    if std::env::var("CCC_NO_AGG_FORWARD").is_err() {
+        for _ in 0..8 {
+            if module.for_each_function(aggregate_copy_forward::run) == 0 { break; }
+        }
+    }
+    module.for_each_function(loop_memory_promote::run);
+    // Resolve constant branches exposed by inlining before interprocedural
+    // closed-form folding examines the surviving call sites.
+    for _ in 0..3 {
+        let n = module.for_each_function(cfg_simplify::run_function);
+        constant_fold::run(module);
+        copy_prop::run(module);
+        if n == 0 { break; }
+    }
+    // Recursive closed forms can expose another constant recursive call after
+    // copy propagation, so iterate briefly to a fixed point before TCE rewrites
+    // the recurrence into loop form.
+    for _ in 0..4 {
+        if ipcp::fold_closed_form_recursions(module) == 0 { break; }
+        constant_fold::run(module);
+        copy_prop::run(module);
+    }
     simplify::run(module);
     constant_fold::run(module);
     copy_prop::run(module);
     resolve_asm::resolve_inline_asm_symbols(module);
+    if std::env::var("LCCC_DUMP_IR_PRELOOP").is_ok() {
+        for func in &module.functions {
+            if func.is_declaration { continue; }
+            eprintln!("=== IR(pre-loop) {} ===", func.name);
+            for (bi, b) in func.blocks.iter().enumerate() {
+                eprintln!("  block {} (label {}):", bi, b.label.0);
+                for inst in &b.instructions {
+                    eprintln!("    {:?}", inst);
+                }
+                eprintln!("    term: {:?}", b.terminator);
+            }
+        }
+    }
 }
 
 /// All optimization levels run the same pipeline with the same number of
@@ -274,6 +359,36 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
 
     run_inline_phase(module, &disabled);
     constant_fold::resolve_remaining_is_constant(module);
+
+    // Switch case outlining: extract case bodies from large switch statements
+    // (like SQLite's VdbeExec with 170+ cases) into separate functions.
+    // Runs after inlining so we see the final function sizes, and before all
+    // other passes so the smaller outlined functions benefit from the full
+    // optimization pipeline. Pass name for CCC_DISABLE_PASSES: "outline"
+    if !disabled.contains("outline") {
+        outline_switch::run(module);
+    }
+
+    // Tail-call-to-loop transformation.
+    // Converts self-recursive tail calls into back-edge branches before the
+    // main optimization loop so that LICM, IVSR, and GVN can optimize the
+    // resulting loops (e.g., hoist invariants, reduce induction variables).
+    if !disabled.contains("tce") {
+        module.for_each_function(tail_call_elim::tail_calls_to_loops);
+    }
+
+    // Binary recursion → iterative accumulator (e.g., Fibonacci).
+    // Runs after TCE so it catches patterns TCE can't handle (non-tail binary recursion).
+    if !disabled.contains("rec2iter") {
+        module.for_each_function(recursion_to_iter::recursion_to_iteration);
+    }
+
+    // Merge duplicate global-address materializations into one SSA value per
+    // symbol (per dominance-safe scope). Runs before the main loop so GVN,
+    // LICM, and the register allocator all see the deduplicated value web
+    // (loops over several static arrays otherwise keep a dozen interchangeable
+    // base-address values live, starving the register pools).
+    module.for_each_function(global_addr_cse::run);
 
     let iterations = 3;
     let num_funcs = module.functions.len();
@@ -371,7 +486,51 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
             total_changes_excl_dce += n;
         }
 
-        // Phase 2b: Integer narrowing
+        // Phase 2b: Loop unrolling — iter 0 only, before GVN/LICM so that
+        // subsequent passes can optimize the unrolled copies.
+        // Pass name for CCC_DISABLE_PASSES: "unroll"
+        if iter == 0 && !dis.unroll {
+            let n = timed_pass!("loop_unroll",
+                run_on_visited(module, &dirty, &mut changed, loop_unroll::unroll_loops));
+            total_changes += n;
+            total_changes_excl_dce += n;
+            if std::env::var("LCCC_DUMP_IR_UNROLL").is_ok() {
+                for func in &module.functions {
+                    if func.is_declaration { continue; }
+                    eprintln!("=== IR(post-unroll) {} ===", func.name);
+                    for (bi, b) in func.blocks.iter().enumerate() {
+                        eprintln!("  block {} (label {}):", bi, b.label.0);
+                        for inst in &b.instructions {
+                            eprintln!("    {:?}", inst);
+                        }
+                        eprintln!("    term: {:?}", b.terminator);
+                    }
+                }
+            }
+        }
+
+        // Phase 2b-vec: x86-64 vectorization — iter 0 only, EARLY in pipeline.
+        // Run before GVN/LICM/etc to catch IR in simpler state.
+        // The vectorizer currently emits Vec* intrinsics backed by XMM/YMM
+        // registers. Other backends deliberately reject those intrinsics, so
+        // running this pass for them turns ordinary scalar loops into a compiler
+        // panic instead of preserving the valid scalar program.
+        // Pass name for CCC_DISABLE_PASSES: "vectorize"
+        if iter == 0 && matches!(target, crate::backend::Target::X86_64 | crate::backend::Target::Aarch64)
+            && !disabled.contains("vectorize")
+        {
+            let vectorize_fn = if target == crate::backend::Target::Aarch64 {
+                vectorize::vectorize_function_two_wide
+            } else {
+                vectorize::vectorize_function
+            };
+            let n = timed_pass!("vectorize",
+                run_on_visited(module, &dirty, &mut changed, vectorize_fn));
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Phase 2c: Integer narrowing
         // Upstream: copy_prop (propagated values expose narrowing)
         if !dis.narrow && should_run!(2, 1) {
             let n = timed_pass!("narrow", run_on_visited(module, &dirty, &mut changed, narrow::narrow_function));
@@ -385,6 +544,13 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
         if !dis.simplify && should_run!(3, 1, 2) {
             let n = timed_pass!("simplify", run_on_visited(module, &dirty, &mut changed, simplify::simplify_function));
             cur_pass_changes[3] = n;
+            total_changes += n;
+            total_changes_excl_dce += n;
+
+            let enable_bit_reverse = target == crate::backend::Target::Aarch64;
+            let n = timed_pass!("bit_idioms", run_on_visited(module, &dirty, &mut changed,
+                |func| bit_idioms::recognize_function(func, enable_bit_reverse)));
+            cur_pass_changes[3] += n;
             total_changes += n;
             total_changes_excl_dce += n;
         }
@@ -430,7 +596,10 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
 
         // Phase 7: If-conversion
         // Upstream: cfg_simplify (simpler CFG), constfold (simplified conditions)
+        // Forward redundant reloads first: removing a load from a conditional
+        // arm makes the arm side-effect-free so if-conversion can fire.
         if !dis.ifconv && should_run!(7, 0, 4) {
+            module.for_each_function(load_forward::run);
             let n = timed_pass!("if_convert", run_on_visited(module, &dirty, &mut changed, if_convert::if_convert_function));
             cur_pass_changes[7] = n;
             total_changes += n;
@@ -490,6 +659,7 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
             total_changes_excl_dce += ipcp_changes;
         }
 
+
         if iter == 0 {
             iter0_total_changes = total_changes_excl_dce;
         }
@@ -536,6 +706,102 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
 
         // Prepare dirty set for next iteration: only re-visit functions that changed.
         std::mem::swap(&mut dirty, &mut changed);
+    }
+
+    // Late vectorization: conditional-reduction loops (sum_positive etc.) are
+    // Select-shaped only after the main loop's if_convert phase, so the early
+    // vectorizer never sees them. A second AArch64 pass here catches them.
+    // CCC_DISABLE_PASSES=latevec disables.
+    if matches!(target, crate::backend::Target::Aarch64) && !disabled.contains("latevec") {
+        let n = module.for_each_function(vectorize::vectorize_function_two_wide_late);
+        if n > 0 {
+            // The vectorizer's block surgery does not maintain source_spans;
+            // drop any that no longer align with their block's instructions.
+            for func in &mut module.functions {
+                for block in &mut func.blocks {
+                    if !block.source_spans.is_empty()
+                        && block.source_spans.len() != block.instructions.len()
+                    {
+                        block.source_spans.clear();
+                    }
+                }
+            }
+            module.for_each_function(dce::eliminate_dead_code);
+        }
+    }
+
+    // DCE can remove aggregate-copy consumers that previously made forwarding
+    // unsafe (for example a full returned struct whose only surviving use is
+    // one field load). Re-run forwarding before final loop promotion.
+    if std::env::var("CCC_NO_AGG_FORWARD").is_err() {
+        for _ in 0..8 {
+            if module.for_each_function(aggregate_copy_forward::run) == 0 { break; }
+        }
+    }
+    // Forward alloca-field stores to later loads of the same constant-offset
+    // field (turns fully-scalarized aggregate memory traffic into SSA values).
+    for _ in 0..4 {
+        if module.for_each_function(store_load_forward::run) == 0 { break; }
+    }
+    module.for_each_function(dce::eliminate_dead_code);
+    if std::env::var("LCCC_DUMP_IR_PROMOTE").is_ok() {
+        for func in &module.functions {
+            if func.is_declaration { continue; }
+            eprintln!("=== IR(pre-promote) {} ===", func.name);
+            for (bi, b) in func.blocks.iter().enumerate() {
+                eprintln!("  block {} (label {}):", bi, b.label.0);
+                for inst in &b.instructions {
+                    eprintln!("    {:?}", inst);
+                }
+                eprintln!("    term: {:?}", b.terminator);
+            }
+        }
+    }
+    // Run memory-recurrence promotion again after CFG and copy cleanup have
+    // exposed canonical natural loops.
+    module.for_each_function(loop_memory_promote::run);
+    module.for_each_function(loop_memory_promote::mark_f64_add_reduction);
+    // Late redundant-load elimination: post-IVSR, field accesses have constant
+    // offsets, so same-address loads (the frontend's repeated `a[j].field`)
+    // merge when intervening stores are provably non-aliasing.
+    module.for_each_function(redundant_loads::run);
+    // Merged loads orphan their (now dead) address computations; clean up.
+    module.for_each_function(dce::eliminate_dead_code);
+    // Second-order strength reduction for triangular loop indices (slope-1).
+    if !disabled.contains("quadsr") {
+        module.for_each_function(quadratic_sr::run);
+        module.for_each_function(dce::eliminate_dead_code);
+    }
+
+    // Hoist FP constants used in loop bodies into preheader Copies so they can
+    // stay in FP registers across the loop (AArch64 constant-pool literal loads
+    // otherwise sit in the loop's dependency path every iteration).
+    if !disabled.contains("fpconst") {
+        module.for_each_function(fp_const_hoist::run);
+    }
+
+    // Hoist large integer constants (not encodable as cmp/add immediates) out
+    // of loop bodies for the same reason — sieve's loop bound cost movz+movk
+    // per iteration before this.
+    if !disabled.contains("intconst") {
+        module.for_each_function(int_const_hoist::run);
+    }
+
+    // Backedge PRE: replace a loop-top expression over a phi with a phi over
+    // the matching loop-bottom expression (carries e.g. mandelbrot's zr^2
+    // across the backedge, one fmul fewer per iteration). Runs after all
+    // loop transforms so final loop shapes are visible, before the antidep
+    // split (whose copies must see the final phi set).
+    if !disabled.contains("bepre") {
+        module.for_each_function(backedge_pre::run);
+    }
+
+    // Split loop-phi anti-dependencies (uses of the phi value after the
+    // backedge value is born) onto an early copy, unblocking the backend's
+    // backedge coalescing so the recurrence copy leaves the dependency chain.
+    // Runs after all loop transforms so the final loop shapes are split.
+    if !disabled.contains("antidep") {
+        module.for_each_function(phi_antidep_split::run);
     }
 
     // Phase 11: Dead static function elimination.

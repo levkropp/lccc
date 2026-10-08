@@ -1392,6 +1392,7 @@ impl ArchCodegen for I686Codegen {
                 IrUnaryOp::Ctz => self.emit_i64_ctz(),
                 IrUnaryOp::Popcount => self.emit_i64_popcount(),
                 IrUnaryOp::Bswap => self.emit_i64_bswap(),
+                IrUnaryOp::BitReverse => unreachable!("bit-reverse idiom is not enabled for i686"),
                 IrUnaryOp::IsConstant => unreachable!("handled above"),
             }
             self.emit_store_acc_pair(dest);
@@ -1408,6 +1409,7 @@ impl ArchCodegen for I686Codegen {
             IrUnaryOp::Ctz => self.emit_int_ctz(ty),
             IrUnaryOp::Popcount => self.emit_int_popcount(ty),
             IrUnaryOp::Bswap => self.emit_int_bswap(ty),
+            IrUnaryOp::BitReverse => unreachable!("bit-reverse idiom is not enabled for i686"),
             IrUnaryOp::IsConstant => unreachable!("handled above"),
         }
         self.state.reg_cache.invalidate_acc();

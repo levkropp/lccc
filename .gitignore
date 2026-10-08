@@ -1,8 +1,52 @@
+# Rust build artifacts
 /target/
-Cargo.lock
-*.o
-*.s
-*.core
-a.out
-dump.rdb
+/target-sroa/
+**/*.rs.bk
+
+# Crash dumps
 core
+core.*
+
+# CCC submodule build
+/ccc/target/
+
+# Jekyll build output
+/_site/
+/.jekyll-cache/
+/.sass-cache/
+Gemfile.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Compiled / binary
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+a.out
+test_*
+bench_*
+
+# Benchmark / test output
+/test-results/
+/tmp-results/
+/tmp/
+*.log
+*.png
+*.pdf
+
+# Misc
+.tmp
+.env
+.bench/
+
+# Local task scratch notes are not repository artifacts.
+/current_tasks/

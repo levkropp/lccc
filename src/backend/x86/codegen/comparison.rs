@@ -2,21 +2,18 @@
 
 use crate::ir::reexports::{BlockId, IrCmpOp, IrConst, Operand, Value};
 use crate::common::types::IrType;
-use super::emit::{X86Codegen, phys_reg_name};
+use super::emit::{X86Codegen, phys_reg_name, phys_reg_name_32, is_xmm_reg};
 
 impl X86Codegen {
     pub(super) fn emit_float_cmp_impl(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
-        let (mov_to_xmm0, mov_to_xmm1_from_rcx) = if ty == IrType::F32 {
-            ("movd %eax, %xmm0", "movd %ecx, %xmm1")
-        } else {
-            ("movq %rax, %xmm0", "movq %rcx, %xmm1")
-        };
         let swap_operands = matches!(op, IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sle | IrCmpOp::Ule);
         let (first, second) = if swap_operands { (rhs, lhs) } else { (lhs, rhs) };
-        self.operand_to_rax(first);
-        self.state.emit_fmt(format_args!("    {}", mov_to_xmm0));
-        self.operand_to_rcx(second);
-        self.state.emit_fmt(format_args!("    {}", mov_to_xmm1_from_rcx));
+
+        // Load first operand → %xmm0 (use constant pool for FP constants)
+        self.emit_fp_operand_to_xmm(first, ty, "xmm0");
+        // Load second operand → %xmm1
+        self.emit_fp_operand_to_xmm(second, ty, "xmm1");
+
         if ty == IrType::F64 {
             self.state.emit("    ucomisd %xmm1, %xmm0");
         } else {
@@ -40,7 +37,7 @@ impl X86Codegen {
                 self.state.emit("    setae %al");
             }
         }
-        self.state.emit("    movzbq %al, %rax");
+        self.state.emit("    movzbl %al, %eax");
         self.state.reg_cache.invalidate_acc();
         self.store_rax_to(dest);
     }
@@ -70,7 +67,7 @@ impl X86Codegen {
                 self.state.emit("    setae %al");
             }
         }
-        self.state.emit("    movzbq %al, %rax");
+        self.state.emit("    movzbl %al, %eax");
         self.state.reg_cache.invalidate_acc();
         self.store_rax_to(dest);
     }
@@ -92,7 +89,19 @@ impl X86Codegen {
             IrCmpOp::Uge => "setae",
         };
         self.state.emit_fmt(format_args!("    {} %al", set_instr));
-        self.state.emit("    movzbq %al, %rax");
+
+        // Register-direct: movzbl %al, %dest_reg_32 — skip %rax relay.
+        // Safe because %al is part of %rax, never overlaps callee-saved registers.
+        if let Some(d_reg) = self.dest_reg(dest) {
+            if !is_xmm_reg(d_reg) {
+                let d_name = phys_reg_name_32(d_reg);
+                self.state.emit_fmt(format_args!("    movzbl %al, %{}", d_name));
+                self.state.reg_cache.invalidate_acc();
+                return;
+            }
+        }
+
+        self.state.emit("    movzbl %al, %eax");
         self.state.reg_cache.invalidate_acc();
         self.store_rax_to(dest);
     }
@@ -156,6 +165,18 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_cond_branch_blocks_impl(&mut self, cond: &Operand, true_block: BlockId, false_block: BlockId) {
+        // Register-direct: test the condition register directly, skip %rax relay.
+        if let Operand::Value(v) = cond {
+            if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                if !is_xmm_reg(reg) {
+                    let name = phys_reg_name(reg);
+                    self.state.emit_fmt(format_args!("    testq %{}, %{}", name, name));
+                    self.state.out.emit_jcc_block("    jne", true_block.0);
+                    self.state.out.emit_jmp_block(false_block.0);
+                    return;
+                }
+            }
+        }
         self.operand_to_rax(cond);
         self.state.emit("    testq %rax, %rax");
         self.state.out.emit_jcc_block("    jne", true_block.0);
@@ -163,39 +184,72 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_select_impl(&mut self, dest: &Value, cond: &Operand, true_val: &Operand, false_val: &Operand, _ty: IrType) {
-        self.operand_to_rax(false_val);
-        self.operand_to_rcx(true_val);
+        // Register-direct: when dest has a register, operate directly on it.
+        if let Some(d_reg) = self.dest_reg(dest) {
+            if !is_xmm_reg(d_reg) {
+                let d_name = phys_reg_name(d_reg);
 
-        match cond {
-            Operand::Const(c) => {
-                let val = match c {
-                    IrConst::I8(v) => *v as i64,
-                    IrConst::I16(v) => *v as i64,
-                    IrConst::I32(v) => *v as i64,
-                    IrConst::I64(v) => *v,
-                    IrConst::Zero => 0,
-                    _ => 0,
+                // Check for register conflicts: if true_val is in dest reg,
+                // we must load it to %rcx BEFORE loading false_val to dest.
+                let true_in_dest = match true_val {
+                    Operand::Value(v) => self.reg_assignments.get(&v.0).copied() == Some(d_reg),
+                    _ => false,
                 };
-                if val == 0 {
-                    self.state.emit("    xorl %edx, %edx");
-                } else if val >= i32::MIN as i64 && val <= i32::MAX as i64 {
-                    self.state.out.emit_instr_imm_reg("    movq", val, "rdx");
-                } else {
-                    self.state.out.emit_instr_imm_reg("    movabsq", val, "rdx");
+
+                // Load condition FIRST, then true/false vals.
+                // operand_to_rax(cond) must run before loading true_val
+                // to rcx, because the condition load may clobber registers
+                // that the register allocator assigned to true_val (the
+                // allocator doesn't model simultaneous liveness of Select operands).
+
+                // Step 1: load and test condition
+                self.operand_to_rax(cond);
+                self.state.emit("    testq %rax, %rax");
+                // Save flags (condition result) — pushfq preserves ZF
+                self.state.emit("    pushfq");
+                if self.state.out.use_rsp_addressing {
+                    self.state.out.rsp_frame_size += 8;
                 }
-            }
-            Operand::Value(v) => {
-                if let Some(&reg) = self.reg_assignments.get(&v.0) {
-                    let reg_name = phys_reg_name(reg);
-                    self.state.out.emit_instr_reg_reg("    movq", reg_name, "rdx");
-                } else if self.state.get_slot(v.0).is_some() {
-                    self.value_to_reg(v, "rdx");
-                } else {
-                    self.state.emit("    xorl %edx, %edx");
+
+                // Step 2: load false_val to dest
+                self.operand_to_callee_reg(false_val, d_reg);
+
+                // Step 3: load true_val to rcx
+                self.operand_to_rcx(true_val);
+
+                // Step 4: restore flags and cmov
+                self.state.emit("    popfq");
+                if self.state.out.use_rsp_addressing {
+                    self.state.out.rsp_frame_size -= 8;
                 }
+                self.state.emit_fmt(format_args!("    cmovneq %rcx, %{}", d_name));
+                self.state.reg_cache.invalidate_acc();
+                return;
             }
         }
-        self.state.emit("    testq %rdx, %rdx");
+
+        // Accumulator fallback — same pushfq approach as register-direct path
+        // to prevent condition loading from clobbering true_val's register.
+
+        // Step 1: load and test condition FIRST
+        self.operand_to_rax(cond);
+        self.state.emit("    testq %rax, %rax");
+        self.state.emit("    pushfq");
+        if self.state.out.use_rsp_addressing {
+            self.state.out.rsp_frame_size += 8;
+        }
+
+        // Step 2: load false_val to rax
+        self.operand_to_rax(false_val);
+
+        // Step 3: load true_val to rcx (safe — condition already tested)
+        self.operand_to_rcx(true_val);
+
+        // Step 4: restore flags and cmov
+        self.state.emit("    popfq");
+        if self.state.out.use_rsp_addressing {
+            self.state.out.rsp_frame_size -= 8;
+        }
         self.state.emit("    cmovneq %rcx, %rax");
         self.state.reg_cache.invalidate_acc();
         self.store_rax_to(dest);

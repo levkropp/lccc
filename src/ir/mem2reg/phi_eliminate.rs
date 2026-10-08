@@ -59,12 +59,23 @@ pub fn eliminate_phis(module: &mut IrModule) {
             }
         }
     }
+    if std::env::var("LCCC_DEBUG_LABELS").is_ok() {
+        eprintln!("[PHI] Starting phi_eliminate with next_block_id = {}", next_block_id);
+    }
 
     for func in &mut module.functions {
         if func.is_declaration || func.blocks.is_empty() {
             continue;
         }
+        if std::env::var("LCCC_DEBUG_LABELS").is_ok() {
+            eprintln!("[PHI] Processing function {}, current labels: {:?}", func.name,
+                      func.blocks.iter().map(|b| b.label.0).collect::<Vec<_>>());
+        }
         eliminate_phis_in_function(func, &mut next_block_id);
+        if std::env::var("LCCC_DEBUG_LABELS").is_ok() {
+            eprintln!("[PHI] After processing {}, labels: {:?}, next_block_id now {}", func.name,
+                      func.blocks.iter().map(|b| b.label.0).collect::<Vec<_>>(), next_block_id);
+        }
     }
 }
 
@@ -177,6 +188,9 @@ fn get_or_create_trampoline(
         .or_insert_with(|| {
             let idx = trampolines.len();
             let label = BlockId(*next_block_id);
+            if std::env::var("LCCC_DEBUG_LABELS").is_ok() {
+                eprintln!("[PHI] Creating trampoline block with BlockId({}), next will be {}", label.0, *next_block_id + 1);
+            }
             *next_block_id += 1;
             trampolines.push(TrampolineBlock {
                 label,

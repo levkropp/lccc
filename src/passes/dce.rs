@@ -125,6 +125,17 @@ pub(crate) fn eliminate_dead_code(func: &mut IrFunction) -> usize {
     }
 
     // Step 4: Sweep - remove all dead instructions.
+    if std::env::var("CCC_DEBUG_DCE").is_ok() {
+        for (bi, block) in func.blocks.iter().enumerate() {
+            for (ii, inst) in block.instructions.iter().enumerate() {
+                if ii < dead[bi].len() && dead[bi][ii] {
+                    if let Some(d) = inst.dest() {
+                        eprintln!("[DCE] Removing Value({}) in block {}: {:?}", d.0, bi, inst);
+                    }
+                }
+            }
+        }
+    }
     let mut total = 0;
     for (bi, block) in func.blocks.iter_mut().enumerate() {
         let dead_flags = &dead[bi];

@@ -67,6 +67,7 @@ use crate::ir::reexports::{
     AtomicOrdering,
     AtomicRmwOp,
     BlockId,
+    Instruction,
     IntrinsicOp,
     IrBinOp,
     IrCmpOp,
@@ -171,6 +172,22 @@ pub trait ArchCodegen {
         }
     }
 
+    /// Try to lower an IR instruction to the MachInst pipeline (virtual register ISel).
+    /// Returns true if the instruction was handled by MachInst (accumulated in an
+    /// internal buffer). Returns false if the instruction should use the default
+    /// accumulator-based codegen path.
+    /// Default: always false (no MachInst support).
+    fn try_lower_machinst(&mut self, _inst: &Instruction) -> bool { false }
+
+    /// Whether MachInst ISel is enabled. When true, GEP folding is skipped
+    /// so that GEPs and Load/Store go through the MachInst path for longer chains.
+    fn is_machinst_enabled(&self) -> bool { false }
+
+    /// Flush the accumulated MachInst buffer: run register allocation and emit assembly.
+    /// Called at block boundaries and before instructions that can't be lowered to MachInst.
+    /// Default: no-op.
+    fn flush_machinst(&mut self) {}
+
     /// Get the physical register assigned to a value, if any.
     /// Returns None when the value is stack-allocated or not register-assigned.
     /// Backends with register allocation must implement this; the default returns
@@ -244,6 +261,32 @@ pub trait ArchCodegen {
     /// single PC-relative memory access (e.g., `symbol(%rip)` on x86-64).
     /// Returns false by default; x86-64 returns true.
     fn supports_global_addr_fold(&self) -> bool {
+        false
+    }
+
+    /// Whether this backend supports indexed (register+register) addressing
+    /// for folded value-offset GEPs: `ldr/str [base_reg, idx_reg, lsl #shift]`.
+    /// Returns false by default; AArch64 returns true.
+    fn supports_indexed_addr(&self) -> bool {
+        false
+    }
+
+    /// Whether `emit_fused_cmp_branch_blocks` handles floating-point compares
+    /// (fcmp + b.cc without materializing a cset boolean). Default false;
+    /// AArch64 returns true.
+    fn supports_fused_fp_cmp_branch(&self) -> bool {
+        false
+    }
+
+    /// Emit a load using indexed addressing: dest = [base + (index << shift)].
+    /// Returns false if it cannot be emitted (caller falls back to unfolding).
+    fn emit_load_indexed(&mut self, _dest: &Value, _base: &Value, _index: &Value, _shift: u8, _ty: IrType) -> bool {
+        false
+    }
+
+    /// Emit a store using indexed addressing: [base + (index << shift)] = val.
+    /// Returns false if it cannot be emitted (caller falls back to unfolding).
+    fn emit_store_indexed(&mut self, _val: &Operand, _base: &Value, _index: &Value, _shift: u8, _ty: IrType) -> bool {
         false
     }
 
@@ -351,6 +394,53 @@ pub trait ArchCodegen {
         self.emit_int_binop(dest, op, lhs, rhs, ty);
     }
 
+    /// Emit a fused multiply-add: dest = acc + (mul_lhs * mul_rhs).
+    ///
+    /// The multiply result stays in the accumulator register (%eax/%rax) and is
+    /// added directly to the accumulator operand. This avoids register-allocating
+    /// the multiply temp, freeing registers for ILP.
+    ///
+    /// Default implementation falls back to separate mul + add.
+    fn emit_fused_mul_add(&mut self, _mul_dest: &Value, mul_lhs: &Operand, mul_rhs: &Operand,
+                          acc: &Operand, add_dest: &Value, ty: IrType) {
+        // Default: emit mul then add separately via the standard paths.
+        self.emit_int_binop(_mul_dest, IrBinOp::Mul, mul_lhs, mul_rhs, ty);
+        self.emit_int_binop(add_dest, IrBinOp::Add, acc, &Operand::Value(Value(_mul_dest.0)), ty);
+    }
+
+    fn supports_fused_float_mul_add(&self) -> bool { false }
+
+    /// Emit a fused multiply-subtract. When `mul_is_lhs` is false this is
+    /// `sub_dest = acc - (mul_lhs * mul_rhs)` (fmsub); when true it is
+    /// `sub_dest = (mul_lhs * mul_rhs) - acc` (fnmsub).
+    ///
+    /// Default implementation falls back to separate mul + sub.
+    fn emit_fused_mul_sub(&mut self, _mul_dest: &Value, mul_lhs: &Operand, mul_rhs: &Operand,
+                          acc: &Operand, sub_dest: &Value, ty: IrType, mul_is_lhs: bool) {
+        self.emit_int_binop(_mul_dest, IrBinOp::Mul, mul_lhs, mul_rhs, ty);
+        let (l, r) = if mul_is_lhs {
+            (Operand::Value(Value(_mul_dest.0)), *acc)
+        } else {
+            (*acc, Operand::Value(Value(_mul_dest.0)))
+        };
+        self.emit_int_binop(sub_dest, IrBinOp::Sub, &l, &r, ty);
+    }
+
+    /// Whether the target can encode a shifted register directly as the second
+    /// operand of an integer logical instruction (for example AArch64's
+    /// `orr w0, w1, w2, lsr #5`).
+    fn supports_shifted_logical(&self) -> bool { false }
+
+    /// Emit `dest = other logical_op (shift_lhs shift_op shift_amount)`.
+    /// Called only for an adjacent, single-use shift/logical pair.
+    fn emit_shifted_logical(&mut self, shift_dest: &Value, shift_op: IrBinOp,
+                            shift_lhs: &Operand, shift_amount: &Operand,
+                            logical_op: IrBinOp, other: &Operand,
+                            dest: &Value, ty: IrType) {
+        self.emit_int_binop(shift_dest, shift_op, shift_lhs, shift_amount, ty);
+        self.emit_int_binop(dest, logical_op, other, &Operand::Value(*shift_dest), ty);
+    }
+
     /// Emit a float binary operation (add/sub/mul/div).
     fn emit_float_binop(&mut self, dest: &Value, op: FloatOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
         let mnemonic = self.emit_float_binop_mnemonic(op);
@@ -433,6 +523,9 @@ pub trait ArchCodegen {
                  is_sret: bool,
                  _is_fastcall: bool,
                  ret_eightbyte_classes: &[crate::common::types::EightbyteClass]) {
+        // Phase 2b: save caller-saved registers with live values before the call.
+        self.emit_pre_call_save_caller_regs();
+
         use super::call_abi::*;
         let config = self.call_abi_config();
         let mut arg_classes = classify_call_args(args, arg_types, struct_arg_sizes, struct_arg_aligns, struct_arg_classes, struct_arg_riscv_float_classes, is_variadic, &config);
@@ -534,7 +627,18 @@ pub trait ArchCodegen {
             self.set_call_ret_eightbyte_classes(ret_eightbyte_classes);
             self.emit_call_store_result(&dest, return_type);
         }
+
+        // Phase 2b: restore caller-saved registers after the call.
+        self.emit_post_call_restore_caller_regs();
     }
+
+    // ---- Caller-save spill/reload hooks for Phase 2b ----
+
+    /// Save caller-saved registers with live values before a call.
+    /// Default: no-op. X86 overrides to selectively save based on liveness.
+    fn emit_pre_call_save_caller_regs(&mut self) {}
+    /// Restore caller-saved registers after a call returns.
+    fn emit_post_call_restore_caller_regs(&mut self) {}
 
     // ---- Call hook methods (overridden by each backend) ----
 
@@ -679,6 +783,11 @@ pub trait ArchCodegen {
                 }
             });
             if let Some(off) = const_offset {
+                // Register-direct path: base and dest both register-assigned —
+                // emit a single add/sub with no accumulator round-trip.
+                if self.emit_gep_reg_const(dest, base, off) {
+                    return;
+                }
                 if let Some(addr) = self.state_ref().resolve_slot_addr(base.0) {
                     match addr {
                         SlotAddr::OverAligned(slot, id) => {
@@ -700,6 +809,19 @@ pub trait ArchCodegen {
                 }
             }
         }
+        // Optimized path: if both base and offset are register-allocated,
+        // use leaq (%base_reg, %offset_reg), %dest_reg to compute the
+        // address in a single instruction.
+        if let Operand::Value(off_val) = offset {
+            let base_reg = self.get_phys_reg_for_value(base.0);
+            let off_reg = self.get_phys_reg_for_value(off_val.0);
+            let dest_reg = self.get_phys_reg_for_value(dest.0);
+            if let (Some(br), Some(or)) = (base_reg, off_reg) {
+                self.emit_leaq_base_index(br, or, dest, dest_reg);
+                return;
+            }
+        }
+
         // General path for non-constant offsets.
         if let Some(addr) = self.state_ref().resolve_slot_addr(base.0) {
             match addr {
@@ -724,12 +846,36 @@ pub trait ArchCodegen {
         self.emit_gep_add_const_to_acc_from_secondary(offset);
     }
 
+    /// Register-direct GEP hook: base and dest both live in registers and the
+    /// offset is a constant. Backends that can emit a single add/sub override
+    /// this and return true. Default: not handled (falls back to slot paths).
+    fn emit_gep_reg_const(&mut self, _dest: &Value, _base: &Value, _offset: i64) -> bool {
+        false
+    }
+
     /// Emit optimized GEP for Indirect base + constant offset.
     /// Default: load ptr from slot, then lea offset(ptr), %rax — two instructions on x86.
     fn emit_gep_indirect_const(&mut self, slot: StackSlot, offset: i64, val_id: u32) {
         // Default fallback: load ptr to secondary, load offset to acc, add.
         self.emit_slot_addr_to_secondary(slot, false, val_id);
         self.emit_gep_add_const_to_acc_from_secondary(offset);
+    }
+
+    /// Emit leaq (%base_reg, %index_reg), %dest for GEP with both operands
+    /// in registers. Default: falls back to accumulator path.
+    fn emit_leaq_base_index(&mut self, base_reg: PhysReg, index_reg: PhysReg,
+                             dest: &Value, dest_reg: Option<PhysReg>) {
+        // Default: load base to secondary, load index to acc, add, store
+        self.emit_reg_to_acc(base_reg);
+        self.emit_acc_to_secondary();
+        self.emit_reg_to_acc(index_reg);
+        self.emit_add_secondary_to_acc();
+        self.emit_store_result(dest);
+    }
+
+    /// Move a physical register's value to the accumulator.
+    fn emit_reg_to_acc(&mut self, _reg: PhysReg) {
+        // Default: no-op (backends override)
     }
 
     /// Add a constant offset to accumulator (used after computing base in acc).
@@ -1026,6 +1172,9 @@ pub trait ArchCodegen {
     fn emit_int_clz(&mut self, ty: IrType);
     fn emit_int_ctz(&mut self, ty: IrType);
     fn emit_int_bswap(&mut self, ty: IrType);
+    fn emit_int_bitreverse(&mut self, _ty: IrType) {
+        panic!("bit-reverse IR reached a backend without native lowering")
+    }
     fn emit_int_popcount(&mut self, ty: IrType);
 
     // --- Control flow primitives ---
@@ -1155,6 +1304,37 @@ pub trait ArchCodegen {
         self.emit_fused_cmp_branch(op, lhs, rhs, ty, &true_label, &false_label);
     }
 
+    /// Whether the backend can fuse an integer compare feeding a Select into
+    /// compare + conditional-select, skipping the boolean materialization.
+    fn supports_fused_cmp_select(&self) -> bool {
+        false
+    }
+
+    /// Emit a fused compare-and-select: `dest = (lhs <op> rhs) ? tv : fv`
+    /// without materializing the comparison's boolean value. Only called for
+    /// integer comparisons whose Cmp result is used solely by this select
+    /// (the caller skips the standalone Cmp emission).
+    ///
+    /// Default: materialize via the generic cmp + select sequence.
+    fn emit_fused_cmp_select(
+        &mut self,
+        op: IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        cmp_ty: IrType,
+        true_val: &Operand,
+        false_val: &Operand,
+        dest: &Value,
+        sel_ty: IrType,
+    ) {
+        let dummy_dest = Value(u32::MAX);
+        self.emit_cmp(&dummy_dest, op, lhs, rhs, cmp_ty);
+        // The accumulator holds the boolean result; select on it.
+        self.emit_select(dest, &Operand::Value(dummy_dest), true_val, false_val, sel_ty);
+        // Invalidate cache since dummy_dest may have polluted it.
+        self.state().reg_cache.invalidate_all();
+    }
+
     /// Emit an indirect branch (computed goto).
     fn emit_indirect_branch(&mut self, target: &Operand) {
         self.emit_load_operand(target);
@@ -1177,8 +1357,11 @@ pub trait ArchCodegen {
         } else if cases.len() >= MIN_JUMP_TABLE_CASES {
             let min_val = cases.iter().map(|&(v, _)| v).min().expect("switch must have cases");
             let max_val = cases.iter().map(|&(v, _)| v).max().expect("switch must have cases");
-            let range = (max_val - min_val + 1) as usize;
-            range <= MAX_JUMP_TABLE_RANGE && cases.len() * 100 / range >= MIN_JUMP_TABLE_DENSITY_PERCENT
+            // Use i128 arithmetic to prevent overflow when min_val is very negative
+            // and max_val is very positive (e.g., -2^31 to 2^31).
+            let range_i128 = max_val as i128 - min_val as i128 + 1;
+            let range_ok = range_i128 > 0 && range_i128 <= MAX_JUMP_TABLE_RANGE as i128;
+            range_ok && cases.len() * 100 / (range_i128 as usize) >= MIN_JUMP_TABLE_DENSITY_PERCENT
         } else {
             false
         };
@@ -1419,11 +1602,16 @@ pub trait ArchCodegen {
 pub fn build_jump_table(cases: &[(i64, BlockId)], default: &BlockId) -> (Vec<BlockId>, i64, usize) {
     let min_val = cases.iter().map(|&(v, _)| v).min().expect("switch must have cases");
     let max_val = cases.iter().map(|&(v, _)| v).max().expect("switch must have cases");
-    let range = (max_val - min_val + 1) as usize;
+    // Use i128 to prevent overflow when case values span a wide range.
+    let range_i128 = max_val as i128 - min_val as i128 + 1;
+    assert!(range_i128 > 0 && range_i128 <= MAX_JUMP_TABLE_RANGE as i128,
+        "jump table range overflow: min={}, max={}, range={}", min_val, max_val, range_i128);
+    let range = range_i128 as usize;
 
     let mut table = vec![*default; range];
     for &(case_val, target) in cases {
         let idx = (case_val - min_val) as usize;
+        debug_assert!(idx < range, "jump table index out of bounds: idx={}, range={}", idx, range);
         table[idx] = target;
     }
     (table, min_val, range)
@@ -1479,22 +1667,32 @@ pub fn emit_store_default(cg: &mut (impl ArchCodegen + ?Sized), val: &Operand, p
         }
         return;
     }
-    cg.emit_load_operand(val);
     if let Some(addr) = addr {
         let store_instr = cg.store_instr_for_type(ty);
         match addr {
             SlotAddr::OverAligned(slot, id) => {
-                cg.emit_save_acc();
+                // Load ptr address first, then value, to avoid save_acc clobbering.
                 cg.emit_alloca_aligned_addr(slot, id);
+                // rcx now holds the target address
+                cg.emit_load_operand(val);
                 cg.emit_typed_store_indirect(store_instr, ty);
             }
-            SlotAddr::Direct(slot) => cg.emit_typed_store_to_slot(store_instr, ty, slot),
+            SlotAddr::Direct(slot) => {
+                cg.emit_load_operand(val);
+                cg.emit_typed_store_to_slot(store_instr, ty, slot);
+            }
             SlotAddr::Indirect(slot) => {
-                cg.emit_save_acc();
+                // Load pointer to %rcx FIRST, then load value to accumulator.
+                // This avoids emit_save_acc which uses %r11/%rdx as scratch —
+                // these can be clobbered by the value loading (operand_to_rax)
+                // if the value computation uses %r11 as an intermediate.
                 cg.emit_load_ptr_from_slot(slot, ptr.0);
+                cg.emit_load_operand(val);
                 cg.emit_typed_store_indirect(store_instr, ty);
             }
         }
+    } else {
+        cg.emit_load_operand(val);
     }
 }
 
@@ -1627,6 +1825,7 @@ pub fn emit_unaryop_default(cg: &mut (impl ArchCodegen + ?Sized), dest: &Value, 
             IrUnaryOp::Clz => cg.emit_int_clz(ty),
             IrUnaryOp::Ctz => cg.emit_int_ctz(ty),
             IrUnaryOp::Bswap => cg.emit_int_bswap(ty),
+            IrUnaryOp::BitReverse => cg.emit_int_bitreverse(ty),
             IrUnaryOp::Popcount => cg.emit_int_popcount(ty),
             IrUnaryOp::IsConstant => unreachable!("IsConstant handled above"),
         }

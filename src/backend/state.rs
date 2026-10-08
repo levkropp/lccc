@@ -44,8 +44,12 @@ pub struct RegCacheEntry {
 /// - RISC-V: acc = t0,    sec = t1
 #[derive(Debug, Default)]
 pub struct RegCache {
-    /// Which value is currently in the primary accumulator register.
+    /// Which value is currently in the primary accumulator register (%rax on x86).
     pub acc: Option<RegCacheEntry>,
+    /// Which value is currently in the secondary register (%rcx on x86).
+    /// Tracked so that operand_to_rax can use `movq %rcx, %rax` instead of
+    /// a stack reload when the value was recently loaded to %rcx.
+    pub sec: Option<RegCacheEntry>,
 }
 
 impl RegCache {
@@ -55,10 +59,22 @@ impl RegCache {
         self.acc = Some(RegCacheEntry { value_id, is_alloca });
     }
 
+    /// Record that the secondary register now holds the given value.
+    #[inline]
+    pub fn set_sec(&mut self, value_id: u32, is_alloca: bool) {
+        self.sec = Some(RegCacheEntry { value_id, is_alloca });
+    }
+
     /// Check if the accumulator holds the given value (with matching alloca status).
     #[inline]
     pub fn acc_has(&self, value_id: u32, is_alloca: bool) -> bool {
         self.acc == Some(RegCacheEntry { value_id, is_alloca })
+    }
+
+    /// Check if the secondary register holds the given value.
+    #[inline]
+    pub fn sec_has(&self, value_id: u32, is_alloca: bool) -> bool {
+        self.sec == Some(RegCacheEntry { value_id, is_alloca })
     }
 
     /// Invalidate the accumulator cache.
@@ -67,11 +83,18 @@ impl RegCache {
         self.acc = None;
     }
 
+    /// Invalidate the secondary register cache.
+    #[inline]
+    pub fn invalidate_sec(&mut self) {
+        self.sec = None;
+    }
+
     /// Invalidate all cached register values. Called on operations that may
     /// clobber any register (calls, inline asm, etc.).
     #[inline]
     pub fn invalidate_all(&mut self) {
         self.acc = None;
+        self.sec = None;
     }
 }
 
@@ -80,6 +103,9 @@ pub struct CodegenState {
     pub out: AsmOutput,
     pub stack_offset: i64,
     pub value_locations: FxHashMap<u32, StackSlot>,
+    /// Emergency spill slot offset, allocated downward from the bottom of the frame.
+    /// Used when store_rax_to encounters a value with no register or stack slot.
+    pub emergency_spill_offset: i64,
     /// Values that are allocas (their stack slot IS the data, not a pointer to data).
     pub alloca_values: FxHashSet<u32>,
     /// Type associated with each alloca (for type-aware loads/stores).
@@ -93,6 +119,10 @@ pub struct CodegenState {
     /// copy handling (e.g., x87 fldl/fstpl for F64, two-word copy for I64).
     /// Only populated on i686; empty on 64-bit targets.
     pub wide_values: FxHashSet<u32>,
+    /// Vector values (produced by Vec* intrinsics like VecZeroF64x4, VecLoadF64x4, etc.).
+    /// These should be addressed via leaq (to get stack slot address) instead of movq
+    /// (which would load scalar bytes), because they hold 128/256-bit vector data.
+    pub vector_values: FxHashSet<u32>,
     /// Counter for generating unique labels (e.g., memcpy loops).
     label_counter: u32,
     /// Whether position-independent code (PIC) generation is enabled.
@@ -107,9 +137,30 @@ pub struct CodegenState {
     /// When true, the epilogue must restore SP from the frame pointer instead of
     /// adding back the compile-time frame size.
     pub has_dyn_alloca: bool,
+    /// Whether to omit the frame pointer for this function.
+    /// When true, %rbp is not used for stack frame addressing and can be
+    /// used as a general-purpose register. Stack slots use %rsp-relative addressing.
+    pub omit_frame_pointer: bool,
+    /// Total frame size (for RSP-relative addressing when omit_frame_pointer is true).
+    /// Set after calculate_stack_space completes.
+    pub frame_size: i64,
     /// Register value cache: tracks which IR values are in the accumulator and
     /// secondary registers to skip redundant loads.
     pub reg_cache: RegCache,
+    /// GEP decomposition: maps GEP result value ID → (base_value_id, offset_value_id).
+    /// Populated during instruction generation for GEPs with variable offsets.
+    /// Used by the FMA intrinsic codegen to detect SIB addressing opportunities.
+    pub gep_base_offset: FxHashMap<u32, (u32, u32)>,
+    /// Set of GEP result value IDs whose instructions were folded into Load/Store
+    /// and skipped during codegen. These values are never emitted — their registers
+    /// are uninitialized. MachInst must not use these as pointers.
+    pub folded_gep_values: FxHashSet<u32>,
+    /// Total use count for each value ID across the entire function.
+    /// Used by MachInst flush to determine if a buffer-defined vreg is live-out.
+    pub value_use_counts: Vec<u32>,
+    /// Use counts within the current block (set before block codegen).
+    /// Compared with value_use_counts to detect live-out values.
+    pub block_use_counts: FxHashMap<u32, u32>,
     /// Whether to replace `ret` with `jmp __x86_return_thunk` (-mfunction-return=thunk-extern).
     /// Used by the Linux kernel for Spectre v2 (retbleed) mitigation.
     pub function_return_thunk: bool,
@@ -122,6 +173,9 @@ pub struct CodegenState {
     pub patchable_function_entry: Option<(u32, u32)>,
     /// Whether to emit endbr64 at function entry points (-fcf-protection=branch).
     pub cf_protection_branch: bool,
+    /// Current program point during codegen (incremented per instruction).
+    /// Used by Phase 2b selective caller-save save/restore.
+    pub current_program_point: u32,
     /// Maps an F128 value ID to the memory location it was loaded from.
     /// This enables full-precision F128 operations (casts, comparisons, stores)
     /// by reloading directly from the original memory location instead of using
@@ -170,6 +224,12 @@ pub struct CodegenState {
     /// stores the output register to this slot after the asm, and subsequent
     /// uses load the value from it.
     pub asm_output_values: FxHashSet<u32>,
+    /// Values whose stack slots must not be reused for other values.
+    /// This includes DynAlloca results (which hold pointers to dynamically
+    /// allocated stack space) and other vectorization-critical values.
+    /// The backend's slot allocation must preserve these values' slots for
+    /// their entire live range to prevent corruption.
+    pub protected_slot_values: FxHashSet<u32>,
     /// Whether to emit .file/.loc debug directives for source-level debugging.
     pub debug_info: bool,
     /// Pre-computed parameter classifications for the current function.
@@ -205,6 +265,15 @@ pub struct CodegenState {
     /// Whether to emit CFI directives (.cfi_startproc, .cfi_endproc, etc.)
     /// for generating .eh_frame unwind tables. Enabled by default (like GCC).
     pub emit_cfi: bool,
+    /// Values that are consumed by the very next instruction and have no other
+    /// uses. These values can stay in the accumulator register cache without
+    /// being stored to a stack slot. Populated during stack layout; used by
+    /// store_rax_to / store_eax_to to skip the store.
+    pub immediately_consumed: FxHashSet<u32>,
+    /// Floating-point constant pool: maps bit pattern → label name.
+    /// FP constants are emitted as .rodata entries and loaded via
+    /// `movsd .LCFPxx(%rip), %xmm` instead of `movabsq + movq`.
+    pub fp_const_pool: FxHashMap<u64, String>,
 }
 
 impl CodegenState {
@@ -213,21 +282,30 @@ impl CodegenState {
             out: AsmOutput::new(),
             stack_offset: 0,
             value_locations: FxHashMap::default(),
+            emergency_spill_offset: 0,
             alloca_values: FxHashSet::default(),
             alloca_types: FxHashMap::default(),
             alloca_alignments: FxHashMap::default(),
             i128_values: FxHashSet::default(),
             wide_values: FxHashSet::default(),
+            vector_values: FxHashSet::default(),
             label_counter: 0,
             pic_mode: false,
             local_symbols: FxHashSet::default(),
             tls_symbols: FxHashSet::default(),
             has_dyn_alloca: false,
+            omit_frame_pointer: false,
+            frame_size: 0,
             reg_cache: RegCache::default(),
+            gep_base_offset: FxHashMap::default(),
+            folded_gep_values: FxHashSet::default(),
+            value_use_counts: Vec::new(),
+            block_use_counts: FxHashMap::default(),
             function_return_thunk: false,
             indirect_branch_thunk: false,
             patchable_function_entry: None,
             cf_protection_branch: false,
+            current_program_point: 0,
             f128_load_sources: FxHashMap::default(),
             f128_direct_slots: FxHashSet::default(),
             current_text_section: ".text".to_string(),
@@ -237,6 +315,7 @@ impl CodegenState {
             small_slot_values: FxHashSet::default(),
             reg_assigned_values: FxHashSet::default(),
             asm_output_values: FxHashSet::default(),
+            protected_slot_values: FxHashSet::default(),
             debug_info: false,
             param_classes: Vec::new(),
             num_params: 0,
@@ -248,6 +327,8 @@ impl CodegenState {
             data_sections: false,
             needs_divdi3_helpers: false,
             emit_cfi: true,
+            immediately_consumed: FxHashSet::default(),
+            fp_const_pool: FxHashMap::default(),
         }
     }
 
@@ -265,6 +346,40 @@ impl CodegenState {
 
     pub fn emit(&mut self, s: &str) {
         self.out.emit(s);
+    }
+
+    /// Get or create a .rodata label for a floating-point constant.
+    /// Returns the label name (e.g., ".LCFP_3"). Constants are deduped
+    /// so the same bit pattern always returns the same label.
+    pub fn get_fp_const_label(&mut self, bits: u64) -> String {
+        if let Some(label) = self.fp_const_pool.get(&bits) {
+            return label.clone();
+        }
+        let label = format!(".LCFP_{}", self.label_counter);
+        self.label_counter += 1;
+        self.fp_const_pool.insert(bits, label.clone());
+        label
+    }
+
+    /// Emit all accumulated FP constants as a .rodata section.
+    /// Called once at the end of module codegen.
+    pub fn emit_fp_const_pool(&mut self) {
+        if self.fp_const_pool.is_empty() {
+            return;
+        }
+        self.out.emit(".section .rodata");
+        // Sort by label name for deterministic output
+        let mut entries: Vec<_> = self.fp_const_pool.iter().collect();
+        entries.sort_by_key(|(_, label)| (*label).clone());
+        for (bits, label) in entries {
+            // This pool needs eight-BYTE alignment. On AArch64 and RISC-V,
+            // `.align 8` means 2^8 (256) bytes and bloats every distinct
+            // constant with up to 255 bytes of padding; `.balign` has the
+            // intended byte-count semantics on every supported assembler.
+            self.out.emit(".balign 8");
+            self.out.emit_fmt(format_args!("{}:", label));
+            self.out.emit_fmt(format_args!("    .quad {}", *bits as i64));
+        }
     }
 
     /// Emit formatted assembly directly (no temporary String allocation).
@@ -307,10 +422,14 @@ impl CodegenState {
         self.i128_values.clear();
         self.wide_values.clear();
         self.has_dyn_alloca = false;
+        self.omit_frame_pointer = false;
+        self.frame_size = 0;
         self.reg_cache.invalidate_all();
         self.f128_direct_slots.clear();
         self.f128_load_sources.clear();
         self.small_slot_values.clear();
+        self.vector_values.clear();
+        self.protected_slot_values.clear();
         self.reg_assigned_values.clear();
         self.asm_output_values.clear();
         self.param_pre_stored.clear();
@@ -337,6 +456,26 @@ impl CodegenState {
         self.value_locations.get(&v).copied()
     }
 
+    /// Allocate an emergency spill slot for a value that has no register or
+    /// stack slot. Uses the red zone below the frame (extending the stack
+    /// offset downward). The slot is registered in value_locations so
+    /// subsequent reads can find it.
+    pub fn allocate_emergency_slot(&mut self, val_id: u32) -> StackSlot {
+        self.emergency_spill_offset -= 8;
+        let slot = StackSlot(self.stack_offset + self.emergency_spill_offset);
+        // Check for collision with existing slots
+        if std::env::var("CCC_DEBUG_SLOTS").is_ok() {
+            for (&existing_id, &existing_slot) in &self.value_locations {
+                if existing_slot.0 == slot.0 && existing_id != val_id {
+                    eprintln!("[SLOT-COLLISION] Emergency slot for val{} at offset {} collides with val{}",
+                        val_id, slot.0, existing_id);
+                }
+            }
+        }
+        self.value_locations.insert(val_id, slot);
+        slot
+    }
+
     pub fn is_i128_value(&self, v: u32) -> bool {
         self.i128_values.contains(&v)
     }
@@ -346,8 +485,12 @@ impl CodegenState {
     /// Currently infrastructure-only: backends don't use this yet because
     /// store/load paths aren't fully type-safe (some always use 8-byte ops).
     #[allow(dead_code)]
-    pub fn is_small_slot(&self, v: u32) -> bool {
-        self.small_slot_values.contains(&v)
+    pub fn is_small_slot(&self, _v: u32) -> bool {
+        // Disabled: small-slot optimization uses movl (32-bit) for loads/stores,
+        // which zero-extends the upper 32 bits. This corrupts signed I32 values
+        // that flow into 64-bit operations through callee-saved registers.
+        // TODO: re-enable with proper signed/unsigned type tracking.
+        false
     }
 
     /// Check if a value is a "wide" type on 32-bit targets (F64, I64, U64).

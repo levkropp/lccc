@@ -1,28 +1,32 @@
 [package]
-name = "ccc"
+name = "lccc"
+
+[lib]
+name = "lccc"
+path = "src/lib.rs"
 version = "0.1.0"
 edition = "2021"
-description = "Claude's C Compiler — a C compiler targeting x86-64, i686, ARM64, and RISC-V"
+description = "LCCC (Lev's C Compiler) — a high-performance C compiler fork targeting x86-64, i686, ARM64, and RISC-V"
 autobins = false
 
 [[bin]]
-name = "ccc"
+name = "lccc"
 path = "src/main.rs"
 
 [[bin]]
-name = "ccc-x86"
+name = "lccc-x86"
 path = "src/bin/ccc_x86.rs"
 
 [[bin]]
-name = "ccc-arm"
+name = "lccc-arm"
 path = "src/bin/ccc_arm.rs"
 
 [[bin]]
-name = "ccc-riscv"
+name = "lccc-riscv"
 path = "src/bin/ccc_riscv.rs"
 
 [[bin]]
-name = "ccc-i686"
+name = "lccc-i686"
 path = "src/bin/ccc_i686.rs"
 
 [features]

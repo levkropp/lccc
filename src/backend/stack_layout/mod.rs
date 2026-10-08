@@ -36,6 +36,7 @@
 mod analysis;
 mod alloca_coalescing;
 mod copy_coalescing;
+mod graph_coloring;
 mod slot_assignment;
 mod inline_asm;
 mod regalloc_helpers;
@@ -96,6 +97,11 @@ struct StackLayoutContext {
     multi_def_values: FxHashSet<u32>,
     /// Copy alias map: dest_id -> root_id (values sharing the same stack slot).
     copy_alias: FxHashMap<u32, u32>,
+    /// Values aliased via phi-web coalescing (must force-overwrite in resolve_copy_aliases).
+    phi_web_aliases: FxHashSet<u32>,
+    /// Phi-web aliases certified by detect_phi_coalesce_groups (loop-backedge
+    /// copies): skip the generic interference check in resolve_copy_aliases.
+    loop_phi_aliases: FxHashSet<u32>,
     /// All value IDs referenced as operands in the function body.
     used_values: FxHashSet<u32>,
     /// Dead parameter allocas (unused params, skip slot allocation).
@@ -106,6 +112,15 @@ struct StackLayoutContext {
     /// as the first operand loaded into the accumulator. These values don't need
     /// stack slots — the accumulator register cache keeps them alive.
     immediately_consumed: FxHashSet<u32>,
+    /// Values that appear as incoming operands in Phi instructions.
+    /// These must NOT be classified as block-local (Tier 3) because phi
+    /// elimination places Copies at predecessor block ends. If the source
+    /// value's Tier 3 slot was reused by another block, the Copy reads garbage.
+    phi_incoming_values: FxHashSet<u32>,
+    /// Block indices where the block has more instructions than the Tier 3
+    /// greedy coloring threshold. Values defined in these blocks are directed
+    /// to Tier 2 (liveness-packed) instead of Tier 3 (greedy reuse).
+    large_blocks: FxHashSet<usize>,
 }
 
 // ── Main stack space calculation ──────────────────────────────────────────
@@ -132,15 +147,125 @@ pub fn calculate_stack_space_common(
     // Even small functions benefit: a 3-block function with 20 intermediates can
     // save 100+ bytes. Critical for recursive functions (PostgreSQL plpgsql) and
     // kernel functions with macro-expanded short-lived intermediates.
-    let coalesce = num_blocks >= 2;
+    let coalesce = num_blocks >= 2 && std::env::var("CCC_NO_SLOT_COALESCE").is_err();
+
+    // Phase 0: Pre-scan for vector intrinsics and mark their destinations.
+    // This must happen BEFORE stack layout because the slot allocator needs to
+    // know which values are vectors in order to protect them from slot reuse.
+    // Vector values need protected slots because reduction vectorization creates
+    // tight dependency chains (init_zero → vec_load → vec_add → PHI) where
+    // premature slot reuse corrupts intermediate vector data.
+    use crate::ir::intrinsics::IntrinsicOp;
+    let debug_protect = std::env::var("LCCC_DEBUG_PROTECT").is_ok();
+    if debug_protect {
+        eprintln!("[PROTECT] Scanning function {} for vector intrinsics", func.name);
+    }
+
+    // Pass 1: Mark all vector intrinsic destinations as vector values
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let crate::ir::instruction::Instruction::Intrinsic { dest: Some(d), op, .. } = inst {
+                // Mark destinations of all vector intrinsics as vector values
+                let is_vector = matches!(op,
+                    IntrinsicOp::VecZeroF64x4 | IntrinsicOp::VecZeroF64x2 |
+                    IntrinsicOp::VecZeroI32x8 | IntrinsicOp::VecZeroI32x4 |
+                    IntrinsicOp::VecLoadF64x4 | IntrinsicOp::VecLoadF64x2 |
+                    IntrinsicOp::VecLoadI32x8 | IntrinsicOp::VecLoadI32x4 |
+                    IntrinsicOp::VecAddF64x4 | IntrinsicOp::VecAddF64x2 |
+                    IntrinsicOp::VecAddI32x8 | IntrinsicOp::VecAddI32x4 |
+                    IntrinsicOp::VecMulF64x4 | IntrinsicOp::VecMulF64x2
+                    | IntrinsicOp::VecLoadWidenI32ToI64x2
+                    | IntrinsicOp::VecAddI64x2 | IntrinsicOp::VecMulI64x2
+                    | IntrinsicOp::VecZeroI64x2
+                );
+                if is_vector {
+                    state.vector_values.insert(d.0);
+                    // Also mark as protected so slot reuse doesn't corrupt vector data
+                    state.protected_slot_values.insert(d.0);
+                    if debug_protect {
+                        eprintln!("[PROTECT] Marked SSA value {} as protected ({:?})", d.0, op);
+                    }
+                }
+            }
+        }
+    }
+
+    // Pass 2: Mark PHI nodes that have vector incoming values as vector/protected.
+    // This handles the vectorized accumulator PHI: %acc_phi = phi [%init_zero, entry], [%vec_add, latch]
+    // Must be done AFTER Pass 1 so that incoming vector values are already marked.
+    // NOTE: PHI nodes are eliminated before stack layout, so this won't find them.
+    // Instead, we rely on Pass 3 (Copy propagation) to mark the Copy instructions
+    // that replace PHI nodes.
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let crate::ir::instruction::Instruction::Phi { dest, incoming, .. } = inst {
+                if debug_protect {
+                    eprintln!("[PROTECT-PHI] Checking PHI SSA {}, incoming: {:?}", dest.0, incoming);
+                }
+                // If any incoming value is a vector, the PHI result is also a vector
+                let has_vector_incoming = incoming.iter().any(|(val, _)| {
+                    if let crate::ir::instruction::Operand::Value(v) = val {
+                        let is_vec = state.vector_values.contains(&v.0);
+                        if debug_protect && is_vec {
+                            eprintln!("[PROTECT-PHI]   Incoming SSA {} is a vector!", v.0);
+                        }
+                        is_vec
+                    } else {
+                        false
+                    }
+                });
+                if has_vector_incoming {
+                    state.vector_values.insert(dest.0);
+                    state.protected_slot_values.insert(dest.0);
+                    if debug_protect {
+                        eprintln!("[PROTECT] Marked PHI SSA value {} as protected (has vector incoming)", dest.0);
+                    }
+                }
+            }
+        }
+    }
+
+    // Pass 3: Propagate protection through Copy instructions.
+    // PHI elimination converts `%acc = phi [%init, entry], [%result, latch]` into
+    // Copy instructions. If the source of a Copy is protected, the dest should be too.
+    // Iterate until no new protected values are found (fixed-point).
+    loop {
+        let initial_count = state.protected_slot_values.len();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let crate::ir::instruction::Instruction::Copy { dest, src } = inst {
+                    if let crate::ir::instruction::Operand::Value(src_val) = src {
+                        if state.protected_slot_values.contains(&src_val.0) {
+                            let was_new = state.protected_slot_values.insert(dest.0);
+                            state.vector_values.insert(dest.0);
+                            if debug_protect && was_new {
+                                eprintln!("[PROTECT-COPY] Marked SSA {} as protected (copy from protected SSA {})", dest.0, src_val.0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if state.protected_slot_values.len() == initial_count {
+            break; // Fixed point reached
+        }
+    }
+
+    if debug_protect {
+        eprintln!("[PROTECT] Total protected values: {}", state.protected_slot_values.len());
+    }
 
     // Phase 1: Build analysis context (use-blocks, def-blocks, used values,
     //          dead param allocas, alloca coalescability, copy aliases).
-    let ctx = build_layout_context(func, coalesce, reg_assigned, callee_saved_regs, lhs_first_binop);
+    let ctx = build_layout_context(func, coalesce, reg_assigned, callee_saved_regs, lhs_first_binop, &cached_liveness);
 
     // Tell CodegenState which values are register-assigned so that
     // resolve_slot_addr can return a dummy Indirect slot for them.
     state.reg_assigned_values = reg_assigned.keys().copied().collect();
+
+    // Propagate the immediately-consumed set to CodegenState so that
+    // store_rax_to / store_eax_to can skip the store for these values.
+    state.immediately_consumed = ctx.immediately_consumed.clone();
 
     // Phase 2: Classify all instructions into the three tiers.
     let mut non_local_space = initial_offset;
@@ -158,7 +283,7 @@ pub fn calculate_stack_space_common(
 
     // Phase 3: Tier 3 — block-local greedy slot reuse.
     slot_assignment::assign_tier3_block_local_slots(
-        func, &ctx, coalesce,
+        state, func, &ctx, coalesce,
         &block_local_values, &mut deferred_slots,
         &mut block_space, &mut max_block_local_space, &assign_slot,
     );
@@ -175,7 +300,15 @@ pub fn calculate_stack_space_common(
     );
 
     // Phase 6: Resolve copy aliases (propagate slots from root to aliased values).
-    slot_assignment::resolve_copy_aliases(state, &ctx.copy_alias);
+    // Uses liveness information to avoid sharing slots between values with
+    // overlapping lifetimes (which would corrupt one of the values).
+    slot_assignment::resolve_copy_aliases(
+        state,
+        &ctx.copy_alias,
+        &ctx.phi_web_aliases,
+        &ctx.loop_phi_aliases,
+        func,
+    );
 
     // Phase 7: Propagate wide-value status through Copy chains (32-bit targets only).
     slot_assignment::propagate_wide_values(state, func, &ctx.copy_alias);
@@ -194,6 +327,7 @@ fn build_layout_context(
     reg_assigned: &FxHashMap<u32, PhysReg>,
     callee_saved_regs: &[PhysReg],
     lhs_first_binop: bool,
+    cached_liveness: &Option<super::liveness::LivenessResult>,
 ) -> StackLayoutContext {
     // Build use-block map
     let mut use_blocks_map = if coalesce {
@@ -234,8 +368,9 @@ fn build_layout_context(
     };
 
     // Copy coalescing analysis.
-    let copy_alias = copy_coalescing::build_copy_alias_map(
+    let (copy_alias, phi_web_aliases, loop_phi_aliases) = copy_coalescing::build_copy_alias_map(
         func, &def_block, &multi_def_values, reg_assigned, &use_blocks_map,
+        cached_liveness,
     );
 
     // Immediately-consumed value analysis: identify values that can skip stack slots.
@@ -299,15 +434,44 @@ fn build_layout_context(
         }
     }
 
+    // Collect phi incoming values: values used as operands in Phi instructions.
+    let mut phi_incoming_values = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let crate::ir::reexports::Instruction::Phi { incoming, .. } = inst {
+                for (op, _) in incoming {
+                    if let crate::ir::reexports::Operand::Value(v) = op {
+                        phi_incoming_values.insert(v.0);
+                    }
+                }
+            }
+        }
+    }
+
+    // Identify blocks too large for Tier 3 greedy coloring.
+    // The accumulator-based codegen processes instructions sequentially, but
+    // the actual spill ordering can diverge from IR instruction order in
+    // large blocks (register cache effects, multi-operand instructions,
+    // fused operations). Tier 2 liveness-packed allocation uses proper live
+    // interval computation that handles these cases correctly.
+    let large_blocks: FxHashSet<usize> = func.blocks.iter().enumerate()
+        .filter(|(_, b)| b.instructions.len() > slot_assignment::MAX_TIER3_BLOCK_INSTRUCTIONS)
+        .map(|(i, _)| i)
+        .collect();
+
     StackLayoutContext {
         coalesce,
         use_blocks_map,
         def_block,
         multi_def_values,
         copy_alias,
+        phi_web_aliases,
+        loop_phi_aliases,
         used_values,
         dead_param_allocas,
         coalescable_allocas,
         immediately_consumed,
+        phi_incoming_values,
+        large_blocks,
     }
 }

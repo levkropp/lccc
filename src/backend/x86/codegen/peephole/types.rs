@@ -46,6 +46,10 @@ pub(super) struct LineInfo {
     /// somewhere in the line text. Pre-computed during classify_line to eliminate
     /// O(n * patterns) `str::contains` calls in `eliminate_unused_callee_saves`.
     pub(super) reg_refs: u16,
+    /// When true, this instruction must not be removed or modified by any
+    /// peephole pass. Used for parameter pre-stores (movq %arg_reg, %callee_saved)
+    /// that must survive across function calls.
+    pub(super) pinned: bool,
 }
 
 /// What kind of assembly line this is, with pre-extracted fields for the
@@ -173,7 +177,13 @@ impl LineInfo {
     /// This avoids re-scanning leading whitespace on every access.
     #[inline]
     pub(super) fn trimmed<'a>(&self, line: &'a str) -> &'a str {
-        &line[self.trim_start as usize..]
+        let start = self.trim_start as usize;
+        if start >= line.len() {
+            // Line was replaced with shorter/empty text after classification
+            line.trim()
+        } else {
+            &line[start..]
+        }
     }
 }
 
@@ -182,19 +192,19 @@ impl LineInfo {
 /// Helper to construct a LineInfo with default ext_kind and has_indirect_mem.
 #[inline]
 pub(super) fn line_info(kind: LineKind, ts: u16) -> LineInfo {
-    LineInfo { kind, ext_kind: ExtKind::None, trim_start: ts, has_indirect_mem: false, rbp_offset: RBP_OFFSET_NONE, reg_refs: 0 }
+    LineInfo { kind, ext_kind: ExtKind::None, trim_start: ts, has_indirect_mem: false, rbp_offset: RBP_OFFSET_NONE, reg_refs: 0, pinned: false }
 }
 
 /// Helper to construct a LineInfo with default ext_kind but pre-scanned reg_refs.
 #[inline]
 pub(super) fn line_info_with_regs(kind: LineKind, ts: u16, reg_refs: u16) -> LineInfo {
-    LineInfo { kind, ext_kind: ExtKind::None, trim_start: ts, has_indirect_mem: false, rbp_offset: RBP_OFFSET_NONE, reg_refs }
+    LineInfo { kind, ext_kind: ExtKind::None, trim_start: ts, has_indirect_mem: false, rbp_offset: RBP_OFFSET_NONE, reg_refs, pinned: false }
 }
 
 /// Helper to construct a LineInfo with a specific ext_kind.
 #[inline]
 pub(super) fn line_info_ext(kind: LineKind, ext: ExtKind, ts: u16) -> LineInfo {
-    LineInfo { kind, ext_kind: ext, trim_start: ts, has_indirect_mem: false, rbp_offset: RBP_OFFSET_NONE, reg_refs: 0 }
+    LineInfo { kind, ext_kind: ext, trim_start: ts, has_indirect_mem: false, rbp_offset: RBP_OFFSET_NONE, reg_refs: 0, pinned: false }
 }
 
 /// Parse one assembly line into a `LineInfo`.
@@ -278,6 +288,7 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
                 has_indirect_mem: has_indirect,
                 rbp_offset: rbp_off,
                 reg_refs,
+                pinned: false,
             };
         }
     }
@@ -373,7 +384,7 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
     let rbp_off = if has_indirect { RBP_OFFSET_NONE } else { parse_rbp_offset(s) };
     // Pre-scan register references for O(1) checks in eliminate_unused_callee_saves
     let reg_refs = scan_register_refs(sb);
-    LineInfo { kind: LineKind::Other { dest_reg }, ext_kind: ext, trim_start: ts, has_indirect_mem: has_indirect, rbp_offset: rbp_off, reg_refs }
+    LineInfo { kind: LineKind::Other { dest_reg }, ext_kind: ext, trim_start: ts, has_indirect_mem: has_indirect, rbp_offset: rbp_off, reg_refs, pinned: false }
 }
 
 /// Fast check for self-move: `movq %REG, %REG` where both register names match.
@@ -637,15 +648,20 @@ pub(super) fn parse_store_to_rbp_str(s: &str) -> Option<(&str, &str, MoveSize)> 
     if !src.starts_with('%') {
         return None;
     }
-    if !dst.ends_with("(%rbp)") {
-        return None;
+    // Accept both (%rbp) and (%rsp) for frame pointer / frame-pointer-less modes
+    if dst.ends_with("(%rbp)") {
+        let offset = &dst[..dst.len() - 6];
+        return Some((src, offset, size));
     }
-    let offset = &dst[..dst.len() - 6];
-
-    Some((src, offset, size))
+    if dst.ends_with("(%rsp)") {
+        let offset = &dst[..dst.len() - 6];
+        return Some((src, offset, size));
+    }
+    None
 }
 
-/// Parse `movX offset(%rbp), %reg` or `movslq offset(%rbp), %reg` (load from rbp).
+/// Parse `movX offset(%rbp), %reg` or `movX offset(%rsp), %reg`
+/// or `movslq offset(%rbp), %reg` (load from stack frame).
 /// Returns (offset_str, register_str, size).
 pub(super) fn parse_load_from_rbp_str(s: &str) -> Option<(&str, &str, MoveSize)> {
     let (rest, size) = strip_mov_prefix(s, true)?;
@@ -654,15 +670,20 @@ pub(super) fn parse_load_from_rbp_str(s: &str) -> Option<(&str, &str, MoveSize)>
     let src = src.trim();
     let dst = dst.trim();
 
-    if !src.ends_with("(%rbp)") {
-        return None;
-    }
-    let offset = &src[..src.len() - 6];
     if !dst.starts_with('%') {
         return None;
     }
 
-    Some((offset, dst, size))
+    // Accept both (%rbp) and (%rsp) for frame pointer / frame-pointer-less modes
+    if src.ends_with("(%rbp)") {
+        let offset = &src[..src.len() - 6];
+        return Some((offset, dst, size));
+    }
+    if src.ends_with("(%rsp)") {
+        let offset = &src[..src.len() - 6];
+        return Some((offset, dst, size));
+    }
+    None
 }
 
 // Re-export the shared LineStore: zero-allocation line storage that keeps
@@ -674,7 +695,8 @@ pub(super) use crate::backend::peephole_common::LineStore;
 
 #[inline]
 pub(super) fn mark_nop(info: &mut LineInfo) {
-    *info = LineInfo { kind: LineKind::Nop, ext_kind: ExtKind::None, trim_start: 0, has_indirect_mem: false, rbp_offset: RBP_OFFSET_NONE, reg_refs: 0 };
+    if info.pinned { return; } // Never remove pinned instructions
+    *info = LineInfo { kind: LineKind::Nop, ext_kind: ExtKind::None, trim_start: 0, has_indirect_mem: false, rbp_offset: RBP_OFFSET_NONE, reg_refs: 0, pinned: false };
 }
 
 /// Replace a line's text and re-classify it.
@@ -804,12 +826,13 @@ pub(super) fn has_indirect_memory_access(s: &str) -> bool {
 pub(super) fn parse_rbp_offset(s: &str) -> i32 {
     let bytes = s.as_bytes();
     let len = bytes.len();
-    // Search for "(%rbp)" pattern
+    // Search for "(%rbp)" or "(%rsp)" pattern (both used for stack frame refs)
     let mut found_offset = RBP_OFFSET_NONE;
     let mut i = 0;
     while i + 5 < len {
         if bytes[i] == b'(' && bytes[i + 1] == b'%'
-            && bytes[i + 2] == b'r' && bytes[i + 3] == b'b' && bytes[i + 4] == b'p'
+            && bytes[i + 2] == b'r'
+            && ((bytes[i + 3] == b'b' && bytes[i + 4] == b'p') || (bytes[i + 3] == b's' && bytes[i + 4] == b'p'))
             && bytes[i + 5] == b')'
         {
             // Found "(%rbp)" at position i. Parse the offset before '('.

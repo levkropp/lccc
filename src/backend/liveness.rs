@@ -49,6 +49,12 @@ pub struct LivenessResult {
     /// Depth 0 = not in any loop. Depth 1 = in one loop. Depth 2 = nested, etc.
     /// Used by the register allocator to weight uses inside loops more heavily.
     pub block_loop_depth: Vec<u32>,
+    /// Per-block live-in/live-out sets (dense value indices), retained for
+    /// point-precise coalescing checks. Empty when the function has no values.
+    pub block_live_in: Vec<BitSet>,
+    pub block_live_out: Vec<BitSet>,
+    /// Value id -> dense index map for the live sets.
+    pub dense_of_value: FxHashMap<u32, usize>,
 }
 
 // ── Compact bitset for dataflow ──────────────────────────────────────────────
@@ -56,7 +62,7 @@ pub struct LivenessResult {
 /// A compact bitset stored as a contiguous slice of u64 words.
 /// Supports O(1) insert/contains and O(n/64) union/difference/equality.
 #[derive(Clone)]
-struct BitSet {
+pub(crate) struct BitSet {
     words: Vec<u64>,
 }
 
@@ -75,7 +81,7 @@ impl BitSet {
     }
 
     #[inline(always)]
-    fn contains(&self, idx: usize) -> bool {
+    pub(crate) fn contains(&self, idx: usize) -> bool {
         let word = idx / 64;
         let bit = idx % 64;
         (self.words[word] >> bit) & 1 != 0
@@ -153,15 +159,17 @@ struct ProgramPointState {
 pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
     let num_blocks = func.blocks.len();
     if num_blocks == 0 {
-        return LivenessResult { intervals: Vec::new(), call_points: Vec::new(), block_loop_depth: Vec::new() };
+        return LivenessResult { intervals: Vec::new(), call_points: Vec::new(), block_loop_depth: Vec::new(), block_live_in: Vec::new(), block_live_out: Vec::new(), dense_of_value: FxHashMap::default() };
     }
+
+    // Debug: trace phi references for GetToken return value
 
     let alloca_set = collect_alloca_set(func);
     let (value_ids, id_to_dense) = build_dense_value_map(func, &alloca_set);
 
     let num_values = value_ids.len();
     if num_values == 0 {
-        return LivenessResult { intervals: Vec::new(), call_points: Vec::new(), block_loop_depth: Vec::new() };
+        return LivenessResult { intervals: Vec::new(), call_points: Vec::new(), block_loop_depth: Vec::new(), block_live_in: Vec::new(), block_live_out: Vec::new(), dense_of_value: FxHashMap::default() };
     }
 
     // Phase 1: Assign program points and build gen/kill sets.
@@ -202,10 +210,30 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
     // Phase 5: Build and sort intervals.
     let intervals = build_intervals(&value_ids, &ps.def_points, &ps.last_use_points);
 
+    if let Ok(dbg) = std::env::var("CCC_DEBUG_LIVE") {
+        if let Ok(target) = dbg.parse::<u32>() {
+            if let Some(&dense) = id_to_dense.get(&target) {
+                eprintln!("[LIVE] v{} def={} last_use={}", target, ps.def_points[dense], ps.last_use_points[dense]);
+                for (bi, b) in func.blocks.iter().enumerate() {
+                    let li = live_in[bi].contains(dense);
+                    let lo = live_out[bi].contains(dense);
+                    if li || lo {
+                        eprintln!("[LIVE]   block {} (label {}) live_in={} live_out={} pts=[{},{}]",
+                            bi, b.label.0, li, lo, ps.block_start_points[bi], ps.block_end_points[bi]);
+                    }
+                }
+                eprintln!("[LIVE]   call_points={:?}", ps.call_points);
+            }
+        }
+    }
+
     LivenessResult {
         intervals,
         call_points: ps.call_points,
         block_loop_depth,
+        block_live_in: live_in,
+        block_live_out: live_out,
+        dense_of_value: id_to_dense,
     }
 }
 
@@ -334,17 +362,14 @@ fn assign_program_points(
                 }
                 // i128 div/rem emit implicit calls to __divti3/__udivti3/__modti3/__umodti3.
                 // These are BinOp instructions at the IR level but generate `call` at the
-                // assembly level, clobbering all caller-saved registers. We must treat them
-                // as call points so the register allocator doesn't assign caller-saved
-                // registers to values whose live ranges span these operations.
+                // assembly level, clobbering all caller-saved registers.
                 Instruction::BinOp { op, ty, .. }
                     if matches!(ty, IrType::I128 | IrType::U128)
                         && matches!(op, IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem) =>
                 {
                     call_points.push(point);
                 }
-                // i128 <-> float casts emit implicit calls to compiler-rt helpers
-                // (__floattidf/__fixdfti/etc.). Same reasoning as i128 div/rem above.
+                // i128 <-> float casts emit implicit calls to compiler-rt helpers.
                 Instruction::Cast { from_ty, to_ty, .. }
                     if (matches!(from_ty, IrType::I128 | IrType::U128) && to_ty.is_float())
                         || (from_ty.is_float() && matches!(to_ty, IrType::I128 | IrType::U128)) =>
@@ -405,6 +430,38 @@ fn assign_program_points(
 
         block_gen.push(gen);
         block_kill.push(kill);
+    }
+
+    // Phase 1d: Extend liveness for phi incoming values.
+    // After phi elimination, each Phi { incoming: [(V, block_X), ...] } becomes
+    // a Copy instruction at the END of block_X. The value V must be live at that
+    // point. Without this extension, V's interval might end earlier (at its last
+    // direct use), allowing its register to be reused before the phi-elimination
+    // Copy executes. This is the root cause of the sqlite3RunParser n-value
+    // corruption: n's register (r13) was reused before the phi Copy.
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Phi { incoming, .. } = inst {
+                for (op, pred_label) in incoming {
+                    if let Operand::Value(v) = op {
+                        if alloca_set.contains(&v.0) { continue; }
+                        if let Some(&dense) = id_to_dense.get(&v.0) {
+                            if let Some(&pred_idx) = block_id_to_idx.get(&pred_label.0) {
+                                let pred_end = block_end_points[pred_idx];
+                                // Extend the value's last use to the predecessor's end
+                                let entry = &mut last_use_points[dense];
+                                if *entry == u32::MAX || pred_end > *entry {
+                                    *entry = pred_end;
+                                }
+                                // Also add to predecessor's gen set so backward
+                                // dataflow propagates liveness correctly
+                                block_gen[pred_idx].insert(dense);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     ProgramPointState {
@@ -603,25 +660,48 @@ fn extend_gep_base_liveness(
 ) {
     // Phase A: Identify foldable GEPs with non-alloca bases.
     // Same criteria as build_gep_fold_map in generation.rs.
-    let mut gep_info: FxHashMap<u32, (u32, i64)> = FxHashMap::default(); // gep_dest_id -> (base_id, offset)
+    // Value: (base_id, offset), where offset is Const(i64) or an index Value.
+    enum GepOffset {
+        Const(i64),
+        Index(u32),
+    }
+    let mut gep_info: FxHashMap<u32, (u32, GepOffset)> = FxHashMap::default(); // gep_dest_id -> (base_id, offset)
+    let mut def_of: FxHashMap<u32, &Instruction> = FxHashMap::default();
 
     for block in &func.blocks {
         for inst in &block.instructions {
-            if let Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), .. } = inst {
-                // Skip alloca bases (already handled by existing fold logic)
-                if alloca_set.contains(&base.0) {
-                    continue;
+            if let Some(d) = inst.dest() {
+                def_of.insert(d.0, inst);
+            }
+            match inst {
+                Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), .. } => {
+                    // Constant-offset GEP: foldable into Load/Store addressing mode
+                    if alloca_set.contains(&base.0) {
+                        continue;
+                    }
+                    let offset_val = match c {
+                        IrConst::I64(n) => *n,
+                        IrConst::I32(n) => *n as i64,
+                        IrConst::I16(n) => *n as i64,
+                        IrConst::I8(n) => *n as i64,
+                        _ => continue,
+                    };
+                    if offset_val >= i32::MIN as i64 && offset_val <= i32::MAX as i64 {
+                        gep_info.insert(dest.0, (base.0, GepOffset::Const(offset_val)));
+                    }
                 }
-                let offset_val = match c {
-                    IrConst::I64(n) => *n,
-                    IrConst::I32(n) => *n as i64,
-                    IrConst::I16(n) => *n as i64,
-                    IrConst::I8(n) => *n as i64,
-                    _ => continue,
-                };
-                if offset_val >= i32::MIN as i64 && offset_val <= i32::MAX as i64 {
-                    gep_info.insert(dest.0, (base.0, offset_val));
+                Instruction::GetElementPtr { dest, base, offset: Operand::Value(off), .. } => {
+                    // Variable-offset GEP: may be used for indexed addressing.
+                    // Both the base pointer AND the index value must stay live
+                    // until the Load/Store that uses this GEP result, otherwise
+                    // the register allocator may reuse either register before
+                    // the indexed load/store executes.
+                    if alloca_set.contains(&base.0) {
+                        continue;
+                    }
+                    gep_info.insert(dest.0, (base.0, GepOffset::Index(off.0)));
                 }
+                _ => {}
             }
         }
     }
@@ -701,16 +781,72 @@ fn extend_gep_base_liveness(
                         Instruction::Store { ptr, .. } => ptr.0,
                         _ => unreachable!("GEP analysis matched non-Load/Store instruction"),
                     };
-                    if let Some(&(base_id, _offset)) = gep_info.get(&ptr_id) {
-                        // Extend base's last_use to this program point
-                        if !alloca_set.contains(&base_id) {
-                            if let Some(&dense) = id_to_dense.get(&base_id) {
-                                let entry = &mut last_use_points[dense];
-                                if *entry == u32::MAX || block_point > *entry {
-                                    *entry = block_point;
+                    if let Some(&(base_id, ref offset)) = gep_info.get(&ptr_id) {
+                        // Extend a value's last_use to this program point,
+                        // following Copy chains (a base/index defined by a Copy
+                        // needs its source kept live too, or the register may
+                        // be reused before the folded load/store executes).
+                        let mut extend_one = |start_id: u32, last_use_points: &mut [u32], block_gen: &mut [BitSet]| {
+                            let mut extend_id = start_id;
+                            for _ in 0..10 { // max Copy chain depth
+                                if alloca_set.contains(&extend_id) { break; }
+                                if let Some(&dense) = id_to_dense.get(&extend_id) {
+                                    let entry = &mut last_use_points[dense];
+                                    if *entry == u32::MAX || block_point > *entry {
+                                        *entry = block_point;
+                                    }
+                                    block_gen[bi].insert(dense);
                                 }
-                                // Also add to block's gen set (the base is "used" here)
-                                block_gen[bi].insert(dense);
+                                let mut found_copy_src = None;
+                                for b in &func.blocks {
+                                    for i in &b.instructions {
+                                        if let Instruction::Copy { dest, src: Operand::Value(s) } = i {
+                                            if dest.0 == extend_id {
+                                                found_copy_src = Some(s.0);
+                                            }
+                                        }
+                                    }
+                                }
+                                match found_copy_src {
+                                    Some(src) => extend_id = src,
+                                    None => break,
+                                }
+                            }
+                        };
+                        extend_one(base_id, last_use_points, block_gen);
+                        // For variable-offset (indexed) GEPs, the index value is
+                        // consumed by the folded load/store too — keep it live.
+                        if let GepOffset::Index(idx_id) = offset {
+                            extend_one(*idx_id, last_use_points, block_gen);
+                            // The indexed-addressing fold peels a Shl/Mul (and a
+                            // widening Cast) off the offset and reads the
+                            // pre-scale index register directly as
+                            // `[base, index, lsl #k]` — that value must stay
+                            // live until the memory op as well (fannkuch
+                            // flip-loop hang: the index died at the Shl and the
+                            // load's own destination reused its register).
+                            let mut cur = *idx_id;
+                            for _ in 0..2 {
+                                let next = match def_of.get(&cur) {
+                                    Some(Instruction::Cast { src: Operand::Value(v), from_ty, to_ty, .. })
+                                        if to_ty.size() >= from_ty.size() => Some(v.0),
+                                    Some(Instruction::BinOp { op: IrBinOp::Shl, lhs: Operand::Value(v), rhs: Operand::Const(c), .. })
+                                        if c.to_i64().is_some_and(|k| (0..=3).contains(&k)) => Some(v.0),
+                                    Some(Instruction::BinOp { op: IrBinOp::Mul, lhs, rhs, .. }) => {
+                                        let (v, c) = if let (Operand::Value(v), Operand::Const(c)) = (lhs, rhs) { (Some(v), Some(c)) }
+                                            else if let (Operand::Const(c), Operand::Value(v)) = (lhs, rhs) { (Some(v), Some(c)) }
+                                            else { (None, None) };
+                                        match (v, c.and_then(|c| c.to_i64())) {
+                                            (Some(v), Some(n)) if n > 0 && (n as u64).is_power_of_two() && n <= 8 => Some(v.0),
+                                            _ => None,
+                                        }
+                                    }
+                                    _ => None,
+                                };
+                                match next {
+                                    Some(v) => { extend_one(v, last_use_points, block_gen); cur = v; }
+                                    None => break,
+                                }
                             }
                         }
                     }

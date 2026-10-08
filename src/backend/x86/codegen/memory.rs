@@ -1,11 +1,450 @@
 //! X86Codegen: memory operations (load, store, memcpy, GEP, stack).
 
-use crate::ir::reexports::{IrConst, Operand, Value};
+use crate::ir::reexports::{IrConst, IrBinOp, Instruction, Operand, Value};
 use crate::common::types::{AddressSpace, IrType};
 use crate::backend::state::{StackSlot, SlotAddr};
-use super::emit::{X86Codegen, phys_reg_name};
+use super::emit::{X86Codegen, phys_reg_name, phys_reg_name_32, typed_phys_reg_name, is_xmm_reg};
 
 impl X86Codegen {
+    /// Try to emit a store using x86-64 SIB indexed addressing mode.
+    /// Returns true if successful, false to fall back to normal codegen.
+    ///
+    /// First tries IVSR pattern detection (Phase 9b), then falls back to
+    /// Phase 9 pattern (GEP with Mul/Shl offset).
+    fn try_emit_indexed_store(&mut self, val: &Operand, ptr: &Value, ty: IrType) -> bool {
+        // Phase 9b: Try IVSR pointer pattern first (most common in loops)
+        if self.try_emit_ivsr_indexed_store(val, ptr, ty) {
+            return true;
+        }
+
+        // Phase 9: Try non-IVSR pattern (explicit multiply/shift)
+        self.try_emit_phase9_indexed_store(val, ptr, ty)
+    }
+
+    /// Try to emit indexed addressing for IVSR-transformed loop pointer stores.
+    fn try_emit_ivsr_indexed_store(&mut self, val: &Operand, ptr: &Value, ty: IrType) -> bool {
+        // Check if ptr is an IVSR pointer phi
+        let ivsr_info = match self.ivsr_pointers.get(&ptr.0) {
+            Some(info) => info.clone(),
+            None => return false,
+        };
+
+        // Find the loop counter associated with this pointer
+        let counter_val = match self.pointer_to_counter.get(&ptr.0) {
+            Some(&counter_id) => Value(counter_id),
+            None => return false,
+        };
+
+        // Check if both base and counter are in registers
+        let base_reg = match self.reg_assignments.get(&ivsr_info.base_ptr.0) {
+            Some(&reg) => phys_reg_name(reg),
+            None => return false,
+        };
+
+        let index_reg = match self.reg_assignments.get(&counter_val.0) {
+            Some(&reg) => phys_reg_name(reg),
+            None => return false,
+        };
+
+        // Verify stride is a valid SIB scale
+        if !Self::is_valid_sib_scale(ivsr_info.stride) {
+            return false;
+        }
+
+        // Base and index must be different registers.
+        if base_reg == index_reg {
+            return false;
+        }
+
+        // Check if loading the store value would clobber base or index register
+        if let Operand::Value(v) = val {
+            if let Some(&val_reg) = self.reg_assignments.get(&v.0) {
+                let val_name = phys_reg_name(val_reg);
+                if val_name == base_reg || val_name == index_reg {
+                    return false;
+                }
+            }
+        }
+
+        // Load the value to be stored into the accumulator/xmm register.
+        // FP constants load directly from the rodata constant pool into xmm0.
+        let fp_const = matches!(val, Operand::Const(IrConst::F64(_) | IrConst::F32(_)))
+            && matches!(ty, IrType::F64 | IrType::F32);
+        if fp_const {
+            self.emit_fp_operand_to_xmm(val, ty, "xmm0");
+        } else {
+            self.operand_to_rax(val);
+        }
+
+        // Determine store instruction and source register based on type
+        let (store_instr, src_reg) = match ty {
+            IrType::F64 => {
+                if !fp_const {
+                    // Convert from rax to xmm0
+                    self.state.emit("    movq %rax, %xmm0");
+                }
+                ("movsd", "%xmm0")
+            }
+            IrType::F32 => {
+                if !fp_const {
+                    // Convert from rax to xmm0
+                    self.state.emit("    movd %eax, %xmm0");
+                }
+                ("movss", "%xmm0")
+            }
+            IrType::I64 | IrType::U64 => ("movq", "%rax"),
+            IrType::I32 | IrType::U32 => ("movl", "%eax"),
+            IrType::I16 | IrType::U16 => ("movw", "%ax"),
+            IrType::I8 | IrType::U8 => ("movb", "%al"),
+            _ => return false,
+        };
+
+        // Emit indexed store: movX %src, (%base,%index,scale)
+        if ivsr_info.init_offset == 0 {
+            self.state.emit_fmt(format_args!(
+                "    {} {}, (%{},%{},{})",
+                store_instr, src_reg, base_reg, index_reg, ivsr_info.stride
+            ));
+        } else {
+            self.state.emit_fmt(format_args!(
+                "    {} {}, {}(%{},%{},{})",
+                store_instr, src_reg, ivsr_info.init_offset, base_reg, index_reg, ivsr_info.stride
+            ));
+        }
+
+        true
+    }
+
+    /// Phase 9 indexed addressing: detect GEP with multiply/shift offset for stores.
+    /// Detects patterns like: `store val, (base + index*scale)` where:
+    /// - base is in a register
+    /// - index is in a register
+    /// - scale is 1, 2, 4, or 8
+    ///
+    /// Emits: `mov %src, (%base_reg,%index_reg,scale)`
+    fn try_emit_phase9_indexed_store(&mut self, val: &Operand, ptr: &Value, ty: IrType) -> bool {
+        // Phase 9 decomposes a variable-offset GEP into SIB addressing:
+        //   Store val, (GEP base, Mul(idx, scale))  →  movl %eax, (%base, %idx, scale)
+        // However, variable-offset GEPs are always emitted as `leaq` instructions
+        // (they are NOT in gep_fold_map, which only handles constant offsets).
+        // By the time the Store is emitted, the GEP's source registers (base, idx)
+        // may have been clobbered by the leaq destination or intervening instructions.
+        // The GEP result is already computed in a register/slot, so use it directly.
+        return false;
+
+        // Check if ptr is defined by a GEP instruction
+        let gep_inst = match self.get_defining_instruction(ptr.0) {
+            Some(inst) => inst,
+            None => return false,
+        };
+
+        let (gep_base, gep_offset) = match gep_inst {
+            Instruction::GetElementPtr { base, offset, .. } => (base, offset),
+            _ => return false,
+        };
+
+        // Check if offset is a Value (not a constant - those are handled by existing GEP folding)
+        let offset_val = match gep_offset {
+            Operand::Value(v) => v,
+            _ => return false,
+        };
+
+        // Check if offset is defined by a multiply or shift (i*scale pattern)
+        let (index_val, scale) = match self.get_defining_instruction(offset_val.0) {
+            Some(Instruction::BinOp { op: IrBinOp::Mul, lhs: Operand::Value(idx), rhs: Operand::Const(c), .. }) => {
+                // Pattern: index * const
+                let scale_val = match c.to_i64() {
+                    Some(v) => v,
+                    None => return false,
+                };
+                if !Self::is_valid_sib_scale(scale_val) {
+                    return false;
+                }
+                (idx, scale_val)
+            }
+            Some(Instruction::BinOp { op: IrBinOp::Shl, lhs: Operand::Value(idx), rhs: Operand::Const(c), .. }) => {
+                // Pattern: index << shift_amount (equivalent to index * 2^shift)
+                let shift = match c.to_i64() {
+                    Some(v) if v >= 0 && v <= 3 => v,  // shift of 0-3 gives scale of 1,2,4,8
+                    _ => return false,
+                };
+                let scale_val = 1i64 << shift;
+                (idx, scale_val)
+            }
+            _ => return false,
+        };
+
+        // Check if base and index both have register assignments
+        let base_reg = match self.reg_assignments.get(&gep_base.0) {
+            Some(&reg) => phys_reg_name(reg),
+            None => return false,
+        };
+
+        let index_reg = match self.reg_assignments.get(&index_val.0) {
+            Some(&reg) => phys_reg_name(reg),
+            None => return false,
+        };
+
+        // Base and index must be different registers for SIB addressing.
+        // If the register allocator assigned both the same register (e.g.,
+        // because one value's live range ended and the register was reused),
+        // the SIB computation would be wrong (base + base*scale instead of
+        // base + index*scale).
+        if base_reg == index_reg {
+            return false;
+        }
+
+        // Check if loading the store value would clobber the base or index
+        // register. This happens when the store value's register overlaps with
+        // the base/index, or when operand_to_rax needs to use the register for
+        // intermediate computations. If so, fall back to non-indexed store.
+        if let Operand::Value(v) = val {
+            if let Some(&val_reg) = self.reg_assignments.get(&v.0) {
+                let val_name = phys_reg_name(val_reg);
+                if val_name == base_reg || val_name == index_reg {
+                    return false; // Register conflict, fall back
+                }
+            }
+        }
+
+        // Load the value to be stored into the accumulator/xmm register.
+        // FP constants load directly from the rodata constant pool into xmm0.
+        let fp_const = matches!(val, Operand::Const(IrConst::F64(_) | IrConst::F32(_)))
+            && matches!(ty, IrType::F64 | IrType::F32);
+        if fp_const {
+            self.emit_fp_operand_to_xmm(val, ty, "xmm0");
+        } else {
+            self.operand_to_rax(val);
+        }
+
+        // Determine store instruction and source register based on type
+        let (store_instr, src_reg) = match ty {
+            IrType::F64 => {
+                if !fp_const {
+                    // Convert from rax to xmm0
+                    self.state.emit("    movq %rax, %xmm0");
+                }
+                ("movsd", "%xmm0")
+            }
+            IrType::F32 => {
+                if !fp_const {
+                    // Convert from rax to xmm0
+                    self.state.emit("    movd %eax, %xmm0");
+                }
+                ("movss", "%xmm0")
+            }
+            IrType::I64 | IrType::U64 => ("movq", "%rax"),
+            IrType::I32 | IrType::U32 => ("movl", "%eax"),
+            IrType::I16 | IrType::U16 => ("movw", "%ax"),
+            IrType::I8 | IrType::U8 => ("movb", "%al"),
+            _ => return false,  // Unsupported type for indexed addressing
+        };
+
+        // Emit indexed store: movX %src, (%base,%index,scale)
+        self.state.emit_fmt(format_args!(
+            "    {} {}, (%{},%{},{})",
+            store_instr, src_reg, base_reg, index_reg, scale
+        ));
+
+        true
+    }
+
+    /// Try to emit a load using x86-64 SIB indexed addressing mode.
+    /// Returns true if successful, false to fall back to normal codegen.
+    ///
+    /// First tries IVSR pattern detection (Phase 9b), then falls back to
+    /// Phase 9 pattern (GEP with Mul/Shl offset).
+    fn try_emit_indexed_load(&mut self, dest: &Value, ptr: &Value, ty: IrType) -> bool {
+        // Phase 9b: Try IVSR pointer pattern first (most common in loops)
+        if self.try_emit_ivsr_indexed_load(dest, ptr, ty) {
+            return true;
+        }
+
+        // Phase 9: Try non-IVSR pattern (explicit multiply/shift)
+        self.try_emit_phase9_indexed_load(dest, ptr, ty)
+    }
+
+    /// Try to emit indexed addressing for IVSR-transformed loop pointers.
+    /// Detects pattern: %ptr = Phi(%init, %next) where %next = GEP(%ptr, stride)
+    /// and emits: movX (%base,%counter,scale), %dest
+    fn try_emit_ivsr_indexed_load(&mut self, dest: &Value, ptr: &Value, ty: IrType) -> bool {
+        // Check if ptr is an IVSR pointer phi
+        let ivsr_info = match self.ivsr_pointers.get(&ptr.0) {
+            Some(info) => info.clone(),
+            None => return false,
+        };
+
+        // Find the loop counter associated with this pointer
+        let counter_val = match self.pointer_to_counter.get(&ptr.0) {
+            Some(&counter_id) => Value(counter_id),
+            None => return false,
+        };
+
+        // Check if both base and counter are in registers
+        let base_reg = match self.reg_assignments.get(&ivsr_info.base_ptr.0) {
+            Some(&reg) => phys_reg_name(reg),
+            None => return false,
+        };
+
+        let index_reg = match self.reg_assignments.get(&counter_val.0) {
+            Some(&reg) => phys_reg_name(reg),
+            None => return false,
+        };
+
+        // Verify stride is a valid SIB scale
+        if !Self::is_valid_sib_scale(ivsr_info.stride) {
+            return false;
+        }
+
+        // Determine load instruction and destination register based on type
+        let (load_instr, dest_reg) = match ty {
+            IrType::F64 => ("movsd", "%xmm0"),
+            IrType::F32 => ("movss", "%xmm0"),
+            IrType::I64 | IrType::U64 => ("movq", "%rax"),
+            IrType::I32 | IrType::U32 => ("movl", "%eax"),
+            IrType::I16 | IrType::U16 => ("movzwl", "%eax"),
+            IrType::I8 | IrType::U8 => ("movzbl", "%eax"),
+            _ => return false,
+        };
+
+        // Emit indexed load: movX (%base,%index,scale), %dest
+        // Handle optional displacement for non-zero init_offset
+        if ivsr_info.init_offset == 0 {
+            self.state.emit_fmt(format_args!(
+                "    {} (%{},%{},{}), {}",
+                load_instr, base_reg, index_reg, ivsr_info.stride, dest_reg
+            ));
+        } else {
+            self.state.emit_fmt(format_args!(
+                "    {} {}(%{},%{},{}), {}",
+                load_instr, ivsr_info.init_offset, base_reg, index_reg, ivsr_info.stride, dest_reg
+            ));
+        }
+
+        // Update register cache - for FP types, value is in xmm0, for integers in rax
+        match ty {
+            IrType::F64 | IrType::F32 => {
+                // For floating point, the value is in xmm0, not rax
+                // We need to move it to rax for the common code path
+                if ty == IrType::F64 {
+                    self.state.emit("    movq %xmm0, %rax");
+                } else {
+                    self.state.emit("    movd %xmm0, %eax");
+                }
+                self.state.reg_cache.set_acc(dest.0, false);
+            }
+            _ => {
+                // Integer types are already in rax
+                self.state.reg_cache.set_acc(dest.0, false);
+            }
+        }
+
+        true
+    }
+
+    /// Phase 9 indexed addressing: detect GEP with multiply/shift offset.
+    /// Detects patterns like: `load (base + index*scale)` where:
+    /// - base is in a register
+    /// - index is in a register
+    /// - scale is 1, 2, 4, or 8
+    ///
+    /// Emits: `mov (%base_reg,%index_reg,scale), %dest`
+    fn try_emit_phase9_indexed_load(&mut self, dest: &Value, ptr: &Value, ty: IrType) -> bool {
+        // Disabled: same issue as try_emit_phase9_indexed_store — variable-offset
+        // GEPs are already emitted, so base/index registers may be stale.
+        return false;
+
+        // Check if ptr is defined by a GEP instruction
+        let gep_inst = match self.get_defining_instruction(ptr.0) {
+            Some(inst) => inst,
+            None => return false,
+        };
+
+        let (gep_base, gep_offset) = match gep_inst {
+            Instruction::GetElementPtr { base, offset, .. } => (base, offset),
+            _ => return false,
+        };
+
+        // Check if offset is a Value (not a constant - those are handled by existing GEP folding)
+        let offset_val = match gep_offset {
+            Operand::Value(v) => v,
+            _ => return false,
+        };
+
+        // Check if offset is defined by a multiply or shift (i*scale pattern)
+        let (index_val, scale) = match self.get_defining_instruction(offset_val.0) {
+            Some(Instruction::BinOp { op: IrBinOp::Mul, lhs: Operand::Value(idx), rhs: Operand::Const(c), .. }) => {
+                // Pattern: index * const
+                let scale_val = match c.to_i64() {
+                    Some(v) => v,
+                    None => return false,
+                };
+                if !Self::is_valid_sib_scale(scale_val) {
+                    return false;
+                }
+                (idx, scale_val)
+            }
+            Some(Instruction::BinOp { op: IrBinOp::Shl, lhs: Operand::Value(idx), rhs: Operand::Const(c), .. }) => {
+                // Pattern: index << shift_amount (equivalent to index * 2^shift)
+                let shift = match c.to_i64() {
+                    Some(v) if v >= 0 && v <= 3 => v,  // shift of 0-3 gives scale of 1,2,4,8
+                    _ => return false,
+                };
+                let scale_val = 1i64 << shift;
+                (idx, scale_val)
+            }
+            _ => return false,
+        };
+
+        // Check if base and index both have register assignments
+        let base_reg = match self.reg_assignments.get(&gep_base.0) {
+            Some(&reg) => phys_reg_name(reg),
+            None => return false,
+        };
+
+        let index_reg = match self.reg_assignments.get(&index_val.0) {
+            Some(&reg) => phys_reg_name(reg),
+            None => return false,
+        };
+
+        // Determine load instruction and destination register based on type
+        let (load_instr, dest_reg) = match ty {
+            IrType::F64 => ("movsd", "%xmm0"),
+            IrType::F32 => ("movss", "%xmm0"),
+            IrType::I64 | IrType::U64 => ("movq", "%rax"),
+            IrType::I32 | IrType::U32 => ("movl", "%eax"),
+            IrType::I16 | IrType::U16 => ("movzwl", "%eax"),
+            IrType::I8 | IrType::U8 => ("movzbl", "%eax"),
+            _ => return false,  // Unsupported type for indexed addressing
+        };
+
+        // Emit indexed load: movX (%base,%index,scale), %dest
+        self.state.emit_fmt(format_args!(
+            "    {} (%{},%{},{}), {}",
+            load_instr, base_reg, index_reg, scale, dest_reg
+        ));
+
+        // Update register cache - for FP types, value is in xmm0, for integers in rax
+        match ty {
+            IrType::F64 | IrType::F32 => {
+                // For floating point, the value is in xmm0, not rax
+                // We need to move it to rax for the common code path
+                if ty == IrType::F64 {
+                    self.state.emit("    movq %xmm0, %rax");
+                } else {
+                    self.state.emit("    movd %xmm0, %eax");
+                }
+                self.state.reg_cache.set_acc(dest.0, false);
+            }
+            _ => {
+                // Integer types are already in rax
+                self.state.reg_cache.set_acc(dest.0, false);
+            }
+        }
+
+        true
+    }
+
     // ---- Store/Load overrides ----
 
     pub(super) fn emit_store_impl(&mut self, val: &Operand, ptr: &Value, ty: IrType) {
@@ -37,7 +476,140 @@ impl X86Codegen {
             }
             return;
         }
+
+        // Try indexed addressing mode first (Phase 9 optimization)
+        if self.try_emit_indexed_store(val, ptr, ty) {
+            // Indexed addressing succeeded - we're done!
+            return;
+        }
+
+        // Scalar FP store: keep the value in the SSE domain instead of
+        // round-tripping through %rax.
+        if matches!(ty, IrType::F64 | IrType::F32) {
+            let store_instr = if ty == IrType::F64 { "    movsd" } else { "    movss" };
+            let addr = self.state.resolve_slot_addr(ptr.0);
+            match addr {
+                Some(SlotAddr::Direct(slot)) => {
+                    let src = self.fp_store_value_xmm(val, ty);
+                    self.state.out.emit_instr_reg_rbp(store_instr, src, slot.0);
+                    return;
+                }
+                Some(SlotAddr::Indirect(slot)) => {
+                    if let Some(&reg) = self.reg_assignments.get(&ptr.0) {
+                        if !is_xmm_reg(reg) {
+                            let reg_name = phys_reg_name(reg);
+                            let src = self.fp_store_value_xmm(val, ty);
+                            self.state.emit_fmt(format_args!("{} %{}, (%{})", store_instr, src, reg_name));
+                            return;
+                        }
+                    }
+                    self.emit_load_ptr_from_slot_impl(slot, ptr.0);
+                    let src = self.fp_store_value_xmm(val, ty);
+                    self.state.emit_fmt(format_args!("{} %{}, (%rcx)", store_instr, src));
+                    return;
+                }
+                Some(SlotAddr::OverAligned(slot, id)) => {
+                    self.emit_alloca_aligned_addr_impl(slot, id);
+                    let src = self.fp_store_value_xmm(val, ty);
+                    self.state.emit_fmt(format_args!("{} %{}, (%rcx)", store_instr, src));
+                    return;
+                }
+                None => {} // fall through to default
+            }
+        }
+
+        // Constant-immediate store optimization: when storing a small constant,
+        // emit `movX $IMM, ADDR` directly instead of loading the constant into
+        // %rax and then storing through the accumulator. This saves 1-3 instructions
+        // (eliminates xorl/movq for zero, or movq $IMM for other constants, plus
+        // the emit_save_acc movq %rax, %rdx for indirect stores).
+        if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128) {
+            if let Operand::Const(c) = val {
+                if let Some(imm) = c.to_i64() {
+                    // Only use immediate form when value fits in i32 (x86 mov mem,imm limitation)
+                    if imm >= i32::MIN as i64 && imm <= i32::MAX as i64 {
+                        if self.try_emit_const_store(imm as i32, ptr, ty) {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Register-direct fast path: bypass the accumulator when both val
+        // and ptr have register assignments. Saves 2-3 instructions per store.
+        if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128) {
+            if let Operand::Value(v) = val {
+                let v_reg = self.reg_assignments.get(&v.0).copied();
+                let p_reg = self.reg_assignments.get(&ptr.0).copied();
+
+                // Both val and ptr in GPR registers: emit 1 instruction
+                if let (Some(vr), Some(pr)) = (v_reg, p_reg) {
+                    if !is_xmm_reg(vr) && !is_xmm_reg(pr) && !self.state.is_alloca(ptr.0) {
+                        let store_instr = Self::mov_store_for_type(ty);
+                        let v_name = typed_phys_reg_name(vr, ty);
+                        let p_name = phys_reg_name(pr);
+                        self.state.emit_fmt(format_args!("    {} %{}, (%{})", store_instr, v_name, p_name));
+                        self.state.reg_cache.invalidate_acc();
+                        return;
+                    }
+                }
+
+                // Val in register, ptr on stack: 2 instructions (skip emit_save_acc)
+                if let Some(vr) = v_reg {
+                    if !is_xmm_reg(vr) && !self.state.is_alloca(ptr.0) {
+                        if let Some(crate::backend::state::SlotAddr::Indirect(slot)) = self.state.resolve_slot_addr(ptr.0) {
+                            self.emit_load_ptr_from_slot_impl(slot, ptr.0);
+                            let store_instr = Self::mov_store_for_type(ty);
+                            let v_name = typed_phys_reg_name(vr, ty);
+                            self.state.emit_fmt(format_args!("    {} %{}, (%rcx)", store_instr, v_name));
+                            self.state.reg_cache.invalidate_acc();
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fall back to default store logic
         crate::backend::traits::emit_store_default(self, val, ptr, ty);
+    }
+
+    /// Try to emit a constant-immediate store: `movX $IMM, ADDR`.
+    /// Bypasses the accumulator entirely, saving 1-3 instructions.
+    fn try_emit_const_store(&mut self, imm: i32, ptr: &Value, ty: IrType) -> bool {
+        let store_instr = Self::mov_store_for_type(ty);
+        let addr = self.state.resolve_slot_addr(ptr.0);
+
+        match addr {
+            Some(SlotAddr::Direct(slot)) => {
+                // Store constant directly to stack slot: movX $IMM, N(%rsp/%rbp)
+                let out = &mut self.state.out;
+                out.write_str("    ");
+                out.write_str(store_instr);
+                out.write_str(" $");
+                out.write_i64(imm as i64);
+                out.write_str(", ");
+                if out.use_rsp_addressing {
+                    out.write_i64(out.rsp_frame_size + slot.0);
+                    out.write_str("(%rsp)");
+                } else {
+                    out.write_i64(slot.0);
+                    out.write_str("(%rbp)");
+                }
+                out.newline();
+                self.state.reg_cache.invalidate_all();
+                true
+            }
+            Some(SlotAddr::Indirect(slot)) => {
+                // Pointer is in a stack slot — load pointer to %rcx, then store immediate
+                self.emit_load_ptr_from_slot_impl(slot, ptr.0);
+                self.state.emit_fmt(format_args!("    {} ${}, (%rcx)", store_instr, imm));
+                self.state.reg_cache.invalidate_all();
+                true
+            }
+            _ => false, // OverAligned or no slot — fall back to default
+        }
     }
 
     pub(super) fn emit_load_impl(&mut self, dest: &Value, ptr: &Value, ty: IrType) {
@@ -49,6 +621,119 @@ impl X86Codegen {
             }
             return;
         }
+
+        // Try indexed addressing mode first (Phase 9 optimization)
+        if self.try_emit_indexed_load(dest, ptr, ty) {
+            // Indexed addressing succeeded - we're done!
+            // The accumulator already holds dest's value (cache updated in try_emit_indexed_load)
+            self.store_rax_to(dest);
+            return;
+        }
+
+        // Scalar FP load: keep the value in the SSE domain — load directly
+        // into an XMM register (the destination's own XMM register when it
+        // has one) instead of round-tripping through %rax.
+        if matches!(ty, IrType::F64 | IrType::F32) {
+            let load_instr = if ty == IrType::F64 { "    movsd" } else { "    movss" };
+            let dest_xmm = match self.reg_assignments.get(&dest.0) {
+                Some(&r) if is_xmm_reg(r) => Some(phys_reg_name(r)),
+                _ => None,
+            };
+            let target = dest_xmm.unwrap_or("xmm0");
+            let addr = self.state.resolve_slot_addr(ptr.0);
+            match addr {
+                Some(SlotAddr::Direct(slot)) => {
+                    self.state.out.emit_instr_rbp_reg(load_instr, slot.0, target);
+                }
+                Some(SlotAddr::Indirect(slot)) => {
+                    if let Some(&reg) = self.reg_assignments.get(&ptr.0) {
+                        if !is_xmm_reg(reg) {
+                            let reg_name = phys_reg_name(reg);
+                            self.state.emit_fmt(format_args!("{} (%{}), %{}", load_instr, reg_name, target));
+                            if dest_xmm.is_none() {
+                                self.store_xmm_to(dest, "xmm0", ty);
+                            }
+                            return;
+                        }
+                    }
+                    self.emit_load_ptr_from_slot_impl(slot, ptr.0);
+                    self.state.emit_fmt(format_args!("{} (%rcx), %{}", load_instr, target));
+                }
+                Some(SlotAddr::OverAligned(slot, id)) => {
+                    self.emit_alloca_aligned_addr_impl(slot, id);
+                    self.state.emit_fmt(format_args!("{} (%rcx), %{}", load_instr, target));
+                }
+                None => {
+                    // No address resolution — fall back to the default path.
+                    crate::backend::traits::emit_load_default(self, dest, ptr, ty);
+                    return;
+                }
+            }
+            if dest_xmm.is_none() {
+                self.store_xmm_to(dest, "xmm0", ty);
+            }
+            return;
+        }
+
+        // Register-direct load: when ptr has a register, load directly.
+        // If dest ALSO has a register, load directly to dest (bypassing rax entirely).
+        // Otherwise, load to rax and store via accumulator.
+        if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128) {
+            if let Some(p_reg) = self.reg_assignments.get(&ptr.0).copied() {
+                if !is_xmm_reg(p_reg) && !self.state.is_alloca(ptr.0) {
+                    let load_instr = self.mov_load_for_value(ty, dest.0);
+                    let p_name = phys_reg_name(p_reg);
+                    let use_32bit_dest = matches!(ty, IrType::U32 | IrType::F32)
+                        || (ty == IrType::I32 && load_instr == "movl");
+
+                    // Check if dest has a register — load directly to it.
+                    if let Some(d_reg) = self.reg_assignments.get(&dest.0).copied() {
+                        if !is_xmm_reg(d_reg) {
+                            let d_name = if use_32bit_dest {
+                                phys_reg_name_32(d_reg)
+                            } else {
+                                phys_reg_name(d_reg)
+                            };
+                            self.state.emit_fmt(format_args!("    {} (%{}), %{}", load_instr, p_name, d_name));
+                            return;
+                        }
+                    }
+
+                    // Dest is on stack — load to rax as before.
+                    let dest_reg = if use_32bit_dest { "%eax" } else { "%rax" };
+                    self.state.emit_fmt(format_args!("    {} (%{}), {}", load_instr, p_name, dest_reg));
+                    self.state.reg_cache.set_acc(dest.0, false);
+                    self.store_rax_to(dest);
+                    return;
+                }
+            }
+        }
+
+        // Register-direct load from alloca: when ptr is a stack-allocated local
+        // variable and dest has a register, load directly to the register.
+        // This bypasses the accumulator, saving one movq instruction.
+        if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128) {
+            if let Some(d_reg) = self.reg_assignments.get(&dest.0).copied() {
+                if !is_xmm_reg(d_reg) && self.state.is_alloca(ptr.0) {
+                    if let Some(slot) = self.state.get_slot(ptr.0) {
+                        let load_instr = Self::mov_load_for_type(ty);
+                        // Match the dest register width to the load instruction:
+                        // movl → 32-bit dest (implicit zero-extend)
+                        // movslq/movsbq/movswq/movzbq/movzwq/movq → 64-bit dest
+                        let d_name = match ty {
+                            IrType::U32 | IrType::F32 => phys_reg_name_32(d_reg),
+                            _ => phys_reg_name(d_reg),
+                        };
+                        let sr = self.slot_ref(slot.0);
+                        self.state.emit_fmt(format_args!("    {} {}, %{}", load_instr, sr, d_name));
+                        self.state.reg_cache.invalidate_acc();
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Fall back to default load logic
         crate::backend::traits::emit_load_default(self, dest, ptr, ty);
     }
 
@@ -81,24 +766,160 @@ impl X86Codegen {
             }
             return;
         }
-        // Non-F128: use the default GEP fold logic.
-        self.operand_to_rax(val);
+        // Scalar FP store: keep the value in the SSE domain instead of
+        // round-tripping through %rax.
+        if matches!(ty, IrType::F64 | IrType::F32) {
+            let store_instr = if ty == IrType::F64 { "    movsd" } else { "    movss" };
+            let addr = self.state.resolve_slot_addr(base.0);
+            match addr {
+                Some(SlotAddr::Direct(slot)) => {
+                    let folded_slot = StackSlot(slot.0 + offset);
+                    let src = self.fp_store_value_xmm(val, ty);
+                    self.state.out.emit_instr_reg_rbp(store_instr, src, folded_slot.0);
+                    return;
+                }
+                Some(SlotAddr::Indirect(slot)) => {
+                    if let Some(&reg) = self.reg_assignments.get(&base.0) {
+                        if !is_xmm_reg(reg) {
+                            let reg_name = phys_reg_name(reg);
+                            let src = self.fp_store_value_xmm(val, ty);
+                            if offset != 0 {
+                                self.state.emit_fmt(format_args!("{} %{}, {}(%{})", store_instr, src, offset, reg_name));
+                            } else {
+                                self.state.emit_fmt(format_args!("{} %{}, (%{})", store_instr, src, reg_name));
+                            }
+                            return;
+                        }
+                    }
+                    self.emit_load_ptr_from_slot_impl(slot, base.0);
+                    if offset != 0 {
+                        self.emit_add_offset_to_addr_reg_impl(offset);
+                    }
+                    let src = self.fp_store_value_xmm(val, ty);
+                    self.state.emit_fmt(format_args!("{} %{}, (%rcx)", store_instr, src));
+                    return;
+                }
+                Some(SlotAddr::OverAligned(slot, id)) => {
+                    self.emit_alloca_aligned_addr_impl(slot, id);
+                    self.emit_add_offset_to_addr_reg_impl(offset);
+                    let src = self.fp_store_value_xmm(val, ty);
+                    self.state.emit_fmt(format_args!("{} %{}, (%rcx)", store_instr, src));
+                    return;
+                }
+                None => {} // fall through to default
+            }
+        }
+
+        // Non-F128: try constant-immediate store optimization first.
+        if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128) {
+            if let Operand::Const(c) = val {
+                if let Some(imm) = c.to_i64() {
+                    if imm >= i32::MIN as i64 && imm <= i32::MAX as i64 {
+                        let store_instr = Self::mov_store_for_type(ty);
+                        let imm32 = imm as i32;
+                        let addr = self.state.resolve_slot_addr(base.0);
+                        match addr {
+                            Some(SlotAddr::Direct(slot)) => {
+                                let folded_slot = StackSlot(slot.0 + offset);
+                                let out = &mut self.state.out;
+                                out.write_str("    ");
+                                out.write_str(store_instr);
+                                out.write_str(" $");
+                                out.write_i64(imm32 as i64);
+                                out.write_str(", ");
+                                if out.use_rsp_addressing {
+                                    out.write_i64(out.rsp_frame_size + folded_slot.0);
+                                    out.write_str("(%rsp)");
+                                } else {
+                                    out.write_i64(folded_slot.0);
+                                    out.write_str("(%rbp)");
+                                }
+                                out.newline();
+                                self.state.reg_cache.invalidate_all();
+                                return;
+                            }
+                            Some(SlotAddr::Indirect(slot)) => {
+                                if let Some(&reg) = self.reg_assignments.get(&base.0) {
+                                    let reg_name = phys_reg_name(reg);
+                                    if offset != 0 {
+                                        self.state.emit_fmt(format_args!("    {} ${}, {}(%{})", store_instr, imm32, offset, reg_name));
+                                    } else {
+                                        self.state.emit_fmt(format_args!("    {} ${}, (%{})", store_instr, imm32, reg_name));
+                                    }
+                                } else {
+                                    self.emit_load_ptr_from_slot_impl(slot, base.0);
+                                    if offset != 0 {
+                                        self.emit_add_offset_to_addr_reg_impl(offset);
+                                    }
+                                    self.state.emit_fmt(format_args!("    {} ${}, (%rcx)", store_instr, imm32));
+                                }
+                                self.state.reg_cache.invalidate_all();
+                                return;
+                            }
+                            _ => {} // fall through to default path
+                        }
+                    }
+                }
+            }
+        }
+
+        // Register-direct store: when val has a register, store directly to memory
+        // without loading to %rax first. Handles Direct (alloca) and Indirect (ptr) cases.
+        if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128) {
+            if let Operand::Value(v) = val {
+                if let Some(v_reg) = self.reg_assignments.get(&v.0).copied() {
+                    if !is_xmm_reg(v_reg) {
+                        let store_instr = Self::mov_store_for_type(ty);
+                        let v_name = typed_phys_reg_name(v_reg, ty);
+                        let addr = self.state.resolve_slot_addr(base.0);
+                        match addr {
+                            Some(SlotAddr::Direct(slot)) => {
+                                let folded_slot = StackSlot(slot.0 + offset);
+                                let sr = self.slot_ref(folded_slot.0);
+                                self.state.emit_fmt(format_args!("    {} %{}, {}", store_instr, v_name, sr));
+                                return;
+                            }
+                            Some(SlotAddr::Indirect(_slot)) => {
+                                if let Some(&b_reg) = self.reg_assignments.get(&base.0) {
+                                    let b_name = phys_reg_name(b_reg);
+                                    if offset != 0 {
+                                        self.state.emit_fmt(format_args!("    {} %{}, {}(%{})", store_instr, v_name, offset, b_name));
+                                    } else {
+                                        self.state.emit_fmt(format_args!("    {} %{}, (%{})", store_instr, v_name, b_name));
+                                    }
+                                    return;
+                                }
+                                // base not in register — fall through to load base to %rcx
+                            }
+                            _ => {} // fall through
+                        }
+                    }
+                }
+            }
+        }
+
+        // Default GEP fold logic.
         let addr = self.state.resolve_slot_addr(base.0);
         if let Some(addr) = addr {
             let store_instr = Self::mov_store_for_type(ty);
             match addr {
                 SlotAddr::OverAligned(slot, id) => {
-                    self.emit_save_acc_impl();
+                    // For over-aligned, load ptr first to rcx, then load value to rax
                     self.emit_alloca_aligned_addr_impl(slot, id);
                     self.emit_add_offset_to_addr_reg_impl(offset);
-                    self.emit_typed_store_indirect_impl(store_instr, ty);
+                    // rcx now holds the target address
+                    self.operand_to_rax(val);
+                    let store_reg = Self::reg_for_type("rax", ty);
+                    self.state.emit_fmt(format_args!("    {} %{}, (%rcx)", store_instr, store_reg));
                 }
                 SlotAddr::Direct(slot) => {
+                    self.operand_to_rax(val);
                     let folded_slot = StackSlot(slot.0 + offset);
                     self.emit_typed_store_to_slot_impl(store_instr, ty, folded_slot);
                 }
                 SlotAddr::Indirect(slot) => {
                     if let Some(&reg) = self.reg_assignments.get(&base.0) {
+                        self.operand_to_rax(val);
                         let reg_name = phys_reg_name(reg);
                         let store_reg = Self::reg_for_type("rax", ty);
                         if offset != 0 {
@@ -107,15 +928,23 @@ impl X86Codegen {
                             self.state.emit_fmt(format_args!("    {} %{}, (%{})", store_instr, store_reg, reg_name));
                         }
                     } else {
-                        self.emit_save_acc_impl();
+                        // Load pointer to %rcx FIRST, then load value to %rax.
+                        // This avoids emit_save_acc which can be clobbered by
+                        // operand_to_rax if the value uses %r11/%rdx as scratch.
                         self.emit_load_ptr_from_slot_impl(slot, base.0);
                         if offset != 0 {
                             self.emit_add_offset_to_addr_reg_impl(offset);
                         }
-                        self.emit_typed_store_indirect_impl(store_instr, ty);
+                        // Now load value — %rcx is safe (not clobbered by operand_to_rax)
+                        self.operand_to_rax(val);
+                        let store_reg = Self::reg_for_type("rax", ty);
+                        self.state.emit_fmt(format_args!("    {} %{}, (%rcx)", store_instr, store_reg));
                     }
                 }
             }
+        } else {
+            // No addr resolution — fall back
+            self.operand_to_rax(val);
         }
     }
 
@@ -124,6 +953,55 @@ impl X86Codegen {
             if let Some(addr) = self.state.resolve_slot_addr(base.0) {
                 self.emit_f128_fldt(&addr, base.0, offset);
                 self.emit_f128_load_finish(dest);
+            }
+            return;
+        }
+        // Scalar FP load: keep the value in the SSE domain — load directly
+        // into an XMM register (the destination's own XMM register when it
+        // has one) instead of round-tripping through %rax.
+        if matches!(ty, IrType::F64 | IrType::F32) {
+            let load_instr = if ty == IrType::F64 { "    movsd" } else { "    movss" };
+            let dest_xmm = match self.reg_assignments.get(&dest.0) {
+                Some(&r) if is_xmm_reg(r) => Some(phys_reg_name(r)),
+                _ => None,
+            };
+            let target = dest_xmm.unwrap_or("xmm0");
+            let addr = self.state.resolve_slot_addr(base.0);
+            match addr {
+                Some(SlotAddr::Direct(slot)) => {
+                    let folded_slot = StackSlot(slot.0 + offset);
+                    self.state.out.emit_instr_rbp_reg(load_instr, folded_slot.0, target);
+                }
+                Some(SlotAddr::Indirect(slot)) => {
+                    if let Some(&reg) = self.reg_assignments.get(&base.0) {
+                        if !is_xmm_reg(reg) {
+                            let reg_name = phys_reg_name(reg);
+                            if offset != 0 {
+                                self.state.emit_fmt(format_args!("{} {}(%{}), %{}", load_instr, offset, reg_name, target));
+                            } else {
+                                self.state.emit_fmt(format_args!("{} (%{}), %{}", load_instr, reg_name, target));
+                            }
+                            if dest_xmm.is_none() {
+                                self.store_xmm_to(dest, "xmm0", ty);
+                            }
+                            return;
+                        }
+                    }
+                    self.emit_load_ptr_from_slot_impl(slot, base.0);
+                    if offset != 0 {
+                        self.emit_add_offset_to_addr_reg_impl(offset);
+                    }
+                    self.state.emit_fmt(format_args!("{} (%rcx), %{}", load_instr, target));
+                }
+                Some(SlotAddr::OverAligned(slot, id)) => {
+                    self.emit_alloca_aligned_addr_impl(slot, id);
+                    self.emit_add_offset_to_addr_reg_impl(offset);
+                    self.state.emit_fmt(format_args!("{} (%rcx), %{}", load_instr, target));
+                }
+                None => return, // no address resolution — nothing to do
+            }
+            if dest_xmm.is_none() {
+                self.store_xmm_to(dest, "xmm0", ty);
             }
             return;
         }
@@ -143,6 +1021,28 @@ impl X86Codegen {
                 SlotAddr::Indirect(slot) => {
                     if let Some(&reg) = self.reg_assignments.get(&base.0) {
                         let reg_name = phys_reg_name(reg);
+
+                        // Register-direct: if dest also has a register, load directly to it.
+                        if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128) {
+                            if let Some(&d_reg) = self.reg_assignments.get(&dest.0) {
+                                if !is_xmm_reg(d_reg) {
+                                    // movslq/movsbq/movswq need 64-bit dest.
+                                    // movl/movzbl/movzwl use 32-bit dest (implicit zero-extend).
+                                    let d_name = if matches!(ty, IrType::U32 | IrType::F32) {
+                                        phys_reg_name_32(d_reg)
+                                    } else {
+                                        phys_reg_name(d_reg)
+                                    };
+                                    if offset != 0 {
+                                        self.state.emit_fmt(format_args!("    {} {}(%{}), %{}", load_instr, offset, reg_name, d_name));
+                                    } else {
+                                        self.state.emit_fmt(format_args!("    {} (%{}), %{}", load_instr, reg_name, d_name));
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+
                         let dest_reg = Self::load_dest_reg(ty);
                         if offset != 0 {
                             self.state.emit_fmt(format_args!("    {} {}(%{}), {}", load_instr, offset, reg_name, dest_reg));
@@ -170,8 +1070,13 @@ impl X86Codegen {
         out.write_str(" %");
         out.write_str(reg);
         out.write_str(", ");
-        out.write_i64(slot.0);
-        out.write_str("(%rbp)");
+        if out.use_rsp_addressing {
+            out.write_i64(out.rsp_frame_size + slot.0);
+            out.write_str("(%rsp)");
+        } else {
+            out.write_i64(slot.0);
+            out.write_str("(%rbp)");
+        }
         out.newline();
     }
 
@@ -181,17 +1086,29 @@ impl X86Codegen {
         out.write_str("    ");
         out.write_str(instr);
         out.write_str(" ");
-        out.write_i64(slot.0);
-        out.write_str("(%rbp), ");
+        if out.use_rsp_addressing {
+            out.write_i64(out.rsp_frame_size + slot.0);
+            out.write_str("(%rsp), ");
+        } else {
+            out.write_i64(slot.0);
+            out.write_str("(%rbp), ");
+        }
         out.write_str(dest_reg);
         out.newline();
     }
 
     pub(super) fn emit_save_acc_impl(&mut self) {
-        self.state.emit("    movq %rax, %rdx");
+        // Save %rax to a scratch register before loading a pointer to %rcx.
+        // Use %r11 when %rdx is allocated to a value (rdx is in the caller-saved pool).
+        if self.reg_assignments.values().any(|r| r.0 == 16) {
+            self.state.emit("    movq %rax, %r11");
+        } else {
+            self.state.emit("    movq %rax, %rdx");
+        }
     }
 
     pub(super) fn emit_load_ptr_from_slot_impl(&mut self, slot: StackSlot, val_id: u32) {
+        self.state.reg_cache.invalidate_sec(); // clobbers %rcx
         if let Some(&reg) = self.reg_assignments.get(&val_id) {
             let reg_name = phys_reg_name(reg);
             self.state.out.emit_instr_reg_reg("    movq", reg_name, "rcx");
@@ -201,7 +1118,10 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_typed_store_indirect_impl(&mut self, instr: &'static str, ty: IrType) {
-        let store_reg = Self::reg_for_type("rdx", ty);
+        // Store from the accumulator (%rax) to the address in %rcx.
+        // The value was loaded to %rax AFTER the pointer was loaded to %rcx,
+        // so %rax holds the correct value.
+        let store_reg = Self::reg_for_type("rax", ty);
         self.state.emit_fmt(format_args!("    {} %{}, (%rcx)", instr, store_reg));
     }
 
@@ -226,6 +1146,7 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_slot_addr_to_secondary_impl(&mut self, slot: StackSlot, is_alloca: bool, val_id: u32) {
+        self.state.reg_cache.invalidate_sec(); // clobbers %rcx
         if is_alloca {
             self.emit_alloca_addr_to("rcx", val_id, slot.0);
         } else if let Some(&reg) = self.reg_assignments.get(&val_id) {
@@ -256,6 +1177,30 @@ impl X86Codegen {
         }
         if offset != 0 {
             self.state.out.emit_instr_mem_reg("    leaq", offset, "rax", "rax");
+        }
+        self.state.reg_cache.invalidate_acc();
+    }
+
+    /// Emit leaq (%base, %index), %dest for GEP with both operands in registers.
+    /// If dest is also register-allocated, emits directly to the dest register.
+    /// Otherwise, emits to %rax and stores via store_rax_to.
+    pub(super) fn emit_leaq_base_index_impl(
+        &mut self,
+        base_reg: super::super::super::regalloc::PhysReg,
+        index_reg: super::super::super::regalloc::PhysReg,
+        dest: &Value,
+        dest_phys: Option<super::super::super::regalloc::PhysReg>,
+    ) {
+        use super::emit::{phys_reg_name};
+        let base_name = phys_reg_name(base_reg);
+        let index_name = phys_reg_name(index_reg);
+
+        if let Some(dp) = dest_phys {
+            let dest_name = phys_reg_name(dp);
+            self.state.emit_fmt(format_args!("    leaq (%{}, %{}), %{}", base_name, index_name, dest_name));
+        } else {
+            self.state.emit_fmt(format_args!("    leaq (%{}, %{}), %rax", base_name, index_name));
+            self.store_rax_to(dest);
         }
         self.state.reg_cache.invalidate_acc();
     }

@@ -58,6 +58,7 @@ pub const R_AARCH64_ADR_GOT_PAGE: u32 = 311;
 pub const R_AARCH64_LD64_GOT_LO12_NC: u32 = 312;
 pub const R_AARCH64_CONDBR19: u32 = 280;
 pub const R_AARCH64_TSTBR14: u32 = 279;
+pub const R_AARCH64_LD_PREL_LO19: u32 = 273;  // LDR literal: (S + A - P) >> 2, 19-bit
 
 // ── Type aliases ─────────────────────────────────────────────────────────
 // Re-export shared types under the names the ARM linker already uses.

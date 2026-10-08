@@ -328,18 +328,20 @@ struct LoopMemoryInfo {
     /// or InlineAsm with clobbers). Calls can modify any global variable,
     /// so loads from globals cannot be hoisted past calls.
     has_calls: bool,
-    /// Whether the loop body has any stores through non-alloca pointers,
-    /// which could potentially write to global variables. A pointer loaded
-    /// from memory at runtime (e.g., through a struct field) may point to
-    /// global memory, so any store through a non-alloca pointer must be
-    /// treated conservatively as potentially modifying globals.
-    has_global_derived_stores: bool,
+    /// Whether the loop body has stores through pointers that can't be
+    /// traced to any known GlobalAddr. Such pointers (e.g., loaded from
+    /// a struct field at runtime) could alias any global, so all global
+    /// loads must be blocked when this is true.
+    has_unknown_derived_stores: bool,
+    /// Set of GlobalAddr value IDs whose derived pointers are stored to
+    /// within the loop. Loads from OTHER globals can still be hoisted.
+    stored_global_bases: FxHashSet<u32>,
 }
 
 impl LoopMemoryInfo {
     /// Whether the loop has any store operations at all (to any target).
     fn has_any_stores(&self) -> bool {
-        !self.stored_allocas.is_empty() || self.has_global_derived_stores
+        !self.stored_allocas.is_empty() || self.has_unknown_derived_stores || !self.stored_global_bases.is_empty()
     }
 }
 
@@ -380,18 +382,84 @@ fn build_value_to_base_alloca(func: &IrFunction, alloca_info: &AllocaAnalysis) -
     map
 }
 
+/// Build a mapping from GEP/Copy result values to their ultimate base GlobalAddr.
+/// Follows chains like `gep(gep(GlobalAddr, off1), off2)` → GlobalAddr.
+fn build_value_to_base_global(func: &IrFunction, global_addr_values: &FxHashSet<u32>) -> FxHashMap<u32, u32> {
+    // Build canonical mapping: multiple GlobalAddr instructions for the same
+    // symbol should map to the same canonical ID. Without this, stores through
+    // one GlobalAddr for "perm" won't block loads through another GlobalAddr
+    // for "perm", causing incorrect hoisting.
+    let mut symbol_canonical: FxHashMap<String, u32> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::GlobalAddr { dest, name } = inst {
+                symbol_canonical.entry(name.clone()).or_insert(dest.0);
+            }
+        }
+    }
+    let mut canonical_for: FxHashMap<u32, u32> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::GlobalAddr { dest, name } = inst {
+                let canonical = symbol_canonical[name];
+                if canonical != dest.0 {
+                    canonical_for.insert(dest.0, canonical);
+                }
+            }
+        }
+    }
+
+    let mut map: FxHashMap<u32, u32> = FxHashMap::default();
+    // Seed: every GlobalAddr maps to its canonical ID
+    for &gid in global_addr_values {
+        let canonical = canonical_for.get(&gid).copied().unwrap_or(gid);
+        map.insert(gid, canonical);
+    }
+    // Propagate through GEP and Copy chains (fixpoint)
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::GetElementPtr { dest, base, .. } => {
+                        if let Some(&base_global) = map.get(&base.0) {
+                            if map.insert(dest.0, base_global) != Some(base_global) {
+                                changed = true;
+                            }
+                        }
+                    }
+                    Instruction::Copy { dest, src: Operand::Value(src_val) } => {
+                        if let Some(&base_global) = map.get(&src_val.0) {
+                            if map.insert(dest.0, base_global) != Some(base_global) {
+                                changed = true;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    map
+}
+
 /// Scan a loop body to determine which allocas are modified and what
 /// memory side effects the loop has (calls, stores to unknown pointers).
 fn analyze_loop_memory(
     func: &IrFunction,
     loop_body: &FxHashSet<usize>,
     alloca_info: &AllocaAnalysis,
-    _global_addr_values: &FxHashSet<u32>,
+    global_addr_values: &FxHashSet<u32>,
     value_to_base_alloca: &FxHashMap<u32, u32>,
 ) -> LoopMemoryInfo {
     let mut stored_allocas = FxHashSet::default();
     let mut has_calls = false;
-    let mut has_global_derived_stores = false;
+    let mut has_unknown_derived_stores = false;
+    let mut stored_global_bases: FxHashSet<u32> = FxHashSet::default();
+
+    // Build a mapping from GEP/Copy results to their base GlobalAddr value.
+    let value_to_base_global = build_value_to_base_global(func, global_addr_values);
 
     let collect_ptr = |op: &Operand, set: &mut FxHashSet<u32>| {
         if let Operand::Value(v) = op {
@@ -407,23 +475,25 @@ fn analyze_loop_memory(
             match inst {
                 Instruction::Store { ptr, .. } => {
                     stored_allocas.insert(ptr.0);
-                    // A store through any pointer that is NOT a known alloca
-                    // could potentially modify global memory. For example, a
-                    // pointer loaded from a struct field at runtime may point
-                    // to a global variable (e.g., linked list node->next->prev
-                    // where next points to a global anchor). We must
-                    // conservatively flag all non-alloca stores as potentially
-                    // modifying globals to prevent incorrect hoisting of global
-                    // loads.
                     if !alloca_info.alloca_values.contains(&ptr.0) {
-                        has_global_derived_stores = true;
+                        // Try to trace the pointer to a specific GlobalAddr base.
+                        if let Some(&base) = value_to_base_global.get(&ptr.0) {
+                            stored_global_bases.insert(base);
+                        } else {
+                            // Unknown pointer — could alias any global.
+                            has_unknown_derived_stores = true;
+                        }
                     }
                 }
                 Instruction::AtomicRmw { ptr, .. } => {
                     collect_ptr(ptr, &mut stored_allocas);
                     if let Operand::Value(v) = ptr {
                         if !alloca_info.alloca_values.contains(&v.0) {
-                            has_global_derived_stores = true;
+                            if let Some(&base) = value_to_base_global.get(&v.0) {
+                                stored_global_bases.insert(base);
+                            } else {
+                                has_unknown_derived_stores = true;
+                            }
                         }
                     }
                 }
@@ -431,7 +501,11 @@ fn analyze_loop_memory(
                     collect_ptr(ptr, &mut stored_allocas);
                     if let Operand::Value(v) = ptr {
                         if !alloca_info.alloca_values.contains(&v.0) {
-                            has_global_derived_stores = true;
+                            if let Some(&base) = value_to_base_global.get(&v.0) {
+                                stored_global_bases.insert(base);
+                            } else {
+                                has_unknown_derived_stores = true;
+                            }
                         }
                     }
                 }
@@ -439,14 +513,22 @@ fn analyze_loop_memory(
                     collect_ptr(ptr, &mut stored_allocas);
                     if let Operand::Value(v) = ptr {
                         if !alloca_info.alloca_values.contains(&v.0) {
-                            has_global_derived_stores = true;
+                            if let Some(&base) = value_to_base_global.get(&v.0) {
+                                stored_global_bases.insert(base);
+                            } else {
+                                has_unknown_derived_stores = true;
+                            }
                         }
                     }
                 }
                 Instruction::Memcpy { dest, .. } => {
                     stored_allocas.insert(dest.0);
                     if !alloca_info.alloca_values.contains(&dest.0) {
-                        has_global_derived_stores = true;
+                        if let Some(&base) = value_to_base_global.get(&dest.0) {
+                            stored_global_bases.insert(base);
+                        } else {
+                            has_unknown_derived_stores = true;
+                        }
                     }
                 }
                 // Function calls can modify any global state.
@@ -489,7 +571,7 @@ fn analyze_loop_memory(
         }
     }
 
-    LoopMemoryInfo { stored_allocas, modified_base_allocas, has_calls, has_global_derived_stores }
+    LoopMemoryInfo { stored_allocas, modified_base_allocas, has_calls, has_unknown_derived_stores, stored_global_bases }
 }
 
 /// Check if a Load instruction is safe to hoist from a loop.
@@ -508,6 +590,7 @@ fn is_load_hoistable(
     loop_defined: &FxHashSet<u32>,
     invariant: &FxHashSet<u32>,
     global_addr_values: &FxHashSet<u32>,
+    value_to_base_global: &FxHashMap<u32, u32>,
 ) -> bool {
     let ptr_id = ptr.0;
 
@@ -548,10 +631,15 @@ fn is_load_hoistable(
         if loop_mem.has_calls {
             return false;
         }
-        if loop_mem.has_global_derived_stores {
+        if loop_mem.has_unknown_derived_stores {
             return false;
         }
-        // Check if any store in the loop directly targets this GlobalAddr.
+        // Trace the pointer to its root GlobalAddr base and check if that
+        // specific global is stored to in the loop. Different globals don't alias.
+        let base_global = value_to_base_global.get(&ptr_id).copied().unwrap_or(ptr_id);
+        if loop_mem.stored_global_bases.contains(&base_global) {
+            return false;
+        }
         if loop_mem.stored_allocas.contains(&ptr_id) {
             return false;
         }
@@ -608,11 +696,17 @@ fn hoist_loop_invariants(
     // pointer from a GlobalAddr (transitively). Stores through any of these
     // pointers can modify global variables, so they must be tracked to prevent
     // incorrect hoisting of global loads.
+    //
+    // IMPORTANT: Multiple GlobalAddr instructions for the same symbol get different
+    // Value IDs. We canonicalize them so that stores through one GlobalAddr for "perm"
+    // correctly block loads through a different GlobalAddr for "perm".
     let mut global_addr_values: FxHashSet<u32> = FxHashSet::default();
+    let mut root_global_addr_values: FxHashSet<u32> = FxHashSet::default();
     for block in func.blocks.iter() {
         for inst in &block.instructions {
             if let Instruction::GlobalAddr { dest, .. } = inst {
                 global_addr_values.insert(dest.0);
+                root_global_addr_values.insert(dest.0);
             }
         }
     }
@@ -646,6 +740,11 @@ fn hoist_loop_invariants(
 
     // Build a mapping from values to their base alloca (following GEP chains).
     let value_to_base_alloca = build_value_to_base_alloca(func, alloca_info);
+
+    // Build a mapping from values to their base GlobalAddr (following GEP chains).
+    // Used for precise global-store aliasing: loads from global A can be hoisted
+    // even when the loop stores to a different global C.
+    let value_to_base_global = build_value_to_base_global(func, &root_global_addr_values);
 
     // Analyze loop memory for load hoisting.
     let loop_mem = analyze_loop_memory(func, &natural_loop.body, alloca_info, &global_addr_values, &value_to_base_alloca);
@@ -749,7 +848,8 @@ fn hoist_loop_invariants(
                 } else if let Instruction::Load { ptr, .. } = inst {
                     is_load_hoistable(ptr, alloca_info, &loop_mem,
                                              &loop_defined, &invariant,
-                                             &global_addr_values)
+                                             &global_addr_values,
+                                             &value_to_base_global)
                 } else {
                     false
                 };
@@ -818,15 +918,68 @@ fn hoist_loop_invariants(
     // A must come before B in the preheader.
     let sorted = topological_sort_instructions(unique_insts);
 
-    // Insert at the end of the preheader (before terminator)
+    // Insert at the end of the preheader (before terminator) — unless the
+    // preheader already contains a use of a hoisted value: e.g. the
+    // vectorizer's hoisted broadcast references a GEP that this hoist is
+    // moving. Appending past such a use creates a use-before-def, and with
+    // slot-home codegen the use then reads an uninitialized stack slot
+    // (L6 matrix_multiply segfault). Insert before the earliest existing
+    // use of any hoisted dest instead, but never before a preheader def
+    // that a hoisted instruction itself needs.
     if preheader < func.blocks.len() {
         let preheader_block = &mut func.blocks[preheader];
         let num_sorted = sorted.len();
-        preheader_block.instructions.extend(sorted);
-        if !preheader_block.source_spans.is_empty() {
-            preheader_block.source_spans.extend(
-                std::iter::repeat_n(crate::common::source::Span::dummy(), num_sorted)
-            );
+        let hoisted_dests: FxHashSet<u32> = sorted
+            .iter()
+            .filter_map(|i| i.dest().map(|d| d.0))
+            .collect();
+        let earliest_use = preheader_block.instructions.iter().position(|inst| {
+            let mut hit = false;
+            inst.for_each_used_value(|u| {
+                if hoisted_dests.contains(&u) {
+                    hit = true;
+                }
+            });
+            hit
+        });
+        if let Some(use_pos) = earliest_use {
+            // Latest preheader def of any operand the hoisted instructions
+            // read; the insertion must stay after it.
+            let mut latest_needed_def: Option<usize> = None;
+            for (pi, pinst) in preheader_block.instructions.iter().enumerate() {
+                if let Some(d) = pinst.dest() {
+                    let mut needed = false;
+                    for hinst in &sorted {
+                        let mut uses_it = false;
+                        hinst.for_each_used_value(|u| {
+                            if u == d.0 {
+                                uses_it = true;
+                            }
+                        });
+                        if uses_it {
+                            needed = true;
+                        }
+                    }
+                    if needed {
+                        latest_needed_def = Some(pi);
+                    }
+                }
+            }
+            let min_pos = latest_needed_def.map(|p| p + 1).unwrap_or(0);
+            let insert_pos = use_pos.max(min_pos);
+            let tail: Vec<Instruction> = preheader_block.instructions.split_off(insert_pos);
+            preheader_block.instructions.extend(sorted);
+            preheader_block.instructions.extend(tail);
+            if !preheader_block.source_spans.is_empty() {
+                preheader_block.source_spans.clear();
+            }
+        } else {
+            preheader_block.instructions.extend(sorted);
+            if !preheader_block.source_spans.is_empty() {
+                preheader_block.source_spans.extend(
+                    std::iter::repeat_n(crate::common::source::Span::dummy(), num_sorted)
+                );
+            }
         }
     }
 

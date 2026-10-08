@@ -1,208 +1,335 @@
-# CCC — Claude's C Compiler
+# LCCC — Lev's Claude's C Compiler
 
-A C compiler written entirely from scratch in Rust, targeting x86-64, i686,
-AArch64, and RISC-V 64. Zero compiler-specific dependencies — the frontend,
-SSA-based IR, optimizer, code generator, peephole optimizers, assembler,
-linker, and DWARF debug info generation are all implemented from scratch.
-Claude's C Compiler produces ELF executables without any external toolchain.
+> An optimized fork of [CCC](https://github.com/anthropics/claudes-c-compiler): a zero-dependency
+> C compiler in Rust with its own assembler and linker, targeting x86-64, AArch64, RISC-V 64,
+> and i686. LCCC adds a linear-scan register allocator with hot-loop register steal, phi
+> coalescing for both registers and stack slots, SIMD auto-vectorization (AVX2/SSE2 on x86-64,
+> NEON on AArch64), tail-call and recursion-to-iteration transforms, and per-target peephole
+> optimizers. **~1.1× of GCC -O2** on the 18-benchmark suite (AArch64), **600× faster** on
+> naive recursive benchmarks, and it compiles real software like SQLite.
 
-> Note: With the exception of this one paragraph that was written by a human, 100% of the code and documentation in this repository was written by Claude Opus 4.6. A human guided some of this process by writing test cases that Claude was told to pass, but never interactively pair-programmed with Claude to debug or to provide feedback on code quality. As a result, I do not recommend you use this code! None of it has been validated for correctness. Claude wrote this exclusively on a Linux host; it probably will not work on MacOS/Windows — neither I nor Claude have tried. The docs may be wrong and make claims that are false. See [our blog post](https://anthropic.com/engineering/building-c-compiler) for more detail.
+**[Documentation](https://levkropp.github.io/lccc/)** ·
+**[Benchmarks](#benchmarks)** ·
+**[Getting Started](#getting-started)** ·
+**[Roadmap](#roadmap)**
 
-## Prerequisites
+---
 
-- **Rust** (stable, 2021 edition) — install via [rustup](https://rustup.rs/)
-- **Linux host** — the compiler targets Linux ELF executables and relies on
-  Linux system headers / C runtime libraries (glibc or musl) being installed
-  on the host
-- For cross-compilation targets (ARM, RISC-V, i686), the corresponding
-  cross-compilation sysroots should be installed (e.g.,
-  `aarch64-linux-gnu-gcc`, `riscv64-linux-gnu-gcc`)
+## What is LCCC?
 
-## Building
+CCC (Claude's C Compiler) is a zero-dependency C compiler written entirely in Rust by Claude Opus 4.6,
+capable of compiling real projects — PostgreSQL, SQLite, Redis, the Linux kernel — with its own
+assembler and linker (no external toolchain).
 
-```bash
-cargo build --release
+LCCC is a performance fork. The original CCC shuttles every value through the accumulator with no
+register allocation; LCCC replaces that with a linear-scan register allocator and adds the
+optimization machinery needed to approach GCC -O2: SSA optimization pipeline, SIMD
+vectorization, loop transforms, and target-specific peephole optimizers.
+
+```
+C source
+  │  frontend: lex → parse → sema → IR lowering
+  ▼
+SSA IR
+  │  optimizer: TCE · rec2iter · inline · GVN · LICM · IVSR · unroll · vectorize
+  │             · if-conv · DCE · const-fold · narrow · divconst · bit-idioms (27 passes)
+  ▼
+Optimized IR
+  │  regalloc: linear scan over live intervals
+  │    · callee-saved pool: all eligible values, start-order
+  │    · caller-saved pool: non-call-spanning values
+  │    · FP/SIMD pool: F64 accumulators, NEON/SSE vector values
+  │    · post-scan steal: hot loop-carried phi values evict cold holders
+  ▼
+Machine code  (x86-64 · AArch64 · RISC-V 64 · i686)
+  │  stack layout: liveness-packed slots · loop-backedge phi slot coalescing
+  │  peephole: target-specific text passes (FP round-trips, mem folds, copy prop, …)
+  │  standalone assembler + linker (no external toolchain)
+  ▼
+ELF executable
 ```
 
-This produces five binaries in `target/release/`, all compiled from the same
-source. The target architecture is selected by the binary name at runtime:
+---
 
-| Binary | Target |
-|--------|--------|
-| `ccc` | x86-64 (default) |
-| `ccc-x86` | x86-64 |
-| `ccc-arm` | AArch64 |
-| `ccc-riscv` | RISC-V 64 |
-| `ccc-i686` | i686 (32-bit x86) |
+## Benchmarks
 
-## Quick Start
+18-benchmark suite, LCCC vs GCC -O2, best-of-9 wall-clock, AArch64 Linux (same-run ratios).
+All 18 outputs are byte-identical to GCC.
 
-Compile and run a simple C program:
+| Benchmark | LCCC | GCC -O2 | LCCC / GCC |
+|-----------|-----:|--------:|:----------:|
+| `arith_loop` — 32-var arithmetic loop | 0.034 s | 0.030 s | 1.12× |
+| `fib` — fib(40) recursive | <0.001 s | 0.090 s | **~600× faster** |
+| `matmul` — 256×256 matrix multiply | 0.0025 s | 0.0029 s | **1.15× faster** |
+| `qsort` — quicksort 1M integers | 0.070 s | 0.071 s | **1.02× faster** |
+| `sieve` — Eratosthenes 10M | 0.017 s | 0.016 s | 1.06× |
+| `tce_sum` — tail-recursive sum(10M) | 0.0001 s | 0.0001 s | 1.0× (GCC const-folds it) |
+| `nbody` — N-body simulation | 0.185 s | 0.165 s | 1.12× |
+| `binary_trees` — malloc/free recursion | 0.848 s | 0.751 s | 1.13× |
+| `spectral_norm` — FP dense loops | 0.133 s | 0.133 s | **1.0× (parity)** |
+| `mandelbrot` — FP inner loop | 0.553 s | 0.491 s | 1.13× |
+| `hash_table` — pointer chasing | 8.62 s | 7.91 s | 1.09× |
+| `strlen_bench` — string processing | 0.145 s | 0.140 s | 1.04× |
+| `switch_dispatch` — jump tables | 0.404 s | 0.350 s | 1.16× |
+| `struct_copy` — struct copy/field access | 0.013 s | 0.012 s | 1.10× |
+| `loop_patterns` — reduce/transform/prefix | 0.032 s | 0.032 s | **1.0× (parity)** |
+| `fannkuch` — Fannkuch-Redux | 2.010 s | 1.973 s | 1.02× |
+| `ackermann` — ackermann(3,11) | <0.001 s | 0.098 s | **~600× faster** |
+| `bitops` — popcount/clz/reverse | 0.089 s | 0.169 s | **1.9× faster** |
+
+**Geometric mean: 0.49× of GCC -O2** overall — skewed by the two ~600×
+recursion-to-iteration wins; excluding those, **1.01× (statistical parity)**
+across the remaining 16.
+
+What drives the wins:
+
+- **fib / ackermann ~600×**: binary recursion-to-iteration converts exponential O(2^n)
+  recursion into an O(n) iterative sliding-window loop. GCC keeps the recursive calls.
+- **matmul 1.17× faster**: NEON FMA vectorization on AArch64 (AVX2 FMA3 on x86-64), with
+  loop-aware inlining and F64 accumulators promoted into FP registers across the inner loop.
+- **loop_patterns 1.83× → parity** (recent work): NEON reduction vectorization now covers
+  plain sums, i32→i64 widening sums (sadalp), dot products (smlal/smlal2 with split
+  accumulators), conditional sums (`smax` clamp), and max reductions (`smax`/`smaxv`).
+- **fannkuch 2.7× → 1.03×, arith_loop 2.1× → 1.12×**: a post-scan *register
+  steal* gives hot inner-loop-carried values (IVs, accumulators, carried pointers) callee-saved
+  registers that cold function-spanning values would otherwise win purely by starting first —
+  done as a conflict-safe full deallocation of the evicted holder, never range splitting.
+  *Loop-backedge slot coalescing* gives a spilled loop variable's update the variable's own
+  stack slot (proven safe by the phi-coalesce detector), deleting the per-iteration
+  `ldr`+`str` shuffle.
+- **mandelbrot 1.32× → 1.13×, nbody 1.31× → 1.12×**: loop-phi anti-dependency
+  splitting moves the old-value copy off the FP recurrence's serial chain, reverse FP
+  phi coalescing gives copy-web accumulators the backedge source's register when
+  conflict-free, and *backedge PRE* carries a loop-bottom expression (mandelbrot's
+  `zr²`) into the matching loop-top use through a new phi — one `fmul` fewer per
+  iteration, the shape GCC reaches via loop rotation + CSE.
+- **sieve 1.16× → 1.06×**: the prime-count loop is dispatch/branch-throughput bound,
+  and a `csinc` peephole (increment-feeding-`csel` fusion) removed enough dispatch
+  slots to bring it from 2× GCC's per-iteration cost to parity.
+- **qsort 1.12× → faster than GCC**: small leaf functions scan the caller-saved pool
+  first — the hot `cmp` callback no longer pays a five-pair save/restore storm per call.
+  Callee-saves are also shrink-wrapped past clean early returns (binary_trees' null path).
+- **struct_copy 2.31× → 1.08×**: aggregate memcpy-temp forwarding, full unrolling of small
+  constant-trip loops, and ldp/stp adjacent-field pair fusion.
+- **bitops 1.8× faster than GCC**: popcount/clz/reverse lower to single AArch64 instructions.
+
+**Compile time:** LCCC compiles **2–5× faster** than GCC across all benchmarks.
+
+### Running the suites
 
 ```bash
-# Write a test program
-cat > hello.c << 'EOF'
-#include <stdio.h>
-int main(void) {
-    printf("Hello from CCC!\n");
-    return 0;
-}
-EOF
+# Full 18-benchmark suite (performance + correctness + size)
+python3 tests/benchmark/run_benchmarks.py --reps 5
 
-# Compile and run (x86-64)
-./target/release/ccc -o hello hello.c
+# 50-test correctness suite
+python3 tests/correctness/run_correctness.py
+
+# Progressive feature tests (levels 1–8)
+python3 tests/integration/test_progressive.py
+```
+
+---
+
+## Real-World Compatibility
+
+LCCC compiles and **fully runs** the SQLite amalgamation (260K lines, single file):
+CREATE TABLE, INSERT/UPDATE/DELETE, SELECT with WHERE/ORDER BY/LIMIT, JOINs, correlated and
+uncorrelated subqueries, GROUP BY/HAVING, aggregates, UNION ALL, transactions, and prepared
+statements all work.
+
+An [independent benchmark](https://github.com/harshavmb/compare-claude-compiler) found the
+original CCC was 737× slower than GCC on SQLite. LCCC addresses every major issue identified:
+
+| CCC issue | LCCC status |
+|-----------|-------------|
+| No register allocation (shuttle %rax) | Linear scan, three register pools + loop-value steal |
+| No optimization tiers (-O2 = -O0) | Full SSA optimization pipeline at -O2 |
+| No function inlining | Loop-aware inlining pass with heuristics |
+| No vectorization | AVX2/SSE2 on x86-64, NEON on AArch64 |
+| 2.78× code bloat | Down to ~1.7× GCC .text on SQLite |
+| 737× slower runtime | ~1.1× of GCC -O2 on the benchmark suite |
+| Corrupted frame pointers | CFI directives, frame pointer omission |
+
+Known correctness gaps are tracked by the test suites (5 failures in the 50-test correctness
+suite, 3 in the progressive suite — struct passing, designated initializers, multi-dim arrays,
+string arrays, typedef complexity, void-pointer arithmetic).
+
+---
+
+## Inside LCCC
+
+### Linear-scan register allocation
+
+CCC's three-phase greedy allocator considered only ~5% of IR values eligible; a 32-variable
+function got **zero** registers. LCCC runs a Poletto & Sarkar linear scan
+([`src/backend/live_range.rs`](src/backend/live_range.rs),
+[`src/backend/regalloc.rs`](src/backend/regalloc.rs)) over live intervals:
+
+- **Callee-saved pool** for all eligible values; **caller-saved pool** for values that don't
+  span a call; **FP/SIMD pool** for F64 accumulators and vector values (AArch64: d16–d31).
+- Uses are weighted by loop depth (10^depth), so inner-loop temporaries outrank straight-line
+  values.
+- **Post-scan register steal** (AArch64): hot loop-carried phi values the scan missed take a
+  register from the coldest conflicting holder, which is fully deallocated to the stack —
+  safe where in-scan eviction was not.
+- **Phi register coalescing**: a loop-carried phi and its backedge source share a register,
+  making the backedge copy a no-op.
+
+### Phi-copy stack-slot coalescing
+
+Spilled loop variables suffered a "double slot" problem: the phi dest and its backedge update
+each got a stack slot, with a load+store shuffle between them every iteration. The slot
+coalescer ([`src/backend/stack_layout/copy_coalescing.rs`](src/backend/stack_layout/copy_coalescing.rs))
+aliases the update into the phi dest's slot when the phi-coalesce detector proves the old value
+is dead — the backedge copy becomes a same-slot no-op. Multi-source phi webs (switch joins) are
+handled by a separate interference-checked phase.
+
+### SIMD vectorization
+
+- **x86-64**: SSE2 2-wide and AVX2 4-wide (FMA3) auto-vectorization for matmul-style loops and
+  reductions, with remainder loops for any trip count.
+- **AArch64**: NEON intrinsics and register-based F64x2/I32x4 vector ops, FP constant hoisting,
+  and F64 loop accumulators promoted into dedicated FP registers (d24–d31).
+
+### Loop transforms
+
+Tail-call elimination turns self-recursive tail calls into loops; recursion-to-iteration
+handles the binary-recursive cases (fib, ackermann). Loop unrolling, rotation, strength
+reduction (IVSR), LICM, and loop memory promotion run in the main SSA pipeline.
+
+### Peephole optimizers
+
+Each backend runs a text-level peephole pipeline over the emitted assembly (store/load
+forwarding, dead-move elimination, sign-extension fusion, memory-operand folding, indexed
+addressing). The optimizers are deliberately conservative — several latent miscompiles were
+found and fixed by auditing these passes.
+
+---
+
+## Getting started
+
+**Prerequisites:** Rust stable (2021 edition), a POSIX host.
+
+```bash
+git clone https://github.com/levkropp/lccc.git
+cd lccc
+cargo build --release
+# → target/release/lccc        (native target picked by host/argv[0])
+# → target/release/lccc-x86    (x86-64)
+# → target/release/lccc-arm    (AArch64)
+# → target/release/lccc-riscv  (RISC-V 64)
+# → target/release/lccc-i686   (i686)
+
+# Compile a C file (GCC's built-in headers are needed)
+GCC_INC="-I/usr/lib/gcc/x86_64-linux-gnu/$(gcc -dumpversion)/include"
+./target/release/lccc $GCC_INC -O2 -o hello hello.c
 ./hello
 
-# Cross-compile for AArch64 and run under QEMU
-./target/release/ccc-arm -o hello-arm hello.c
-qemu-aarch64 -L /usr/aarch64-linux-gnu ./hello-arm
+# Use as a drop-in GCC replacement
+make CC=/path/to/target/release/lccc
 ```
 
-CCC works as a drop-in GCC replacement. Point your build system at it:
+For cross-compilation targets install the matching sysroot
+(`aarch64-linux-gnu-gcc`, `riscv64-linux-gnu-gcc`). The target is selected by argv[0]:
+symlink or rename the binary (e.g. `aarch64-linux-gnu-cc`) to select that target.
+
+### GCC-compatible flags
 
 ```bash
-# Build a project with make
-make CC=/path/to/ccc-x86
-
-# Build a project with CMake
-cmake -DCMAKE_C_COMPILER=/path/to/ccc-x86 ..
-
-# Build a project with configure scripts
-./configure CC=/path/to/ccc-x86
+lccc -S input.c                    # emit assembly
+lccc -c input.c                    # compile to object file
+lccc -O2 -o output input.c         # optimize (-O0 through -O3, -Os, -Oz)
+lccc -g -o output input.c          # DWARF debug info
+lccc -DFOO=1 -Iinclude/ input.c    # macros + include paths
+lccc -fPIC -shared -o lib.so lib.c # position-independent code
 ```
 
-## Usage
+Unrecognized flags are silently ignored so `lccc` works as a drop-in in build systems.
 
-```bash
-# Compile and link
-ccc -o output input.c                # x86-64
-ccc-arm -o output input.c            # AArch64
-ccc-riscv -o output input.c          # RISC-V 64
-ccc-i686 -o output input.c           # i686
+### Environment variables
 
-# GCC-compatible flags
-ccc -S input.c                       # Emit assembly
-ccc -c input.c                       # Compile to object file
-ccc -E input.c                       # Preprocess only
-ccc -O2 -o output input.c            # Optimize (accepts -O0 through -O3, -Os, -Oz)
-ccc -g -o output input.c             # DWARF debug info
-ccc -DFOO=1 -Iinclude/ input.c       # Define macros, add include paths
-ccc -Werror -Wall input.c            # Warning control
-ccc -fPIC -shared -o lib.so lib.c    # Position-independent code
-ccc -x c -E -                        # Read from stdin
+| Variable | Effect |
+|----------|--------|
+| `CCC_TIME_PASSES` | Print per-pass timing and change counts to stderr |
+| `CCC_DISABLE_PASSES` | Disable passes by name (comma-separated, or `all`) |
+| `CCC_KEEP_ASM` | Keep intermediate `.s` files next to output |
+| `LCCC_DEBUG_VECTORIZE` | Print vectorization pattern matching details |
 
-# Build system integration (reports as GCC 14.2.0 for compatibility)
-ccc -dumpmachine     # x86_64-linux-gnu / aarch64-linux-gnu / riscv64-linux-gnu / i686-linux-gnu
-ccc -dumpversion     # 14
+Individual backend features have `CCC_NO_*` kill switches (e.g. `CCC_NO_LOOP_PIN`,
+`CCC_NO_LOOP_PHI_SLOT`, `CCC_NO_PEEPHOLE`, `CCC_NO_SLOT_COALESCE`) used for A/B benchmarking
+and miscompile bisection; grep for `CCC_` in `src/backend` for the full list.
+
+Pass names: `cfg`, `copyprop`, `narrow`, `simplify`, `constfold`, `gvn`, `licm`,
+`ifconv`, `dce`, `ipcp`, `inline`, `ivsr`, `divconst`, `tce`, `unroll`, `vectorize`.
+
+---
+
+## Project layout
+
+```
+src/
+  frontend/     C source → typed AST (preprocessor, lexer, parser, sema)
+  ir/           Target-independent SSA IR (lowering, mem2reg, analysis)
+  passes/       SSA optimization passes (27 passes + shared loop analysis)
+  backend/      IR → assembly → ELF (4 architectures)
+    live_range.rs     LinearScanAllocator
+    regalloc.rs       pools, phi register coalescing, loop-value steal
+    stack_layout/     tiered slot allocation, copy/slot coalescing
+    arm/ x86/ riscv/ i686/   per-target codegen + peephole
+  common/       Shared types, symbol table, diagnostics
+  driver/       CLI parsing, pipeline orchestration
+
+include/        Bundled C headers (SSE–AVX-512, AES-NI, FMA, SHA, BMI2; NEON)
+tests/          benchmark/ correctness/ integration/ regression/ suites
+
+docs/           Jekyll documentation site source
+updates/        Historical optimization write-ups (kept for the record)
 ```
 
-The compiler accepts most GCC flags. Unrecognized flags (e.g., architecture-
-specific `-m` flags, unknown `-f` flags) are silently ignored so `ccc` can
-serve as a drop-in GCC replacement in build systems.
+---
 
-### Assembler and Linker Modes
+## Roadmap
 
-By default, the compiler uses its **builtin assembler and linker** for all
-four architectures. No external toolchain is required. You can verify this
-with `--version`, which shows `Backend: standalone` when using the builtin
-tools.
+Current priorities, driven by the benchmark suite:
 
-To build with optional GCC fallback support (e.g., for debugging), enable
-Cargo features at compile time:
+- **fannkuch (1.85×)** — loop-nested live-range splitting: inner-loop scalars spill because
+  outer-loop values pin the GPR pool across the whole body
+- **mandelbrot / nbody (~1.3×)** — FP codegen: fewer GPR↔FP round-trips, better scheduling
+- **hash_table (1.25×)** — pointer-chasing load/store tightening
+- Correctness: close the 5 remaining correctness-suite failures (struct passing, designated
+  initializers, multi-dim arrays)
 
-```bash
-# Build with GCC assembler and linker fallback
-cargo build --release --features gcc_assembler,gcc_linker
+The goal is not to beat GCC — it's to make CCC-compiled programs fast enough for real systems
+software. Typical workloads now run within **~1.12× of GCC -O2**.
 
-# Build with GCC fallback for -m16 boot code only
-cargo build --release --features gcc_m16
-```
-
-| Feature | Description |
-|---------|-------------|
-| `gcc_assembler` | Use GCC as the assembler instead of the builtin |
-| `gcc_linker` | Use GCC as the linker instead of the builtin |
-| `gcc_m16` | Use GCC for `-m16` (16-bit real mode boot code) |
-
-When compiled with GCC fallback features enabled, `--version` shows which
-components use GCC (e.g., `Backend: gcc_assembler, gcc_linker`).
-
-## Status
-
-The compiler can build real-world C codebases across all four architectures,
-including the Linux kernel. Projects that compile and pass their test suites
-include PostgreSQL (all 237 regression tests), SQLite, QuickJS, zlib, Lua,
-libsodium, libpng, jq, libjpeg-turbo, mbedTLS, libuv, Redis, libffi, musl,
-TCC, and DOOM — all using the fully standalone assembler and linker with no
-external toolchain. Over 150 additional projects have also been built
-successfully, including FFmpeg (all 7331 FATE checkasm tests on x86-64 and
-AArch64), GNU coreutils, Busybox, CPython, QEMU, and LuaJIT.
-
-### Known Limitations
-
-- **Optimization levels**: All levels (`-O0` through `-O3`, `-Os`, `-Oz`) run
-  the same optimization pipeline. Separate tiers will be added as the compiler
-  matures.
-- **Long double**: x86 80-bit extended precision is supported via x87 FPU
-  instructions. On ARM/RISC-V, `long double` is IEEE binary128 via
-  compiler-rt/libgcc soft-float libcalls.
-- **Complex numbers**: `_Complex` arithmetic has some edge-case failures.
-- **GNU extensions**: Partial `__attribute__` support. NEON intrinsics are
-  partially implemented (core 128-bit operations work).
-- **Atomics**: `_Atomic` is parsed but treated as the underlying type (the
-  qualifier is not tracked through the type system).
+---
 
 ## Testing
 
-The compiler has two kinds of tests:
-
-**Unit tests** (in-source `#[test]` functions for individual passes and modules):
-
 ```bash
+# Unit tests (563 pass, 6 ignored)
 cargo test --release
+
+# Correctness suite (50 programs, vs GCC output)
+python3 tests/correctness/run_correctness.py
+
+# Progressive integration tests (levels 1–8)
+python3 tests/integration/test_progressive.py
+
+# Benchmark suite (18 programs, correctness + performance + size)
+python3 tests/benchmark/run_benchmarks.py --reps 5
 ```
 
-**Integration tests** (end-to-end compilation tests in `tests/`). Each test is
-a directory containing a `main.c` source file and expected output files:
+---
 
-```
-tests/
-  some-test-name/
-    main.c              # C source to compile
-    expected.stdout     # Expected stdout (if any)
-    expected.ret        # Expected exit code (if any)
-    expected.skip.arm   # Skip marker for specific architectures (optional)
-```
+## Licensing
 
-Tests are run by compiling `main.c` with `ccc`, executing the resulting binary,
-and comparing stdout and the exit code against the expected files.
+LCCC uses a dual-license model to separate original contributions from CCC-derived code.
 
-## Environment Variables
+**LCCC contributions** (new files, regalloc changes, benchmarks, docs) —
+MIT OR Apache-2.0 OR BSD-2-Clause (your choice). See `LICENSE-MIT`, `LICENSE-APACHE`, `LICENSE-BSD`.
 
-| Variable | Purpose |
-|----------|---------|
-| `CCC_TIME_PHASES` | Print per-phase compilation timing to stderr |
-| `CCC_TIME_PASSES` | Print per-pass optimization timing and change counts to stderr |
-| `CCC_DISABLE_PASSES` | Disable specific optimization passes (comma-separated, or `all`) |
-| `CCC_KEEP_ASM` | Preserve intermediate `.s` files next to output |
-| `CCC_ASM_DEBUG` | Dump preprocessed assembly to `/tmp/asm_debug_<name>.s` |
+**CCC-derived code** (frontend, SSA IR, optimizer, backends, assembler, linker) —
+CC0 1.0 Universal (public domain). CCC was released as CC0 by Anthropic.
 
-## Project Organization
-
-```
-src/                Compiler source code (Rust)
-  frontend/         C source -> typed AST (preprocessor, lexer, parser, sema)
-  ir/               Target-independent SSA IR (lowering, mem2reg)
-  passes/           SSA optimization passes (15 passes + shared loop analysis)
-  backend/          IR -> assembly -> machine code -> ELF (4 architectures)
-  common/           Shared types, symbol table, diagnostics
-  driver/           CLI parsing, pipeline orchestration
-
-include/            Bundled C headers (x86 SIMD: SSE through AVX-512, AES-NI, FMA, SHA, BMI2; ARM NEON)
-tests/              Compiler tests (each test is a directory with main.c and expected output)
-ideas/              Future work proposals and improvement notes
-```
-
-Each `src/` subdirectory has its own `README.md` with detailed design
-documentation. For the full architecture, compilation pipeline data flow,
-and key design decisions, see [DESIGN_DOC.md](DESIGN_DOC.md).
+See [`LICENSING.md`](LICENSING.md) for the full breakdown and per-file guidance.

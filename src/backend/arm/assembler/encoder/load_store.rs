@@ -288,6 +288,37 @@ pub(crate) fn encode_ldur_stur(operands: &[Operand], is_load: bool, op2_bits: u3
     Ok(EncodeResult::Word(word))
 }
 
+/// Encode unscaled GP loads/stores with explicit size/opc fields:
+/// ldurb/ldurh/ldursb/ldursh/ldursw and sturb/sturh.
+pub(crate) fn encode_ldur_gp(operands: &[Operand], size: u32, opc: u32) -> Result<EncodeResult, String> {
+    if operands.len() < 2 {
+        return Err("ldur/stur variant requires 2 operands".to_string());
+    }
+    let (rt, _) = get_reg(operands, 0)?;
+    let (rn, imm9) = match &operands[1] {
+        Operand::Mem { base, offset } => {
+            let rn = parse_reg_num(base).ok_or("invalid base reg")?;
+            (rn, *offset as i32)
+        }
+        _ => return Err("ldur/stur variant: expected memory operand".to_string()),
+    };
+    if !(-256..=255).contains(&imm9) {
+        return Err(format!("ldur/stur offset {} out of range (-256..=255)", imm9));
+    }
+    let imm9_enc = (imm9 as u32) & 0x1FF;
+    let word = (size << 30) | (0b111 << 27) | (opc << 22)
+        | (imm9_enc << 12) | (rn << 5) | rt;
+    Ok(EncodeResult::Word(word))
+}
+
+/// Encode signed unscaled loads (ldursb/ldursh): opc is 10 for the
+/// sign-extending-to-64-bit (x) form, 11 for the 32-bit (w) form.
+pub(crate) fn encode_ldurs_gp(operands: &[Operand], size: u32) -> Result<EncodeResult, String> {
+    let reg_name = match &operands[0] { Operand::Reg(r) => r.to_lowercase(), _ => String::new() };
+    let opc = if reg_name.starts_with('x') { 0b10 } else { 0b11 };
+    encode_ldur_gp(operands, size, opc)
+}
+
 /// Encode LDTR/STTR with explicit size (for ldtrh, ldtrb, etc.)
 pub(crate) fn encode_ldtr_sized(operands: &[Operand], is_load: bool, size: u32) -> Result<EncodeResult, String> {
     if operands.len() < 2 {

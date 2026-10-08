@@ -32,10 +32,18 @@ pub(super) fn line_references_reg_fast(info: &LineInfo, reg: RegId) -> bool {
 /// For example, replacing family 0 (rax) with family 1 (rcx) will convert:
 ///   %rax -> %rcx, %eax -> %ecx, %ax -> %cx, %al -> %cl
 pub(super) fn replace_reg_family(line: &str, old_id: RegId, new_id: RegId) -> String {
+    // REG_NAMES only covers GP register families 0-15.
+    // XMM/YMM registers (families 24-39) are not in REG_NAMES and must be
+    // skipped to avoid out-of-bounds access that corrupts instruction text.
+    if old_id as usize >= REG_NAMES[0].len() || new_id as usize >= REG_NAMES[0].len() {
+        return line.to_string();
+    }
     let mut result = line.to_string();
-    // Replace in order from longest to shortest to avoid partial matches.
-    // 64-bit names are longest (e.g., %r10, %rax), then 32-bit, 16-bit, 8-bit.
-    for size_idx in 0..4 {
+    // Replace in order from shortest to longest so that smaller sub-register
+    // names (e.g., %ebx→%ebp) are replaced before their 64-bit counterparts
+    // (%rbx→%rbp). This prevents 64-bit replacement from consuming a 32-bit
+    // operand, leaving the wrong register size in the output.
+    for size_idx in [3, 2, 1, 0] {
         let old_name = REG_NAMES[size_idx][old_id as usize];
         let new_name = REG_NAMES[size_idx][new_id as usize];
         if old_name == new_name {
@@ -97,9 +105,13 @@ pub(super) fn has_implicit_reg_usage(trimmed: &str) -> bool {
     if nb.len() < 3 {
         return false;
     }
-    (nb[0] == b'd' && nb[1] == b'i' && nb[2] == b'v') || // div, divl, divq
+    // Integer div/mul use implicit rax:rdx. Exclude SSE variants (divsd/mulsd/etc.)
+    // which start with div[sp] or mul[sp] — these have no implicit register usage.
+    (nb[0] == b'd' && nb[1] == b'i' && nb[2] == b'v'
+        && !(nb.len() > 3 && (nb[3] == b's' || nb[3] == b'p'))) || // div, divl, divq (not divsd/divpd)
     (nb[0] == b'i' && nb[1] == b'd' && nb[2] == b'i') || // idiv
-    (nb[0] == b'm' && nb[1] == b'u' && nb[2] == b'l') || // mul, mulq
+    (nb[0] == b'm' && nb[1] == b'u' && nb[2] == b'l'
+        && !(nb.len() > 3 && (nb[3] == b's' || nb[3] == b'p'))) || // mul, mulq (not mulsd/mulpd)
     trimmed.starts_with("cltq") || // sign-extend eax -> rax (implicit read+write rax)
     trimmed.starts_with("cbw") ||  // sign-extend al -> ax (implicit read+write rax)
     trimmed.starts_with("cqto") || trimmed.starts_with("cdq") ||

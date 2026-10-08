@@ -27,11 +27,25 @@ use super::{
 /// Determine if a non-alloca value can be assigned to a block-local pool slot (Tier 3).
 /// Returns `Some(def_block_idx)` if the value is defined and used only within a
 /// single block, making it safe to share stack space with values from other blocks.
+/// Maximum number of IR instructions in a block for Tier 3 greedy slot reuse.
+/// Above this threshold, the accumulator-based codegen's instruction ordering
+/// diverges too much from IR instruction order, making the greedy coloring's
+/// liveness analysis unreliable. Large blocks use Tier 2 (liveness-packed)
+/// which uses proper live interval computation instead.
+pub(super) const MAX_TIER3_BLOCK_INSTRUCTIONS: usize = 200;
+
 pub(super) fn coalescable_group(
     val_id: u32,
     ctx: &StackLayoutContext,
+    state: &crate::backend::state::CodegenState,
 ) -> Option<usize> {
     if !ctx.coalesce {
+        return None;
+    }
+    // Protected values (DynAlloca results, vector temps) must use Tier 2 (multi-block)
+    // to get permanent, non-reusable slots. Tier 3 (block-local) slots are shared
+    // across blocks via deferred finalization, which can cause aliasing issues.
+    if state.protected_slot_values.contains(&val_id) {
         return None;
     }
     // Values defined in multiple blocks (from phi elimination) must use Tier 2.
@@ -39,6 +53,14 @@ pub(super) fn coalescable_group(
         return None;
     }
     if let Some(&def_blk) = ctx.def_block.get(&val_id) {
+        // Values used as phi incoming must NOT be block-local because phi
+        // elimination places Copies at predecessor block ends. If the source
+        // value's slot was already reused (Tier 3 block-local), the phi Copy
+        // reads garbage. Check all blocks for phi references.
+        if ctx.phi_incoming_values.contains(&val_id) {
+            return None;
+        }
+
         if let Some(blocks) = ctx.use_blocks_map.get(&val_id) {
             let mut unique: Vec<usize> = blocks.clone();
             unique.sort_unstable();
@@ -49,7 +71,11 @@ pub(super) fn coalescable_group(
             }
 
             // Single-block value: defined and used in the same block.
+            // Skip Tier 3 for large blocks where greedy coloring is unreliable.
             if unique.len() == 1 && unique[0] == def_blk {
+                if ctx.large_blocks.contains(&def_blk) {
+                    return None; // Use Tier 2 for large blocks
+                }
                 return Some(def_blk);
             }
         } else {
@@ -400,7 +426,10 @@ fn classify_value(
         Some(IrType::I32) | Some(IrType::U32) |
         Some(IrType::F32)
     );
-    let slot_size: i64 = if is_i128 || is_f128 {
+    let is_vector = state.vector_values.contains(&dest.0);
+    let slot_size: i64 = if is_vector {
+        32 // AVX2 256-bit vectors need 32 bytes
+    } else if is_i128 || is_f128 {
         16
     } else {
         8
@@ -419,19 +448,62 @@ fn classify_value(
         }
     }
 
+    // Vector values from Vec* intrinsics need protected stack slots to prevent
+    // slot reuse from corrupting vector data during reduction vectorization.
+    // The vector_values set is populated by the backend's intrinsic emitters
+    // when they encounter VecZero*, VecLoad*, VecAdd*, etc. operations.
+    if state.vector_values.contains(&dest.0) {
+        state.protected_slot_values.insert(dest.0);
+    }
+
+    let debug_protect = std::env::var("LCCC_DEBUG_PROTECT").is_ok();
+
     // Skip register-assigned values (no stack slot needed).
     if reg_assigned.contains_key(&dest.0) {
+        if debug_protect && state.protected_slot_values.contains(&dest.0) {
+            eprintln!("[CLASSIFY] SSA {} is protected but register-assigned, skipping slot", dest.0);
+        }
         return;
     }
 
     // Skip dead values (defined but never used).
     if !ctx.used_values.contains(&dest.0) {
+        if debug_protect && state.protected_slot_values.contains(&dest.0) {
+            eprintln!("[CLASSIFY] SSA {} is protected but not in used_values, skipping slot", dest.0);
+        }
         return;
     }
 
     // Skip copy-aliased values (they'll share root's slot). Not for i128/f128.
-    if !is_i128 && !is_f128 && ctx.copy_alias.contains_key(&dest.0) {
-        return;
+    // Also don't skip protected values (vectors, DynAlloca results) - they need
+    // unique slots even if copy-aliased, to prevent corruption from slot reuse.
+    // Also don't skip multi-defined values (from phi elimination): they have
+    // complex liveness across blocks that makes slot sharing unsafe. The alias
+    // root might be block-local (Tier 3, reusable), but the multi-def value
+    // needs persistence across blocks.
+    let is_copy_aliased = ctx.copy_alias.contains_key(&dest.0);
+    let is_protected = state.protected_slot_values.contains(&dest.0);
+    let is_multi_def = ctx.multi_def_values.contains(&dest.0);
+    // Don't skip copy-aliased values that have cross-block uses: the alias
+    // root might be block-local (Tier 3, reusable), but this value needs
+    // its data to persist across blocks.
+    let has_cross_block_use = ctx.use_blocks_map.get(&dest.0)
+        .map(|blks| blks.iter().any(|&b| ctx.def_block.get(&dest.0).map_or(true, |&db| b != db)))
+        .unwrap_or(false);
+    // Always classify copy-aliased values into their own slots. The
+    // resolve_copy_aliases phase may later share the slot with the alias root
+    // when safe (no interference), but values must have their own fallback slot
+    // in case resolve_copy_aliases blocks the sharing due to liveness conflicts.
+    // Skipping classification here left values without any slot when sharing was
+    // blocked, causing them to get emergency slots that overlap with other values.
+    if !is_i128 && !is_f128 && !is_protected && !is_multi_def && !has_cross_block_use && is_copy_aliased {
+        if std::env::var("CCC_NO_SLOT_COALESCE").is_ok() {
+            // When slot coalescing is fully disabled, classify normally (fall through).
+        }
+        // Otherwise: fall through to normal classification — give the value its own slot.
+    }
+    if debug_protect && is_protected && is_copy_aliased {
+        eprintln!("[CLASSIFY] SSA {} is protected AND copy-aliased, allocating slot anyway", dest.0);
     }
 
     // Skip immediately-consumed values: produced and consumed in adjacent
@@ -460,7 +532,7 @@ fn classify_value(
         state.small_slot_values.insert(dest.0);
     }
 
-    if let Some(target_blk) = coalescable_group(dest.0, ctx) {
+    if let Some(target_blk) = coalescable_group(dest.0, ctx, state) {
         block_local_values.push(BlockLocalValue {
             dest_id: dest.0,
             slot_size,
@@ -481,6 +553,7 @@ fn classify_value(
 /// critical for functions like blake2s_compress_generic where macro expansion
 /// creates thousands of short-lived intermediates in a single loop body block.
 pub(super) fn assign_tier3_block_local_slots(
+    state: &crate::backend::state::CodegenState,
     func: &IrFunction,
     ctx: &StackLayoutContext,
     coalesce: bool,
@@ -617,10 +690,12 @@ pub(super) fn assign_tier3_block_local_slots(
     }
 
     // For each block, assign slots with greedy coloring.
+    let debug_protect = std::env::var("LCCC_DEBUG_PROTECT").is_ok();
     for (blk_idx, values) in &per_block {
         let mut active: Vec<(usize, i64, i64)> = Vec::new(); // (last_use, offset, size)
         let mut free_8: Vec<i64> = Vec::new();
         let mut free_16: Vec<i64> = Vec::new();
+        let mut free_32: Vec<i64> = Vec::new();
         let mut block_peak: i64 = block_space.get(blk_idx).copied().unwrap_or(0);
 
         for &(dest_id, slot_size) in values {
@@ -631,19 +706,28 @@ pub(super) fn assign_tier3_block_local_slots(
             while i < active.len() {
                 if active[i].0 < my_def {
                     let (_, off, sz) = active.swap_remove(i);
-                    if sz == 16 { free_16.push(off); } else { free_8.push(off); }
+                    if sz >= 32 { free_32.push(off); } else if sz == 16 { free_16.push(off); } else { free_8.push(off); }
                 } else {
                     i += 1;
                 }
             }
 
             // Try to reuse a freed slot of matching size.
-            let free_list = if slot_size == 16 { &mut free_16 } else { &mut free_8 };
-            let offset = if let Some(reused) = free_list.pop() {
+            // Protected values (DynAlloca results, vector temps) must get unique slots.
+            let can_reuse = !state.protected_slot_values.contains(&dest_id);
+            let free_list = if slot_size >= 32 { &mut free_32 } else if slot_size == 16 { &mut free_16 } else { &mut free_8 };
+            let offset = if can_reuse && free_list.len() > 0 {
+                let reused = free_list.pop().unwrap();
+                if debug_protect {
+                    eprintln!("[PROTECT-T3] SSA {} reused block-local slot {}", dest_id, reused);
+                }
                 reused
             } else {
                 let off = block_peak;
                 block_peak += slot_size;
+                if debug_protect && !can_reuse {
+                    eprintln!("[PROTECT-T3] SSA {} is protected, forced new slot at offset {}", dest_id, off);
+                }
                 off
             };
 
@@ -682,8 +766,12 @@ pub(super) fn assign_tier2_liveness_packed_slots(
         return;
     }
 
-    if !coalesce {
-        // Fallback: permanent slots for all multi-block values.
+    // Disable Tier 2 liveness-packed slot sharing — always use permanent slots.
+    // The liveness intervals from compute_live_intervals don't perfectly model
+    // the accumulator-based codegen's spill ordering, causing slot collisions
+    // in large functions like SQLite's. Using permanent (non-shared) slots for
+    // multi-block values is safe and the extra stack space is manageable.
+    {
         for mbv in multi_block_values {
             let (slot, new_space) = assign_slot(*non_local_space, mbv.slot_size, 0);
             state.value_locations.insert(mbv.dest_id, StackSlot(slot));
@@ -705,9 +793,12 @@ pub(super) fn assign_tier2_liveness_packed_slots(
     let mut values_16: Vec<(u32, u32, u32)> = Vec::new();
     let mut no_interval: Vec<(u32, i64)> = Vec::new();
 
+    let mut values_32: Vec<(u32, u32, u32)> = Vec::new();
     for mbv in multi_block_values {
         if let Some(&(start, end)) = interval_map.get(&mbv.dest_id) {
-            if mbv.slot_size == 16 {
+            if mbv.slot_size >= 32 {
+                values_32.push((mbv.dest_id, start, end));
+            } else if mbv.slot_size == 16 {
                 values_16.push((mbv.dest_id, start, end));
             } else {
                 values_8.push((mbv.dest_id, start, end));
@@ -719,6 +810,7 @@ pub(super) fn assign_tier2_liveness_packed_slots(
 
     pack_values_into_slots(&mut values_8, state, non_local_space, 8, assign_slot);
     pack_values_into_slots(&mut values_16, state, non_local_space, 16, assign_slot);
+    pack_values_into_slots(&mut values_32, state, non_local_space, 32, assign_slot);
 
     // Assign permanent slots for values without interval info.
     for (dest_id, size) in no_interval {
@@ -749,19 +841,37 @@ fn pack_values_into_slots(
     let mut heap: BinaryHeap<Reverse<(u32, usize)>> = BinaryHeap::new();
     let mut slot_offsets: Vec<i64> = Vec::new();
 
+    let debug_protect = std::env::var("LCCC_DEBUG_PROTECT").is_ok();
     for &(dest_id, start, end) in values.iter() {
-        if let Some(&Reverse((slot_end, slot_idx))) = heap.peek() {
-            if slot_end < start {
-                heap.pop();
-                let slot_offset = slot_offsets[slot_idx];
-                heap.push(Reverse((end, slot_idx)));
-                state.value_locations.insert(dest_id, StackSlot(slot_offset));
-                continue;
+        // Protected values (DynAlloca results, vector temps) must get unique slots.
+        // These values hold critical pointers or data that must not be overwritten
+        // by slot reuse, even if liveness analysis suggests they're dead.
+        let can_reuse = !state.protected_slot_values.contains(&dest_id);
+
+        if debug_protect && !can_reuse {
+            eprintln!("[PROTECT-T2] SSA {} is protected, forcing new slot (size={})", dest_id, slot_size);
+        }
+
+        if can_reuse {
+            if let Some(&Reverse((slot_end, slot_idx))) = heap.peek() {
+                if slot_end <= start {
+                    heap.pop();
+                    let slot_offset = slot_offsets[slot_idx];
+                    heap.push(Reverse((end, slot_idx)));
+                    state.value_locations.insert(dest_id, StackSlot(slot_offset));
+                    if debug_protect {
+                        eprintln!("[PROTECT-T2] SSA {} reused slot {}", dest_id, slot_offset);
+                    }
+                    continue;
+                }
             }
         }
         let slot_idx = slot_offsets.len();
         let (slot, new_space) = assign_slot(*non_local_space, slot_size, 0);
         state.value_locations.insert(dest_id, StackSlot(slot));
+        if debug_protect {
+            eprintln!("[PROTECT-T2] SSA {} assigned new slot {} (protected={})", dest_id, slot, !can_reuse);
+        }
         *non_local_space = new_space;
         slot_offsets.push(slot);
         heap.push(Reverse((end, slot_idx)));
@@ -816,27 +926,95 @@ pub(super) fn finalize_deferred_slots(
 pub(super) fn resolve_copy_aliases(
     state: &mut crate::backend::state::CodegenState,
     copy_alias: &FxHashMap<u32, u32>,
+    phi_web_aliases: &FxHashSet<u32>,
+    loop_phi_aliases: &FxHashSet<u32>,
+    func: &crate::ir::reexports::IrFunction,
 ) {
-    for (&dest_id, &root_id) in copy_alias {
-        if let Some(&slot) = state.value_locations.get(&root_id) {
-            state.value_locations.insert(dest_id, slot);
+    // Build liveness intervals for interference checking.
+    // We use a lightweight approach: compute def-point and last-use-point for
+    // each value by scanning all instructions. Two values interfere if their
+    // [def, last_use] intervals overlap.
+    let mut def_point: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut last_use: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut point: u32 = 0;
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            // Record definition point
+            if let Some(dest) = inst.dest() {
+                def_point.entry(dest.0).or_insert(point);
+            }
+            // Record uses
+            inst.for_each_used_value(|vid| {
+                last_use.insert(vid, point);
+            });
+            point += 1;
         }
-        // Propagate small-slot property: if the root uses a 4-byte slot,
-        // the aliased copy must also use 4-byte store/load to avoid overflow.
+        // Terminator uses
+        block.terminator.for_each_used_value(|vid| {
+            last_use.insert(vid, point);
+        });
+        point += 1;
+    }
+
+    for (&dest_id, &root_id) in copy_alias {
+        // For phi-web coalesced values, force-overwrite the existing slot with
+        // the root's slot. These values were checked for interference during
+        // phi-web analysis and are safe to share. Loop-backedge phi aliases are
+        // likewise certified (by detect_phi_coalesce_groups) and must also
+        // overwrite the Tier-3 slot the backedge source already received.
+        if !phi_web_aliases.contains(&dest_id) && !loop_phi_aliases.contains(&dest_id) {
+            // For non-phi-web aliases, skip values that already have slots.
+            if state.value_locations.contains_key(&dest_id) {
+                continue;
+            }
+        }
+
+        // Skip non-phi-web aliases when slot coalescing is disabled.
+        // Copy aliases can incorrectly share slots between values with
+        // different lifetimes in complex functions (e.g., sqlite3_str_vappendf).
+        // Phi-web aliases have been verified for interference during analysis.
+        // Skip ALL copy aliases when slot coalescing is disabled.
+        // Both regular and phi-web aliases can cause slot collisions
+        // in large functions like sqlite3_str_vappendf (24KB, 500+ locals).
+        if std::env::var("CCC_NO_SLOT_COALESCE").is_ok() {
+            continue;
+        }
+
+        // Liveness-based interference check for copy alias coalescing.
+        if let Some(&slot) = state.value_locations.get(&root_id) {
+            // Loop-backedge phi aliases are certified by
+            // detect_phi_coalesce_groups: the phi dest (root) is provably dead
+            // after the backedge source (dest) is defined, so the generic
+            // def/last-use check — which conservatively rejects them because
+            // the phi dest is used again on later iterations — does not apply.
+            if std::env::var("CCC_DEBUG_LOOP_PHI").is_ok() && loop_phi_aliases.contains(&dest_id) {
+                eprintln!(
+                    "[LOOP_PHI-RESOLVE] dest=v{} root=v{} slot={} certified",
+                    dest_id, root_id, slot.0
+                );
+            }
+            if !loop_phi_aliases.contains(&dest_id) {
+                let dest_def = def_point.get(&dest_id).copied().unwrap_or(u32::MAX);
+                let root_last = last_use.get(&root_id).copied().unwrap_or(0);
+                if dest_def <= root_last {
+                    continue; // Root still live when dest is defined
+                }
+            }
+            state.value_locations.insert(dest_id, slot);
+        } else {
+            continue;
+        }
+        // Propagate small-slot property
         if state.small_slot_values.contains(&root_id) {
             state.small_slot_values.insert(dest_id);
         }
-        // Propagate alloca status: if root is an alloca, the aliased copy
-        // must also be recognized as an alloca so codegen computes the
-        // stack address instead of loading from the slot.
+        // Propagate alloca status
         if state.alloca_values.contains(&root_id) {
             state.alloca_values.insert(dest_id);
         }
         if let Some(&align) = state.alloca_alignments.get(&root_id) {
             state.alloca_alignments.insert(dest_id, align);
         }
-        // If root has no slot (optimized away or reg-assigned), the aliased
-        // value also gets no slot. The Copy works via accumulator path.
     }
 }
 

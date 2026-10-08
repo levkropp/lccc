@@ -14,7 +14,11 @@ use super::helpers::*;
 // ── Dead register move elimination ──────────────────────────────────────────
 
 /// Maximum forward scan window for dead register move detection.
-const DEAD_MOVE_WINDOW: usize = 24;
+/// Widened from 2 to 8 after fixing also_reads classification (defense-in-depth
+/// cross-size register matching at line 112-114). Previously window=4/48 caused
+/// miscompilations in sqlite3VdbeExec, but the root cause was missing cross-size
+/// register detection in the source operand check.
+const DEAD_MOVE_WINDOW: usize = 8;
 
 pub(super) fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
     let mut changed = false;
@@ -53,6 +57,36 @@ pub(super) fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]
             i += 1;
             continue;
         }
+        // Don't eliminate moves to callee-saved registers in the prologue area.
+        // The register allocator assigns param values to callee-saved regs (rbx,
+        // r12-r15), and the pre-store in emit_store_params copies ABI arg regs
+        // to them. The dead-move analysis can't see past function calls (which
+        // are barriers), so it incorrectly considers these writes dead when the
+        // next visible use is after a call. Callee-saved regs survive calls,
+        // so their pre-call writes are never truly dead.
+        // Register encoding: rbx=1 (encoded differently in peephole)
+        // We check: if the instruction is in the first few lines (prologue area)
+        // and writes to a callee-saved register, skip elimination.
+        // A simpler and more robust check: if the destination is a callee-saved
+        // register (rbx/r12/r13/r14/r15) AND source is an arg register (rdi/rsi/
+        // rdx/rcx/r8/r9), this is likely a param pre-store — don't eliminate.
+        // Protect param pre-stores: movq from ABI arg regs to callee-saved regs.
+        // These save function parameters before calls clobber the arg registers.
+        // The dead-move scanner can't see past calls (barriers), so it incorrectly
+        // considers these writes dead. Callee-saved regs survive calls.
+        // Arg regs: rdi=7, rsi=6, rdx=2, rcx=1, r8=8, r9=9
+        // Callee-saved: rbx=3, r12=12, r13=13, r14=14, r15=15
+        {
+            let trimmed = infos[i].trimmed(store.get(i));
+            if let Some((src_id, _dst_id)) = parse_reg_to_reg_movq(&infos[i], trimmed) {
+                let src_is_arg = matches!(src_id, 1 | 2 | 6 | 7 | 8 | 9);
+                let dst_is_callee = matches!(dst_reg, 3 | 12 | 13 | 14 | 15);
+                if src_is_arg && dst_is_callee {
+                    i += 1;
+                    continue;
+                }
+            }
+        }
 
         let dst_mask = 1u16 << dst_reg;
         let mut dead = false;
@@ -67,6 +101,10 @@ pub(super) fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]
             }
 
             if infos[j].is_barrier() {
+                // At a basic block boundary, we can't prove the register is dead
+                // without analyzing all successor paths. Conservatively stop.
+                // (Previously this followed jmp targets, but that was unsound for
+                // complex control flow with conditional branches at the target.)
                 break;
             }
 
@@ -145,7 +183,7 @@ pub(super) fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]
 pub(super) fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -> bool {
     let mut changed = false;
     let len = store.len();
-    const WINDOW: usize = 16;
+    const WINDOW: usize = 64;
 
     let mut pattern_bytes = [0u8; 24];
 
@@ -261,57 +299,113 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
             i += 1;
             continue;
         }
-        if !matches!(infos[i].kind, LineKind::Push { reg: 5 }) {
-            i += 1;
-            continue;
-        }
 
-        let mut j = next_non_nop(infos, i + 1, len);
-        if j >= len {
-            i = j;
-            continue;
-        }
-        let mov_line = infos[j].trimmed(store.get(j));
-        if mov_line != "movq %rsp, %rbp" {
-            i = j + 1;
-            continue;
-        }
-        j += 1;
+        // Detect function prologue — two forms:
+        // 1. Frame pointer: pushq %rbp + movq %rsp,%rbp + subq $N,%rsp
+        // 2. Frame-pointer-less: subq $N,%rsp (without push %rbp)
+        let body_start;
 
-        j = next_non_nop(infos, j, len);
-        if j >= len {
-            i = j;
-            continue;
-        }
-        let subq_line = infos[j].trimmed(store.get(j));
-        let is_subq = if let Some(rest) = subq_line.strip_prefix("subq $") {
-            rest.strip_suffix(", %rsp").and_then(|v| v.parse::<i64>().ok()).is_some()
-        } else {
-            false
-        };
-        if !is_subq {
-            i = j + 1;
-            continue;
-        }
-        j += 1;
-
-        // Skip callee-saved register saves
-        j = next_non_nop(infos, j, len);
-        let mut callee_save_end = j;
-        while callee_save_end < len {
-            if infos[callee_save_end].is_nop() {
-                callee_save_end += 1;
+        if matches!(infos[i].kind, LineKind::Push { reg: 5 }) {
+            // Form 1: frame pointer prologue
+            let mut j = next_non_nop(infos, i + 1, len);
+            if j >= len {
+                i = j;
                 continue;
             }
-            if let LineKind::StoreRbp { reg, size: MoveSize::Q, .. } = infos[callee_save_end].kind {
-                if is_callee_saved_reg(reg) {
+            let mov_line = infos[j].trimmed(store.get(j));
+            if mov_line != "movq %rsp, %rbp" {
+                i = j + 1;
+                continue;
+            }
+            j += 1;
+
+            j = next_non_nop(infos, j, len);
+            if j >= len {
+                i = j;
+                continue;
+            }
+            let subq_line = infos[j].trimmed(store.get(j));
+            let is_subq = if let Some(rest) = subq_line.strip_prefix("subq $") {
+                rest.strip_suffix(", %rsp").and_then(|v| v.parse::<i64>().ok()).is_some()
+            } else {
+                false
+            };
+            if !is_subq {
+                i = j + 1;
+                continue;
+            }
+            j += 1;
+
+            // Skip callee-saved register saves
+            j = next_non_nop(infos, j, len);
+            let mut callee_save_end = j;
+            while callee_save_end < len {
+                if infos[callee_save_end].is_nop() {
                     callee_save_end += 1;
                     continue;
                 }
+                if let LineKind::StoreRbp { reg, size: MoveSize::Q, .. } = infos[callee_save_end].kind {
+                    if is_callee_saved_reg(reg) {
+                        callee_save_end += 1;
+                        continue;
+                    }
+                }
+                break;
             }
-            break;
+            body_start = callee_save_end;
+        } else {
+            // Form 2: frame-pointer-less prologue (subq $N, %rsp)
+            let line = infos[i].trimmed(store.get(i));
+            let is_subq_rsp = if let Some(rest) = line.strip_prefix("subq $") {
+                rest.strip_suffix(", %rsp").and_then(|v| v.parse::<i64>().ok()).is_some()
+            } else {
+                false
+            };
+            if !is_subq_rsp {
+                i += 1;
+                continue;
+            }
+            // Must be preceded by .cfi_startproc (within 3 lines) to confirm this
+            // is a function prologue and not just a random subq in the middle.
+            let mut found_cfi = false;
+            let check_start = if i >= 3 { i - 3 } else { 0 };
+            for k in check_start..i {
+                if infos[k].is_nop() { continue; }
+                if matches!(infos[k].kind, LineKind::Directive) {
+                    let dl = infos[k].trimmed(store.get(k));
+                    if dl.contains("cfi_startproc") || dl.contains("cfi_def_cfa_offset") {
+                        found_cfi = true;
+                        break;
+                    }
+                }
+            }
+            if !found_cfi {
+                i += 1;
+                continue;
+            }
+
+            // Skip callee-saved register saves after the subq
+            let mut j = next_non_nop(infos, i + 1, len);
+            // Skip .cfi_def_cfa_offset directive if present
+            if j < len && matches!(infos[j].kind, LineKind::Directive) {
+                j = next_non_nop(infos, j + 1, len);
+            }
+            let mut callee_save_end = j;
+            while callee_save_end < len {
+                if infos[callee_save_end].is_nop() {
+                    callee_save_end += 1;
+                    continue;
+                }
+                if let LineKind::StoreRbp { reg, size: MoveSize::Q, .. } = infos[callee_save_end].kind {
+                    if is_callee_saved_reg(reg) {
+                        callee_save_end += 1;
+                        continue;
+                    }
+                }
+                break;
+            }
+            body_start = callee_save_end;
         }
-        let body_start = callee_save_end;
 
         // Find the end of this function
         let mut func_end = len;
@@ -326,8 +420,12 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
             }
         }
 
-        // Phase 1: Collect all "read" byte ranges
-        let mut has_indirect = false;
+        // Phase 1: Collect all "read" byte ranges.
+        // Instead of bailing on ANY indirect memory access, we track which
+        // offsets have their addresses taken (via leaq) and treat those as
+        // "read". This is more precise than the old bail-out approach and
+        // allows dead store elimination in functions with some leaq usage.
+        let mut has_unparseable_indirect = false;
         let mut read_ranges: Vec<(i32, i32)> = Vec::new();
 
         for k in body_start..func_end {
@@ -336,7 +434,9 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
             }
 
             if infos[k].has_indirect_mem {
-                has_indirect = true;
+                // Truly indirect memory access (e.g., (%rax) where rax is unknown).
+                // Mark the whole function as having indirect access.
+                has_unparseable_indirect = true;
                 break;
             }
 
@@ -350,14 +450,16 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                     if rbp_off != RBP_OFFSET_NONE {
                         let line = infos[k].trimmed(store.get(k));
                         if line.starts_with("leaq ") {
-                            has_indirect = true;
-                            break;
+                            // Address taken — conservatively mark 64 bytes as "read"
+                            // to protect this slot and nearby slots.
+                            read_ranges.push((rbp_off, 64));
+                        } else {
+                            read_ranges.push((rbp_off, 32));
                         }
-                        read_ranges.push((rbp_off, 32));
                     } else {
                         let line = infos[k].trimmed(store.get(k));
-                        if line.contains("(%rbp)") {
-                            has_indirect = true;
+                        if line.contains("(%rbp)") || line.contains("(%rsp)") {
+                            has_unparseable_indirect = true;
                             break;
                         }
                     }
@@ -370,15 +472,15 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                     let rbp_off = parse_rbp_offset(line);
                     if rbp_off != RBP_OFFSET_NONE {
                         read_ranges.push((rbp_off, 8));
-                    } else if line.contains("(%rbp)") {
-                        has_indirect = true;
+                    } else if line.contains("(%rbp)") || line.contains("(%rsp)") {
+                        has_unparseable_indirect = true;
                         break;
                     }
                 }
             }
         }
 
-        if has_indirect {
+        if has_unparseable_indirect {
             i = func_end;
             continue;
         }

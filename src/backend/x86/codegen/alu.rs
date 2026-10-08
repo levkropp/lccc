@@ -76,11 +76,11 @@ impl X86Codegen {
             let is_simple_alu = matches!(op, IrBinOp::Add | IrBinOp::Sub | IrBinOp::And
                 | IrBinOp::Or | IrBinOp::Xor | IrBinOp::Mul);
             if is_simple_alu {
-                self.emit_alu_reg_direct(op, lhs, rhs, dest_phys, use_32bit, is_unsigned);
+                self.emit_alu_reg_direct(op, lhs, rhs, dest_phys, use_32bit, is_unsigned, dest.0);
                 return;
             }
             if matches!(op, IrBinOp::Shl | IrBinOp::AShr | IrBinOp::LShr) {
-                self.emit_shift_reg_direct(op, lhs, rhs, dest_phys, use_32bit, is_unsigned);
+                self.emit_shift_reg_direct(op, lhs, rhs, dest_phys, use_32bit, is_unsigned, dest.0);
                 return;
             }
         }
@@ -90,8 +90,111 @@ impl X86Codegen {
             return;
         }
 
+        // Memory-destination ALU: for in-place updates (a op= expr) where dest/lhs share
+        // a stack slot. Emits `op %reg, mem` or `op $imm, mem` which does NOT modify
+        // any register — breaks the serial %rax dependency chain for ILP.
+        // Works for Add, Sub, And, Or, Xor (all have reg/imm-to-memory forms on x86).
+        let mem_dest_mnem = match op {
+            IrBinOp::Add => Some("add"),
+            IrBinOp::Sub => Some("sub"),
+            IrBinOp::And => Some("and"),
+            IrBinOp::Or  => Some("or"),
+            IrBinOp::Xor => Some("xor"),
+            _ => None,
+        };
+        if let Some(mnem) = mem_dest_mnem {
+            if let Operand::Value(lhs_val) = lhs {
+                if self.dest_reg(dest).is_none() && self.dest_reg(lhs_val).is_none() {
+                    if let (Some(dest_slot), Some(lhs_slot)) =
+                        (self.state.get_slot(dest.0), self.state.get_slot(lhs_val.0))
+                    {
+                        if dest_slot.0 == lhs_slot.0 {
+                            let sref = self.slot_ref(dest_slot.0);
+                            // Try register source: op %reg, mem
+                            if let Some(rhs_phys) = self.operand_reg(rhs) {
+                                if use_32bit {
+                                    let rhs_32 = super::emit::phys_reg_name_32(rhs_phys);
+                                    self.state.emit_fmt(format_args!("    {}l %{}, {}", mnem, rhs_32, sref));
+                                } else {
+                                    let rhs_64 = super::emit::phys_reg_name(rhs_phys);
+                                    self.state.emit_fmt(format_args!("    {}q %{}, {}", mnem, rhs_64, sref));
+                                }
+                                // NO cache invalidation — op %reg,mem doesn't modify any register
+                                return;
+                            }
+                            // Try immediate source: op $imm, mem
+                            if let Some(imm) = Self::const_as_imm32(rhs) {
+                                if use_32bit {
+                                    self.state.emit_fmt(format_args!("    {}l ${}, {}", mnem, imm, sref));
+                                } else {
+                                    self.state.emit_fmt(format_args!("    {}q ${}, {}", mnem, imm, sref));
+                                }
+                                // NO cache invalidation — op $imm,mem doesn't modify any register
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Memory-operand optimization: for ALU ops with memory source form,
+        // use memory source directly instead of loading rhs into %rcx first.
+        // Pattern: addq -N(%rbp), %rax  (saves one movq load instruction)
+        // For Mul: imull -N(%rbp), %eax  (2-operand form, does NOT use rdx)
+        // Extends to And/Or/Xor which have identical instruction forms.
+        let mem_op_mnem = match op {
+            IrBinOp::Add => Some("add"),
+            IrBinOp::Sub => Some("sub"),
+            IrBinOp::Mul => Some("imul"),
+            IrBinOp::And => Some("and"),
+            IrBinOp::Or  => Some("or"),
+            IrBinOp::Xor => Some("xor"),
+            _ => None,
+        };
+        if let Some(mnem) = mem_op_mnem {
+            if let Operand::Value(rhs_val) = rhs {
+                // Check if rhs has a stack slot and is NOT register-allocated
+                if self.dest_reg(&rhs_val).is_none() {
+                    if let Some(slot) = self.state.get_slot(rhs_val.0) {
+                        if use_32bit { self.operand_to_eax(lhs); } else { self.operand_to_rax(lhs); }
+                        let sref = self.slot_ref(slot.0);
+                        if use_32bit {
+                            self.state.emit_fmt(format_args!("    {}l {}, %eax", mnem, sref));
+                            self.store_eax_to(dest);
+                        } else {
+                            self.state.emit_fmt(format_args!("    {}q {}, %rax", mnem, sref));
+                            self.store_rax_to(dest);
+                        }
+                        return;
+                    }
+                }
+            }
+            // Also try memory-operand for lhs (swap: rhs to rax, lhs from memory)
+            // for commutative ops: Add, Mul, And, Or, Xor (NOT Sub — non-commutative)
+            let is_commutative = !matches!(op, IrBinOp::Sub);
+            if is_commutative {
+                if let Operand::Value(lhs_val) = lhs {
+                    if self.dest_reg(&lhs_val).is_none() {
+                        if let Some(slot) = self.state.get_slot(lhs_val.0) {
+                            if use_32bit { self.operand_to_eax(rhs); } else { self.operand_to_rax(rhs); }
+                            let sref = self.slot_ref(slot.0);
+                            if use_32bit {
+                                self.state.emit_fmt(format_args!("    {}l {}, %eax", mnem, sref));
+                                self.store_eax_to(dest);
+                            } else {
+                                self.state.emit_fmt(format_args!("    {}q {}, %rax", mnem, sref));
+                                self.store_rax_to(dest);
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
         // General case: load lhs to rax, rhs to rcx
-        self.operand_to_rax(lhs);
+        if use_32bit { self.operand_to_eax(lhs); } else { self.operand_to_rax(lhs); }
         self.operand_to_rcx(rhs);
 
         match op {
@@ -104,7 +207,6 @@ impl X86Codegen {
                 };
                 if use_32bit {
                     self.state.emit_fmt(format_args!("    {}l %ecx, %eax", mnem));
-                    if !is_unsigned { self.state.emit("    cltq"); }
                 } else {
                     self.state.emit_fmt(format_args!("    {}q %rcx, %rax", mnem));
                 }
@@ -113,7 +215,6 @@ impl X86Codegen {
                 if use_32bit {
                     self.state.emit("    cltd");
                     self.state.emit("    idivl %ecx");
-                    self.state.emit("    cltq");
                 } else {
                     self.state.emit("    cqto");
                     self.state.emit("    idivq %rcx");
@@ -129,7 +230,6 @@ impl X86Codegen {
                     self.state.emit("    cltd");
                     self.state.emit("    idivl %ecx");
                     self.state.emit("    movl %edx, %eax");
-                    self.state.emit("    cltq");
                 } else {
                     self.state.emit("    cqto");
                     self.state.emit("    idivq %rcx");
@@ -146,14 +246,22 @@ impl X86Codegen {
                     self.state.emit("    movq %rdx, %rax");
                 }
             }
-            IrBinOp::And => self.state.emit("    andq %rcx, %rax"),
-            IrBinOp::Or => self.state.emit("    orq %rcx, %rax"),
-            IrBinOp::Xor => self.state.emit("    xorq %rcx, %rax"),
+            IrBinOp::And => {
+                if use_32bit { self.state.emit("    andl %ecx, %eax"); }
+                else { self.state.emit("    andq %rcx, %rax"); }
+            }
+            IrBinOp::Or => {
+                if use_32bit { self.state.emit("    orl %ecx, %eax"); }
+                else { self.state.emit("    orq %rcx, %rax"); }
+            }
+            IrBinOp::Xor => {
+                if use_32bit { self.state.emit("    xorl %ecx, %eax"); }
+                else { self.state.emit("    xorq %rcx, %rax"); }
+            }
             IrBinOp::Shl | IrBinOp::AShr | IrBinOp::LShr => {
                 let (mnem32, mnem64) = shift_mnemonic(op);
                 if use_32bit {
                     self.state.emit_fmt(format_args!("    {} %cl, %eax", mnem32));
-                    if !is_unsigned && op != IrBinOp::LShr { self.state.emit("    cltq"); }
                 } else {
                     self.state.emit_fmt(format_args!("    {} %cl, %rax", mnem64));
                 }
@@ -161,7 +269,97 @@ impl X86Codegen {
         }
 
         self.state.reg_cache.invalidate_acc();
-        self.store_rax_to(dest);
+        if use_32bit { self.store_eax_to(dest); } else { self.store_rax_to(dest); }
+    }
+
+    /// Fused multiply-add: add_dest = acc + (mul_lhs * mul_rhs).
+    ///
+    /// Emits a 3-instruction sequence: load one mul operand to %eax, multiply
+    /// by the other (memory-source or register-source), then add %eax to the
+    /// accumulator (register-dest or memory-dest).
+    pub(super) fn emit_fused_mul_add_impl(
+        &mut self, _mul_dest: &Value,
+        mul_lhs: &Operand, mul_rhs: &Operand,
+        acc: &Operand, add_dest: &Value, ty: IrType,
+    ) {
+        let use_32bit = ty == IrType::I32 || ty == IrType::U32;
+
+        // Step 1: Compute mul_lhs * mul_rhs into %eax.
+        // Strategy: load one operand to %eax, imul the other (prefer memory-source).
+        if use_32bit { self.operand_to_eax(mul_lhs); } else { self.operand_to_rax(mul_lhs); }
+
+        // Try memory-source multiply for rhs
+        if let Operand::Value(rhs_val) = mul_rhs {
+            if self.dest_reg(rhs_val).is_none() {
+                if let Some(slot) = self.state.get_slot(rhs_val.0) {
+                    let sref = self.slot_ref(slot.0);
+                    if use_32bit {
+                        self.state.emit_fmt(format_args!("    imull {}, %eax", sref));
+                    } else {
+                        self.state.emit_fmt(format_args!("    imulq {}, %rax", sref));
+                    }
+                    // Fall through to add
+                    self.emit_fused_add_acc(acc, add_dest, use_32bit);
+                    return;
+                }
+            }
+        }
+
+        // Register-source multiply
+        self.operand_to_rcx(mul_rhs);
+        if use_32bit {
+            self.state.emit("    imull %ecx, %eax");
+        } else {
+            self.state.emit("    imulq %rcx, %rax");
+        }
+
+        self.emit_fused_add_acc(acc, add_dest, use_32bit);
+    }
+
+    /// Helper for fused mul-add: add %eax to the accumulator operand and store to dest.
+    fn emit_fused_add_acc(&mut self, acc: &Operand, add_dest: &Value, use_32bit: bool) {
+        // If add_dest is register-allocated, add %eax to it directly.
+        if let Some(dest_phys) = self.dest_reg(add_dest) {
+            // Ensure acc is in the dest register first
+            self.operand_to_callee_reg(acc, dest_phys);
+            if use_32bit {
+                self.state.emit_fmt(format_args!("    addl %eax, %{}", super::emit::phys_reg_name_32(dest_phys)));
+            } else {
+                self.state.emit_fmt(format_args!("    addq %rax, %{}", super::emit::phys_reg_name(dest_phys)));
+            }
+            self.state.reg_cache.invalidate_acc();
+            return;
+        }
+
+        // Memory-dest add: if acc and dest share the same stack slot, use addl %eax, mem.
+        if let Operand::Value(acc_val) = acc {
+            if self.dest_reg(acc_val).is_none() {
+                if let (Some(dest_slot), Some(acc_slot)) =
+                    (self.state.get_slot(add_dest.0), self.state.get_slot(acc_val.0))
+                {
+                    if dest_slot.0 == acc_slot.0 {
+                        let sref = self.slot_ref(dest_slot.0);
+                        if use_32bit {
+                            self.state.emit_fmt(format_args!("    addl %eax, {}", sref));
+                        } else {
+                            self.state.emit_fmt(format_args!("    addq %rax, {}", sref));
+                        }
+                        self.state.reg_cache.invalidate_acc();
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Fallback: load acc to %ecx, add to %eax, store result.
+        self.operand_to_rcx(acc);
+        if use_32bit {
+            self.state.emit("    addl %ecx, %eax");
+            self.store_eax_to(add_dest);
+        } else {
+            self.state.emit("    addq %rcx, %rax");
+            self.store_rax_to(add_dest);
+        }
     }
 
     pub(super) fn emit_copy_i128_impl(&mut self, dest: &Value, src: &Operand) {

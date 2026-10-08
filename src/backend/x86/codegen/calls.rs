@@ -29,8 +29,15 @@ impl X86Codegen {
     pub(super) fn emit_call_stack_args_impl(&mut self, args: &[Operand], arg_classes: &[CallArgClass],
                             _arg_types: &[IrType], stack_arg_space: usize, _fptr_spill: usize, _f128_temp_space: usize) -> i64 {
         let need_align_pad = !stack_arg_space.is_multiple_of(16);
+        let mut sp_adjust: i64 = 0;
         if need_align_pad {
             self.state.emit("    subq $8, %rsp");
+            sp_adjust += 8;
+            // Adjust RSP frame size so operand_to_rax slot conversions
+            // are correct after the alignment subq.
+            if self.state.out.use_rsp_addressing {
+                self.state.out.rsp_frame_size += 8;
+            }
         }
         let arg_padding = crate::backend::call_abi::compute_stack_arg_padding(arg_classes);
         let stack_indices: Vec<usize> = (0..args.len())
@@ -96,8 +103,10 @@ impl X86Codegen {
                     match &args[si] {
                         Operand::Value(v) => {
                             if let Some(slot) = self.state.get_slot(v.0) {
-                                self.state.emit_fmt(format_args!("    pushq {}(%rbp)", slot.0 + 8));
-                                self.state.emit_fmt(format_args!("    pushq {}(%rbp)", slot.0));
+                                let sr1 = self.slot_ref(slot.0 + 8);
+                                let sr0 = self.slot_ref(slot.0);
+                                self.state.emit_fmt(format_args!("    pushq {}", sr1));
+                                self.state.emit_fmt(format_args!("    pushq {}", sr0));
                             } else {
                                 self.state.emit("    pushq $0");
                                 self.state.emit("    pushq $0");
@@ -131,24 +140,50 @@ impl X86Codegen {
                             self.state.emit("    pushq %rcx");
                         }
                     }
+                    let push_bytes = (n_qwords * 8) as i64;
+                    if self.state.out.use_rsp_addressing {
+                        self.state.out.rsp_frame_size += push_bytes;
+                    }
+                    sp_adjust += push_bytes;
                 }
                 CallArgClass::Stack => {
                     self.operand_to_rax(&args[si]);
                     self.state.emit("    pushq %rax");
+                    if self.state.out.use_rsp_addressing {
+                        self.state.out.rsp_frame_size += 8;
+                    }
+                    sp_adjust += 8;
                 }
                 _ => {}
             }
             let pad = arg_padding[si];
             if pad > 0 {
                 self.state.out.emit_instr_imm_reg("    subq", pad as i64, "rsp");
+                sp_adjust += pad as i64;
+                if self.state.out.use_rsp_addressing {
+                    self.state.out.rsp_frame_size += pad as i64;
+                }
             }
         }
-        0
+        // Restore the original RSP frame size. The total adjustment is
+        // tracked in sp_adjust and returned to emit_call_reg_args.
+        if self.state.out.use_rsp_addressing {
+            self.state.out.rsp_frame_size -= sp_adjust;
+        }
+        // Return the total RSP adjustment so emit_call_reg_args can
+        // compensate stack slot offsets when loading register arguments.
+        sp_adjust
     }
 
     pub(super) fn emit_call_reg_args_impl(&mut self, args: &[Operand], arg_classes: &[CallArgClass],
-                          _arg_types: &[IrType], _total_sp_adjust: i64, _f128_temp_space: usize, _stack_arg_space: usize,
+                          _arg_types: &[IrType], total_sp_adjust: i64, _f128_temp_space: usize, _stack_arg_space: usize,
                           _struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>]) {
+        // Stack args (Phase 2) may have adjusted rsp. Temporarily increase
+        // the RSP frame size so rbp-to-rsp offset conversion is correct
+        // when loading register arguments from stack slots.
+        if total_sp_adjust != 0 && self.state.out.use_rsp_addressing {
+            self.state.out.rsp_frame_size += total_sp_adjust;
+        }
         let xmm_regs = ["xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"];
         let mut float_count = 0usize;
         for (i, arg) in args.iter().enumerate() {
@@ -224,13 +259,62 @@ impl X86Codegen {
                     float_count += 1;
                 }
                 CallArgClass::FloatReg { reg_idx } => {
-                    self.operand_to_rax(arg);
-                    self.state.out.emit_instr_reg_reg("    movq", "rax", xmm_regs[reg_idx]);
+                    match arg {
+                        Operand::Const(IrConst::F64(_)) => {
+                            self.emit_fp_operand_to_xmm(arg, IrType::F64, xmm_regs[reg_idx]);
+                        }
+                        Operand::Const(IrConst::F32(_)) => {
+                            self.emit_fp_operand_to_xmm(arg, IrType::F32, xmm_regs[reg_idx]);
+                        }
+                        _ => {
+                            self.operand_to_rax(arg);
+                            self.state.out.emit_instr_reg_reg("    movq", "rax", xmm_regs[reg_idx]);
+                        }
+                    }
                     float_count += 1;
                 }
                 CallArgClass::IntReg { reg_idx } => {
-                    self.operand_to_rax(arg);
-                    self.state.out.emit_instr_reg_reg("    movq", "rax", X86_ARG_REGS[reg_idx]);
+                    let target_reg = X86_ARG_REGS[reg_idx];
+                    // Register-direct: callee-saved regs and constants bypass rax.
+                    // Skip when it would create a round-trip (e.g., rdi→rbx→rdi)
+                    // that the peephole would eliminate along with the param store.
+                    let did_direct = if let Operand::Value(v) = arg {
+                        if let Some(&phys) = self.reg_assignments.get(&v.0) {
+                            if phys.0 >= 1 && phys.0 <= 6 {
+                                // Check for round-trip: if this callee-saved reg was
+                                // loaded from the SAME arg reg we're targeting, skip
+                                let is_round_trip = self.param_source_regs.get(&phys.0)
+                                    .map_or(false, |&src| src == target_reg);
+                                if !is_round_trip {
+                                    let src = super::emit::phys_reg_name(phys);
+                                    self.state.out.emit_instr_reg_reg("    movq", src, target_reg);
+                                    true
+                                } else { false }
+                            } else { false }
+                        } else { false }
+                    } else if let Operand::Const(c) = arg {
+                        if let Some(imm) = c.to_i64() {
+                            if imm == 0 {
+                                let target_32 = match target_reg {
+                                    "rdi" => "edi", "rsi" => "esi", "rdx" => "edx",
+                                    "rcx" => "ecx", "r8" => "r8d", "r9" => "r9d",
+                                    _ => target_reg,
+                                };
+                                self.state.emit_fmt(format_args!("    xorl %{}, %{}", target_32, target_32));
+                            } else {
+                                self.state.out.emit_instr_imm_reg("    movq", imm, target_reg);
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if !did_direct {
+                        self.operand_to_rax(arg);
+                        self.state.out.emit_instr_reg_reg("    movq", "rax", target_reg);
+                    }
                 }
                 _ => {}
             }
@@ -241,6 +325,10 @@ impl X86Codegen {
             self.state.emit("    xorl %eax, %eax");
         }
         self.state.reg_cache.invalidate_all();
+        // Restore the original RSP frame size.
+        if total_sp_adjust != 0 && self.state.out.use_rsp_addressing {
+            self.state.out.rsp_frame_size -= total_sp_adjust;
+        }
     }
 
     pub(super) fn emit_call_instruction_impl(&mut self, direct_name: Option<&str>, func_ptr: Option<&Operand>, _indirect: bool, _stack_arg_space: usize) {
@@ -251,14 +339,15 @@ impl X86Codegen {
                 self.state.out.emit_call(name);
             }
         } else if let Some(ptr) = func_ptr {
-            self.state.emit("    pushq %rax");
+            // Load function pointer into rax and call through it.
+            // Using rax avoids clobbering r10 which may hold a
+            // register-allocated value.
             self.operand_to_rax(ptr);
-            self.state.emit("    movq %rax, %r10");
-            self.state.emit("    popq %rax");
             if self.state.indirect_branch_thunk {
+                self.state.emit("    movq %rax, %r10");
                 self.state.emit("    call __x86_indirect_thunk_r10");
             } else {
-                self.state.emit("    call *%r10");
+                self.state.emit("    call *%rax");
             }
         }
         self.state.reg_cache.invalidate_all();
@@ -277,6 +366,12 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_call_store_result_impl(&mut self, dest: &Value, return_type: IrType) {
+        // Void functions have no meaningful return value — skip the store.
+        // Without this, store_rax_to writes garbage %rax to a stack slot that
+        // may overlap with callee-saved register save area, corrupting them.
+        if return_type == IrType::Void {
+            return;
+        }
         if is_i128_type(return_type) {
             use crate::common::types::EightbyteClass;
             if self.call_ret_classes.len() == 2 {
@@ -315,8 +410,7 @@ impl X86Codegen {
                 self.store_rax_rdx_to(dest);
             }
         } else if return_type == IrType::F32 {
-            self.state.emit("    movd %xmm0, %eax");
-            self.store_rax_to(dest);
+            self.store_xmm_to(dest, "xmm0", IrType::F32);
         } else if return_type == IrType::F128 {
             if let Some(slot) = self.state.get_slot(dest.0) {
                 self.state.out.emit_instr_rbp("    fstpt", slot.0);
@@ -333,8 +427,7 @@ impl X86Codegen {
                 self.store_rax_to(dest);
             }
         } else if return_type == IrType::F64 {
-            self.state.emit("    movq %xmm0, %rax");
-            self.store_rax_to(dest);
+            self.store_xmm_to(dest, "xmm0", IrType::F64);
         } else {
             self.store_rax_to(dest);
         }

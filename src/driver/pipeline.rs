@@ -1085,10 +1085,149 @@ impl Driver {
         run_passes(&mut module, self.opt_level, self.target);
         if time_phases { eprintln!("[TIME] opt passes: {:.3}s", t6.elapsed().as_secs_f64()); }
 
+        // Live range splitting: split call-spanning values, then clean up
+        if std::env::var("CCC_NO_SPLIT_RANGES").is_err() {
+            let max_splits = std::env::var("CCC_SPLIT_MAX")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(30);
+            let mut did_split = false;
+            for func in &mut module.functions {
+                if !func.is_declaration && func.blocks.len() > 10 {
+                    let n = crate::backend::split_ranges::split_call_spanning_ranges(func, max_splits);
+                    if n > 0 { did_split = true; }
+                }
+            }
+            // Loop-transparent splitting (spill values live across a hot loop
+            // but unused inside it). NOTE: measured as a net loss on the
+            // benchmark suite — the store/reload round-trips cost more than the
+            // freed registers save, because the values competing for registers
+            // in hot loops are the in-loop ones (bases/IVs), which can't be
+            // transparent-split. Kept opt-in for reference.
+            if std::env::var("CCC_LOOP_SPLIT").is_ok() {
+                for func in &mut module.functions {
+                    if !func.is_declaration && !func.blocks.is_empty() {
+                        let n = crate::backend::split_ranges::split_loop_transparent_ranges(func, max_splits);
+                        if n > 0 { did_split = true; }
+                    }
+                }
+            }
+            // Run cleanup passes on split IR: copy propagation + DCE
+            // to eliminate redundant Store/Load → Copy chains from mem2reg
+            if did_split {
+                for func in &mut module.functions {
+                    if !func.is_declaration && !func.blocks.is_empty() {
+                        crate::passes::copy_prop::propagate_copies(func);
+                        crate::passes::dce::eliminate_dead_code(func);
+                    }
+                }
+            }
+        }
+
         // Lower SSA phi nodes to copies before codegen
         let t7 = std::time::Instant::now();
         eliminate_phis(&mut module);
         if time_phases { eprintln!("[TIME] phi elimination: {:.3}s", t7.elapsed().as_secs_f64()); }
+
+        // Final block layout: optimization passes and phi elimination append
+        // new blocks (vector bodies, trampolines, exit blocks) at the end of
+        // `func.blocks`, which scrambles the linearized order the backend's
+        // liveness/regalloc relies on. Re-layout in reverse post-order so loop
+        // bodies and their exit blocks stay contiguous and loop-carried values
+        // don't falsely span calls.
+        if std::env::var("CCC_NO_BLOCK_RELAYOUT").is_err() {
+            for func in &mut module.functions {
+                if !func.is_declaration {
+                    crate::passes::block_layout::relayout_blocks_rpo(func);
+                }
+            }
+        }
+
+        // CRITICAL FIX: Renumber all block labels to ensure global uniqueness across all functions
+        // This fixes a bug where optimization passes can create duplicate labels
+        {
+            use crate::ir::instruction::BlockId;
+            use std::collections::HashMap;
+            let mut next_global_label = 0u32;
+
+            for func in &mut module.functions {
+                if func.is_declaration {
+                    continue;
+                }
+
+                // Build a map from old labels to new globally-unique labels
+                let mut label_map: HashMap<BlockId, BlockId> = HashMap::new();
+                for block in &func.blocks {
+                    if !label_map.contains_key(&block.label) {
+                        label_map.insert(block.label, BlockId(next_global_label));
+                        next_global_label += 1;
+                    }
+                }
+
+                // Renumber all block labels
+                for block in &mut func.blocks {
+                    block.label = label_map[&block.label];
+                }
+
+                // Renumber all terminator targets
+                for block in &mut func.blocks {
+                    use crate::ir::reexports::Terminator;
+                    match &mut block.terminator {
+                        Terminator::Branch(target) => {
+                            if let Some(&new) = label_map.get(target) {
+                                *target = new;
+                            }
+                        }
+                        Terminator::CondBranch { true_label, false_label, .. } => {
+                            if let Some(&new) = label_map.get(true_label) {
+                                *true_label = new;
+                            }
+                            if let Some(&new) = label_map.get(false_label) {
+                                *false_label = new;
+                            }
+                        }
+                        Terminator::Switch { cases, default, .. } => {
+                            for (_val, target) in cases {
+                                if let Some(&new) = label_map.get(target) {
+                                    *target = new;
+                                }
+                            }
+                            if let Some(&new) = label_map.get(default) {
+                                *default = new;
+                            }
+                        }
+                        Terminator::IndirectBranch { possible_targets, .. } => {
+                            for target in possible_targets {
+                                if let Some(&new) = label_map.get(target) {
+                                    *target = new;
+                                }
+                            }
+                        }
+                        Terminator::Return(_) | Terminator::Unreachable => {}
+                    }
+                }
+            }
+        }
+
+        // Debug: dump IR labels before codegen
+        if std::env::var("LCCC_DEBUG_LABELS").is_ok() {
+            for func in &module.functions {
+                eprintln!("[IR] Function {}: labels = {:?}", func.name,
+                          func.blocks.iter().map(|b| b.label.0).collect::<Vec<_>>());
+            }
+        }
+        // TEMP: full IR dump
+        if std::env::var("LCCC_DUMP_IR").is_ok() {
+            for func in &module.functions {
+                if func.is_declaration { continue; }
+                eprintln!("=== IR {} ===", func.name);
+                for (bi, b) in func.blocks.iter().enumerate() {
+                    eprintln!("  block {} (label {}):", bi, b.label.0);
+                    for inst in &b.instructions {
+                        eprintln!("    {:?}", inst);
+                    }
+                    eprintln!("    term: {:?}", b.terminator);
+                }
+            }
+        }
 
         // Note: we intentionally do NOT run copy_prop after phi elimination.
         // The IR is no longer in SSA form at this point - Copy instructions from

@@ -1,15 +1,22 @@
 //! X86Codegen: prologue, epilogue, parameter storage.
 
-use crate::ir::reexports::{IrFunction, Instruction, Value};
+use crate::ir::reexports::{IrBinOp, IrFunction, Instruction, Operand, Terminator, Value};
 use crate::common::types::IrType;
+use crate::common::fx_hash::FxHashSet;
 use crate::backend::call_abi::{ParamClass, classify_params};
 use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
 use crate::backend::regalloc::PhysReg;
-use super::emit::{X86Codegen, X86_CALLEE_SAVED, X86_CALLER_SAVED, phys_reg_name,
-                     collect_inline_asm_callee_saved_x86, X86_ARG_REGS};
+use super::emit::{X86Codegen, X86_CALLEE_SAVED, X86_CALLEE_SAVED_WITH_RBP, X86_CALLER_SAVED,
+                     phys_reg_name, collect_inline_asm_callee_saved_x86, X86_ARG_REGS};
 
 impl X86Codegen {
     pub(super) fn calculate_stack_space_impl(&mut self, func: &IrFunction) -> i64 {
+        // Store function pointer for indexed addressing detection
+        self.current_func = Some(func as *const IrFunction);
+
+        // Analyze IVSR patterns for Phase 9b indexed addressing optimization
+        self.analyze_ivsr_pointers(func);
+
         // Track variadic function info
         self.is_variadic = func.is_variadic;
         // Count named params using the shared ABI classification, so this
@@ -35,18 +42,36 @@ impl X86Codegen {
         // skip allocating stack slots for values assigned to registers.
         let mut asm_clobbered_regs: Vec<PhysReg> = Vec::new();
         collect_inline_asm_callee_saved_x86(func, &mut asm_clobbered_regs);
-        let available_regs = crate::backend::generation::filter_available_regs(&X86_CALLEE_SAVED, &asm_clobbered_regs);
+        let callee_base: &[PhysReg] = if self.state.omit_frame_pointer {
+            &X86_CALLEE_SAVED_WITH_RBP
+        } else {
+            &X86_CALLEE_SAVED
+        };
+        let mut available_regs = crate::backend::generation::filter_available_regs(callee_base, &asm_clobbered_regs);
 
         let mut caller_saved_regs = X86_CALLER_SAVED.to_vec();
         let mut has_indirect_call = false;
         let mut has_i128_ops = false;
         let mut has_atomic_rmw = false;
+        // Track rdx-clobbering patterns for conditional rdx allocation
+        let mut has_div_rem = false;
+        let mut has_gep = false;       // GEP → indirect stores → emit_save_acc uses rdx
+        let mut has_switch = false;    // Switch → jump tables use rdx
+        let mut has_select = false;    // Select → cmov path uses rdx
+        let mut has_i32_widening = false; // Cast from I32/U32 to I64/pointer → needs sign-ext
         for block in &func.blocks {
             for inst in &block.instructions {
                 match inst {
                     Instruction::CallIndirect { .. } => { has_indirect_call = true; }
-                    Instruction::BinOp { ty, .. }
-                    | Instruction::UnaryOp { ty, .. } => {
+                    Instruction::BinOp { op, ty, .. } => {
+                        if matches!(ty, IrType::I128 | IrType::U128) {
+                            has_i128_ops = true;
+                        }
+                        if matches!(op, IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem) {
+                            has_div_rem = true;
+                        }
+                    }
+                    Instruction::UnaryOp { ty, .. } => {
                         if matches!(ty, IrType::I128 | IrType::U128) {
                             has_i128_ops = true;
                         }
@@ -56,6 +81,11 @@ impl X86Codegen {
                             || matches!(to_ty, IrType::I128 | IrType::U128) {
                             has_i128_ops = true;
                         }
+                        // Detect I32/U32 widening to 64-bit: requires sign-extension.
+                        if matches!(from_ty, IrType::I32 | IrType::U32)
+                            && matches!(to_ty, IrType::I64 | IrType::U64 | IrType::Ptr) {
+                            has_i32_widening = true;
+                        }
                     }
                     Instruction::Cmp { ty, .. }
                     | Instruction::Store { ty, .. } => {
@@ -64,32 +94,114 @@ impl X86Codegen {
                         }
                     }
                     Instruction::AtomicRmw { .. } => { has_atomic_rmw = true; }
+                    Instruction::GetElementPtr { .. } => { has_gep = true; }
+                    Instruction::Select { .. } => { has_select = true; }
+                    _ => {}
+                }
+            }
+            if matches!(block.terminator, Terminator::Switch { .. }) {
+                has_switch = true;
+            }
+        }
+        // r10: use call *%rax instead of call *%r10 (frees r10 for non-call-spanning).
+        // Exception: indirect branch thunks still use r10 (rare).
+        if has_i128_ops {
+            caller_saved_regs.retain(|r| r.0 != 12 && r.0 != 13 && r.0 != 14 && r.0 != 15); // r8, r9, rdi, rsi
+        }
+        // r8: atomic RMW uses rdi instead of r8 (frees r8 unless i128 excludes it).
+        // rdx (PhysReg 16) is available as caller-saved when no instruction
+        // implicitly clobbers it: division (rdx:rax), i128 ops (rax:rdx pair),
+        // switch jump tables (rdx as dispatch). GEP indirect stores and Select
+        // cmov paths have been taught to use %r11 when rdx is allocated.
+        if !has_div_rem && !has_i128_ops && !has_switch {
+            caller_saved_regs.push(PhysReg(16)); // rdx
+        }
+
+        // Note: promoting caller-saved registers to callee-saved does NOT work
+        // because the x86-64 SysV ABI defines the callee-saved set. When we
+        // promote r11 to callee-saved in function A and A calls function B,
+        // B (following the ABI) freely clobbers r11. A's "callee-saved" r11
+        // value is destroyed. The fix requires per-call save/restore, not
+        // promotion. See binary size investigation in project memory.
+
+        // Build set of I32 values that need sign-extension (used in 64-bit contexts).
+        // Values NOT in this set can skip movslq after 32-bit register ALU ops.
+        // A value needs sext if it's: (a) a Cast source going to I64/U64/Ptr,
+        // (b) an operand of GetElementPtr, or (c) used in a 64-bit BinOp/Cmp.
+        let mut needs_sext_set: FxHashSet<u32> = FxHashSet::default();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::Cast { src, from_ty, to_ty, .. } => {
+                        if matches!(from_ty, IrType::I32 | IrType::U32)
+                            && matches!(to_ty, IrType::I64 | IrType::U64 | IrType::Ptr) {
+                            if let Operand::Value(v) = src {
+                                needs_sext_set.insert(v.0);
+                            }
+                        }
+                    }
+                    Instruction::GetElementPtr { base, offset, .. } => {
+                        needs_sext_set.insert(base.0);
+                        if let Operand::Value(v) = offset {
+                            needs_sext_set.insert(v.0);
+                        }
+                    }
                     _ => {}
                 }
             }
         }
-        if has_indirect_call {
-            caller_saved_regs.retain(|r| r.0 != 11); // r10 = PhysReg(11)
-        }
-        if has_i128_ops {
-            caller_saved_regs.retain(|r| r.0 != 12 && r.0 != 13 && r.0 != 14 && r.0 != 15); // r8, r9, rdi, rsi
-        }
-        if has_atomic_rmw {
-            caller_saved_regs.retain(|r| r.0 != 12); // r8
-        }
+        // Always sign-extend I32 values after 32-bit ALU ops. The needs_sext_set
+        // optimization was unsound: it only tracked Cast and GEP uses, missing cases
+        // where I32 values flow into 64-bit pointer arithmetic through intermediate
+        // registers (e.g., `(yysize + 1) * sizeof(yyStackEntry)` in SQLite's parser).
+        self.skip_i32_sext = false;
+        self.needs_sext_values = FxHashSet::default();
 
-        let (reg_assigned, cached_liveness) = crate::backend::generation::run_regalloc_and_merge_clobbers(
+        let (reg_assigned, cached_liveness, caller_save_spans) = crate::backend::generation::run_regalloc_and_merge_clobbers(
             func, available_regs, caller_saved_regs, &asm_clobbered_regs,
             &mut self.reg_assignments, &mut self.used_callee_saved,
             false,
         );
 
-        let mut space = calculate_stack_space_common(&mut self.state, func, 0, |space, alloc_size, align| {
+        // FPO (RSP mode): callee saves are movq'd into the frame at offsets -8..-N*8
+        // from the virtual rbp. callee_save_reserve shifts local slots below them.
+        // RBP (push mode): pushes go BEFORE subq and are at -8(%rbp)..-N*8(%rbp).
+        // Local slots are within the subq frame starting at -(N*8+first_slot)(%rbp).
+        // For non-variadic RBP functions, no reserve is needed because the subq frame
+        // starts below the push area. For variadic functions, the register save area
+        // is added to `space` separately.
+        // Reserve space for callee-saved register saves PLUS 8 bytes of padding.
+        // The saves occupy offsets -8, -16, ..., -(N*8) from the virtual rbp.
+        // Without the +8 padding, block-local slot reuse (Tier 3) can assign
+        // a variable to offset -(N*8) which COLLIDES with the last callee-save
+        // (typically %rbp). Adding 8 bytes ensures the reuse pool starts at
+        // -(N*8 + 8), safely below the callee-save area.
+        let n_callee = self.used_callee_saved.len() as i64;
+        let callee_save_reserve = if n_callee > 0 { n_callee * 8 + 8 } else { 0 };
+        let mut space = calculate_stack_space_common(&mut self.state, func, callee_save_reserve, |space, alloc_size, align| {
             let effective_align = if align > 0 { align.max(8) } else { 8 };
             let alloc = (alloc_size + 7) & !7;
             let new_space = ((space + alloc + effective_align - 1) / effective_align) * effective_align;
             (-new_space, new_space)
-        }, &reg_assigned, &X86_CALLEE_SAVED, cached_liveness, false);
+        }, &reg_assigned, &X86_CALLEE_SAVED, cached_liveness, true);
+
+        // Initialize emergency spill offset below the allocated frame space.
+        // Without this, emergency spills start at offset 0 from the frame base
+        // and grow upward into the callee-saved register push area, corrupting
+        // saved registers (e.g., writing to -8(%rbp) where %rbx was pushed).
+        self.state.emergency_spill_offset = -space;
+
+        // Allocate spill slots for Phase 2b caller-saved-spanning registers.
+        self.caller_save_spill_slots.clear();
+        self.caller_save_intervals.clear();
+        for (&reg_id, spans) in &caller_save_spans {
+            if !spans.is_empty() {
+                space += 8;
+                let slot = crate::backend::state::StackSlot(-space);
+                self.caller_save_spill_slots.insert(reg_id, slot);
+                self.caller_save_intervals.insert(reg_id, spans.clone());
+            }
+        }
 
         if func.is_variadic {
             if self.no_sse {
@@ -100,12 +212,23 @@ impl X86Codegen {
             self.reg_save_area_offset = -space;
         }
 
-        let callee_save_space = (self.used_callee_saved.len() as i64) * 8;
-        space + callee_save_space
+        // `space` includes callee_save_reserve for the save area — return as-is.
+        space
     }
 
     pub(super) fn aligned_frame_size_impl(&self, raw_space: i64) -> i64 {
-        if raw_space > 0 { (raw_space + 15) & !15 } else { 0 }
+        if raw_space <= 0 { return 0; }
+        let aligned = (raw_space + 15) & !15;
+        if self.state.omit_frame_pointer {
+            // With frame pointer omission, there's no `push %rbp` to absorb the
+            // 8-byte return address misalignment. The frame size must be ≡ 8 (mod 16)
+            // so that RSP is 16-byte aligned at subsequent CALL instructions.
+            // At function entry: RSP ≡ 8 (mod 16) due to the caller's CALL.
+            // subq $(8 mod 16), %rsp → RSP ≡ 8 - 8 = 0 (mod 16) ✓
+            if aligned % 16 == 0 { aligned + 8 } else { aligned }
+        } else {
+            aligned
+        }
     }
 
     pub(super) fn emit_prologue_impl(&mut self, func: &IrFunction, frame_size: i64) {
@@ -114,38 +237,88 @@ impl X86Codegen {
         if self.state.cf_protection_branch {
             self.state.emit("    endbr64");
         }
-        self.state.emit("    pushq %rbp");
-        if self.state.emit_cfi {
-            self.state.emit("    .cfi_def_cfa_offset 16");
-            self.state.emit("    .cfi_offset %rbp, -16");
-        }
-        self.state.emit("    movq %rsp, %rbp");
-        if self.state.emit_cfi {
-            self.state.emit("    .cfi_def_cfa_register %rbp");
-        }
-        if frame_size > 0 {
-            const PAGE_SIZE: i64 = 4096;
-            if frame_size > PAGE_SIZE {
-                let probe_label = self.state.fresh_label("stack_probe");
-                self.state.out.emit_instr_imm_reg("    movq", frame_size, "r11");
-                self.state.out.emit_named_label(&probe_label);
-                self.state.out.emit_instr_imm_reg("    subq", PAGE_SIZE, "rsp");
-                self.state.emit("    orl $0, (%rsp)");
-                self.state.out.emit_instr_imm_reg("    subq", PAGE_SIZE, "r11");
-                self.state.out.emit_instr_imm_reg("    cmpq", PAGE_SIZE, "r11");
-                self.state.out.emit_jcc_label("    ja", &probe_label);
-                self.state.emit("    subq %r11, %rsp");
-                self.state.emit("    orl $0, (%rsp)");
-            } else {
-                self.state.out.emit_instr_imm_reg("    subq", frame_size, "rsp");
-            }
-        }
 
+        // Variadic functions need the frame pointer for va_start/va_arg to
+        // compute register save area addresses relative to %rbp. Override FPO.
+        let omit_fp = self.state.omit_frame_pointer && !func.is_variadic;
         let used_regs = self.used_callee_saved.clone();
-        for (i, &reg) in used_regs.iter().enumerate() {
-            let offset = -frame_size + (i as i64 * 8);
-            let reg_name = phys_reg_name(reg);
-            self.state.out.emit_instr_reg_rbp("    movq", reg_name, offset);
+
+        if omit_fp {
+            // Frame-pointer-less prologue.
+            // Use compact push/pop encoding for all saved registers (only
+            // callee-saved registers appear here; Phase 2 caller-saved
+            // allocations need no prologue save, and Phase 2b caller-saved
+            // spans are saved selectively at call sites). pushq is 1-2 bytes
+            // vs movq's 7-8 bytes. The Phase 2b spill slots (for selective
+            // save/restore at call sites) are in the subq area, not the push
+            // area, so they don't interfere.
+            let n_saves = used_regs.len() as i64;
+            let use_push_pop = n_saves > 0;
+
+            if use_push_pop {
+                for &reg in &used_regs {
+                    let reg_name = phys_reg_name(reg);
+                    self.state.emit_fmt(format_args!("    pushq %{}", reg_name));
+                }
+                let local_size = frame_size - n_saves * 8;
+                if local_size > 0 {
+                    self.state.out.emit_instr_imm_reg("    subq", local_size, "rsp");
+                }
+            } else {
+                if frame_size > 0 {
+                    self.state.out.emit_instr_imm_reg("    subq", frame_size, "rsp");
+                }
+                for (i, &reg) in used_regs.iter().enumerate() {
+                    let reg_name = phys_reg_name(reg);
+                    let rsp_offset = frame_size - (i as i64 + 1) * 8;
+                    self.state.emit_fmt(format_args!("    movq %{}, {}(%rsp)", reg_name, rsp_offset));
+                }
+            }
+            if self.state.emit_cfi {
+                self.state.emit_fmt(format_args!("    .cfi_def_cfa_offset {}", frame_size + 8));
+            }
+            self.state.out.use_rsp_addressing = true;
+            self.state.out.rsp_frame_size = frame_size;
+        } else {
+            // Traditional frame-pointer prologue.
+            // Reset RSP-relative addressing flag: a previous FPO function may have
+            // set it, and the AsmOutput is shared across all functions in the module.
+            self.state.out.use_rsp_addressing = false;
+            self.state.emit("    pushq %rbp");
+            if self.state.emit_cfi {
+                self.state.emit("    .cfi_def_cfa_offset 16");
+                self.state.emit("    .cfi_offset %rbp, -16");
+            }
+            self.state.emit("    movq %rsp, %rbp");
+            if self.state.emit_cfi {
+                self.state.emit("    .cfi_def_cfa_register %rbp");
+            }
+
+            // Save callee-saved registers with pushq
+            for &reg in &used_regs {
+                let reg_name = phys_reg_name(reg);
+                self.state.emit_fmt(format_args!("    pushq %{}", reg_name));
+            }
+
+            // Allocate remaining stack space for local variables
+            let local_size = frame_size - (used_regs.len() as i64 * 8);
+            if local_size > 0 {
+                const PAGE_SIZE: i64 = 4096;
+                if local_size > PAGE_SIZE {
+                    let probe_label = self.state.fresh_label("stack_probe");
+                    self.state.out.emit_instr_imm_reg("    movq", local_size, "r11");
+                    self.state.out.emit_named_label(&probe_label);
+                    self.state.out.emit_instr_imm_reg("    subq", PAGE_SIZE, "rsp");
+                    self.state.emit("    orl $0, (%rsp)");
+                    self.state.out.emit_instr_imm_reg("    subq", PAGE_SIZE, "r11");
+                    self.state.out.emit_instr_imm_reg("    cmpq", PAGE_SIZE, "r11");
+                    self.state.out.emit_jcc_label("    ja", &probe_label);
+                    self.state.emit("    subq %r11, %rsp");
+                    self.state.emit("    orl $0, (%rsp)");
+                } else {
+                    self.state.out.emit_instr_imm_reg("    subq", local_size, "rsp");
+                }
+            }
         }
 
         if func.is_variadic {
@@ -166,13 +339,45 @@ impl X86Codegen {
 
     pub(super) fn emit_epilogue_impl(&mut self, frame_size: i64) {
         let used_regs = self.used_callee_saved.clone();
-        for (i, &reg) in used_regs.iter().enumerate() {
-            let offset = -frame_size + (i as i64 * 8);
-            let reg_name = phys_reg_name(reg);
-            self.state.out.emit_instr_rbp_reg("    movq", offset, reg_name);
+        let num_saved = used_regs.len() as i64;
+        let omit_fp = self.state.omit_frame_pointer && !self.state.func_is_variadic;
+
+        if omit_fp {
+            let use_push_pop = num_saved > 0;
+
+            if use_push_pop {
+                let local_size = frame_size - num_saved * 8;
+                if local_size > 0 {
+                    self.state.out.emit_instr_imm_reg("    addq", local_size, "rsp");
+                }
+                for &reg in used_regs.iter().rev() {
+                    let reg_name = phys_reg_name(reg);
+                    self.state.emit_fmt(format_args!("    popq %{}", reg_name));
+                }
+            } else {
+                for (i, &reg) in used_regs.iter().enumerate() {
+                    let reg_name = phys_reg_name(reg);
+                    let offset = frame_size - (i as i64 + 1) * 8;
+                    self.state.emit_fmt(format_args!("    movq {}(%rsp), %{}", offset, reg_name));
+                }
+                if frame_size > 0 {
+                    self.state.out.emit_instr_imm_reg("    addq", frame_size, "rsp");
+                }
+            }
+        } else {
+            // Traditional epilogue: restore from pushes, then popq %rbp
+            if num_saved > 0 {
+                self.state.emit_fmt(format_args!("    leaq {}(%rbp), %rsp", -(num_saved * 8)));
+            } else {
+                self.state.emit("    movq %rbp, %rsp");
+            }
+            for &reg in used_regs.iter().rev() {
+                let reg_name = phys_reg_name(reg);
+                self.state.emit_fmt(format_args!("    popq %{}", reg_name));
+            }
+            self.state.emit("    popq %rbp");
         }
-        self.state.emit("    movq %rbp, %rsp");
-        self.state.emit("    popq %rbp");
+        let _ = frame_size;
     }
 
     pub(super) fn emit_store_params_impl(&mut self, func: &IrFunction) {
@@ -204,7 +409,10 @@ impl X86Codegen {
             }
         }
 
-        let stack_base: i64 = 16;
+        // In RBP mode: stack args start at 16(%rbp) = return_addr(8) + saved_rbp(8).
+        // In FPO mode: no saved rbp, so stack args start at 8 from the virtual rbp
+        // (which is entry_rsp = return_addr).
+        let stack_base: i64 = if self.state.omit_frame_pointer { 8 } else { 16 };
 
         // Build a map from physical register -> list of param indices that use it,
         // so we can detect when two params share the same callee-saved register.
@@ -232,6 +440,10 @@ impl X86Codegen {
                 let has_slot = find_param_alloca(func, i)
                     .and_then(|(dest, _)| self.state.get_slot(dest.0))
                     .is_some();
+                if std::env::var("CCC_DEBUG_PARAM_STORE").is_ok() {
+                    let reg = self.reg_assignments.get(&paramref_dest.0);
+                    eprintln!("[PRE-STORE] param {} paramref_dest={} has_slot={} reg={:?}", i, paramref_dest.0, has_slot, reg);
+                }
                 if !has_slot {
                     if let Some(&phys_reg) = self.reg_assignments.get(&paramref_dest.0) {
                         // Only pre-store to callee-saved registers (PhysReg 1-5).
@@ -239,9 +451,11 @@ impl X86Codegen {
                         // because they overlap with ABI argument registers that
                         // haven't been saved yet.
                         let is_callee_saved = phys_reg.0 >= 1 && phys_reg.0 <= 5;
+                        if std::env::var("CCC_DEBUG_PARAM_STORE").is_ok() {
+                            let shared = reg_to_params.get(&phys_reg.0).is_some_and(|u| u.len() > 1);
+                            eprintln!("[PRE-STORE]   callee={} shared={} class={:?}", is_callee_saved, shared, class);
+                        }
                         if is_callee_saved {
-                            // Safety check: if another param's dest is also assigned
-                            // to this register, skip pre-store to avoid conflicts.
                             let shared = reg_to_params.get(&phys_reg.0)
                                 .is_some_and(|users| users.len() > 1);
                             if !shared {
@@ -250,7 +464,102 @@ impl X86Codegen {
                                     self.state.out.emit_instr_reg_reg(
                                         "    movq", X86_ARG_REGS[reg_idx], dest_reg);
                                     self.state.param_pre_stored.insert(i);
+                                    self.param_source_regs.insert(phys_reg.0, X86_ARG_REGS[reg_idx]);
                                 } // TODO: handle StackSlot/SSE params
+                            }
+                        }
+                    }
+                    continue;
+                }
+            } else {
+                // DEBUG: dump entry block instructions for this param
+                if std::env::var("CCC_DEBUG_PARAM_STORE").is_ok() {
+                    if let Some((alloca_dest, _)) = find_param_alloca(func, i) {
+                        eprintln!("[PARAM-STORE] param {} has alloca dest={}, no ParamRef", i, alloca_dest.0);
+                        eprintln!("[PARAM-STORE] has_slot={}", self.state.get_slot(alloca_dest.0).is_some());
+                        for (bi, block) in func.blocks.iter().enumerate() {
+                            for inst in &block.instructions {
+                                match inst {
+                                    Instruction::Store { ptr, val, .. } if ptr.0 == alloca_dest.0 =>
+                                        eprintln!("[PARAM-STORE]   block[{}] Store to alloca: val={:?}", bi, val),
+                                    Instruction::Load { ptr, dest, .. } if ptr.0 == alloca_dest.0 =>
+                                        eprintln!("[PARAM-STORE]   block[{}] Load from alloca: dest={}", bi, dest.0),
+                                    Instruction::Copy { dest, src } =>
+                                        eprintln!("[PARAM-STORE]   block[{}] Copy dest={} src={:?}", bi, dest.0, src),
+                                    Instruction::ParamRef { dest, param_idx, .. } =>
+                                        eprintln!("[PARAM-STORE]   block[{}] ParamRef dest={} idx={}", bi, dest.0, param_idx),
+                                    _ => {}
+                                }
+                            }
+                        }
+                        for (&vid, &reg) in self.reg_assignments.iter() {
+                            eprintln!("[PARAM-STORE]   reg_assign: val={} -> PhysReg({})", vid, reg.0);
+                        }
+                    }
+                }
+                // No ParamRef for this param. The alloca may have been promoted
+                // by mem2reg, converting Store/Load chains to direct SSA references.
+                // After promotion, the param value flows through Copy/Cast chains.
+                //
+                // The register allocator may have assigned a promoted value to a
+                // callee-saved register. We must copy the ABI arg register to it
+                // in the prologue, because ABI registers get clobbered by calls.
+                //
+                // Strategy: find the alloca for this param, then search for Store
+                // instructions that write TO that alloca. The Store's source value
+                // (which may be a Copy from the original param) tells us which SSA
+                // value represents the parameter after store-to-load forwarding.
+                let has_slot = find_param_alloca(func, i)
+                    .and_then(|(dest, _)| self.state.get_slot(dest.0))
+                    .is_some();
+                if !has_slot {
+                    if let Some((alloca_dest, _)) = find_param_alloca(func, i) {
+                        let alloca_id = alloca_dest.0;
+                        // Collect all SSA values stored to this alloca, then
+                        // propagate through Copy chains to find all derived values.
+                        // Any of these that are register-assigned need the ABI arg
+                        // saved in the prologue.
+                        let mut param_vals: Vec<u32> = Vec::new();
+                        for block in &func.blocks {
+                            for inst in &block.instructions {
+                                if let Instruction::Store { ptr, val, .. } = inst {
+                                    if ptr.0 == alloca_id {
+                                        if let crate::ir::instruction::Operand::Value(v) = val {
+                                            param_vals.push(v.0);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Propagate through Copy chains
+                        let mut all_vals: crate::common::fx_hash::FxHashSet<u32> = param_vals.iter().copied().collect();
+                        let mut changed_prop = true;
+                        while changed_prop {
+                            changed_prop = false;
+                            for block in &func.blocks {
+                                for inst in &block.instructions {
+                                    if let Instruction::Copy { dest, src: crate::ir::instruction::Operand::Value(v) } = inst {
+                                        if all_vals.contains(&v.0) && all_vals.insert(dest.0) {
+                                            changed_prop = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Check if any derived value is callee-saved register-assigned
+                        for &vid in &all_vals {
+                            if let Some(&phys_reg) = self.reg_assignments.get(&vid) {
+                                let is_callee_saved = phys_reg.0 >= 1 && phys_reg.0 <= 5;
+                                if is_callee_saved {
+                                    let dest_reg = phys_reg_name(phys_reg);
+                                    if let ParamClass::IntReg { reg_idx } = class {
+                                        self.state.out.emit_instr_reg_reg(
+                                            "    movq", X86_ARG_REGS[reg_idx], dest_reg);
+                                        self.state.param_pre_stored.insert(i);
+                                        self.param_source_regs.insert(phys_reg.0, X86_ARG_REGS[reg_idx]);
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
@@ -364,7 +673,8 @@ impl X86Codegen {
             if let Some((slot, alloca_ty)) = self.state.param_alloca_slots[param_idx] {
                 let load_instr = Self::mov_load_for_type(alloca_ty);
                 let reg = Self::load_dest_reg(alloca_ty);
-                self.state.emit_fmt(format_args!("    {} {}(%rbp), {}", load_instr, slot.0, reg));
+                let sr = self.slot_ref(slot.0);
+                self.state.emit_fmt(format_args!("    {} {}, {}", load_instr, sr, reg));
                 self.store_rax_to(dest);
                 return;
             }
@@ -372,7 +682,7 @@ impl X86Codegen {
 
         let xmm_regs = ["xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"];
         let class = self.state.param_classes[param_idx];
-        let stack_base: i64 = 16;
+        let stack_base: i64 = if self.state.omit_frame_pointer { 8 } else { 16 };
 
         match class {
             ParamClass::IntReg { reg_idx } => {
@@ -395,7 +705,8 @@ impl X86Codegen {
                 let src = stack_base + offset;
                 let load_instr = Self::mov_load_for_type(ty);
                 let reg = Self::load_dest_reg(ty);
-                self.state.emit_fmt(format_args!("    {} {}(%rbp), {}", load_instr, src, reg));
+                let sr = self.slot_ref(src);
+                self.state.emit_fmt(format_args!("    {} {}, {}", load_instr, sr, reg));
                 self.store_rax_to(dest);
             }
             _ => {}

@@ -33,10 +33,10 @@ use crate::ir::reexports::{
 };
 use super::loop_analysis::{self, NaturalLoop};
 
-/// Maximum stride (in bytes) for an induction variable to be eligible for
-/// strength reduction. Covers common element sizes up to 1 KB; larger strides
-/// are unlikely to benefit and may indicate non-array access patterns.
-const MAX_IV_STRIDE: i64 = 1024;
+/// Maximum byte stride eligible for pointer induction. Matrix row strides are
+/// routinely several KiB (256 doubles = 2048 bytes), and are especially worth
+/// reducing because their multiply executes in an enclosing hot loop.
+const MAX_IV_STRIDE: i64 = 1 << 20;
 
 /// Maximum number of Cast/Copy instructions to follow when looking through
 /// cast chains to find the root value. Guards against infinite loops on
@@ -154,6 +154,13 @@ fn reduce_loop(
     // GEP replacements in the header use the correct adjusted index.
     let mut header_phi_insertions = 0usize;
 
+    // Share one pointer IV across GEP uses whose bases are equivalent
+    // (copies of the same value, or GlobalAddr of the same symbol).  Without
+    // sharing, a struct-in-array loop like `bodies[j].x/.y/.z/...` creates one
+    // pointer IV per field, exploding register pressure; the shared pointer
+    // turns the other fields into constant-offset folds on one carried pointer.
+    let mut shared_ptr_ivs: FxHashMap<(usize, GepBaseKey), Value> = FxHashMap::default();
+
     let preheader_label = func.blocks[preheader].label;
     let back_block_label = func.blocks[back_blocks[0]].label;
 
@@ -164,6 +171,29 @@ fn reduce_loop(
         for &(gep_block_idx, gep_inst_idx, gep_dest, gep_base) in &d.gep_uses {
             // Only reduce GEPs where the base is loop-invariant (skip loop-variant bases).
             if !is_loop_invariant(gep_base.0, &natural_loop.body, func) {
+                continue;
+            }
+
+            let share_key = (d.iv_index, canonical_gep_base_key(func, gep_base));
+            if let Some(&existing_ptr_iv) = shared_ptr_ivs.get(&share_key) {
+                // An equivalent GEP was already strength-reduced to a pointer
+                // IV; this one computes the same address — copy the shared IV.
+                let adjusted_idx = if gep_block_idx == header {
+                    gep_inst_idx + header_phi_insertions
+                } else {
+                    gep_inst_idx
+                };
+                if adjusted_idx < func.blocks[gep_block_idx].instructions.len() {
+                    let inst = &func.blocks[gep_block_idx].instructions[adjusted_idx];
+                    if inst.dest() == Some(gep_dest) {
+                        func.blocks[gep_block_idx].instructions[adjusted_idx] =
+                            Instruction::Copy {
+                                dest: gep_dest,
+                                src: Operand::Value(existing_ptr_iv),
+                            };
+                        reductions += 1;
+                    }
+                }
                 continue;
             }
 
@@ -337,6 +367,9 @@ fn reduce_loop(
                                 src: Operand::Value(ptr_iv_val),
                             };
                         reductions += 1;
+                        // The phi and increment are committed at this point;
+                        // equivalent GEPs may now reuse this pointer IV.
+                        shared_ptr_ivs.insert(share_key, ptr_iv_val);
                     }
                 }
             }
@@ -348,6 +381,45 @@ fn reduce_loop(
     }
 
     reductions
+}
+
+/// Key identifying equivalent GEP bases for pointer-IV sharing.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum GepBaseKey {
+    /// Canonical root value after following Copy chains.
+    Root(u32),
+    /// A global symbol address (GlobalAddr is pure, so same name = same address).
+    Global(String),
+}
+
+/// Resolve a GEP base through Copy chains to a canonical sharing key.
+fn canonical_gep_base_key(func: &IrFunction, base: Value) -> GepBaseKey {
+    let mut cur = base.0;
+    for _ in 0..MAX_CAST_CHAIN_LENGTH {
+        let mut next = None;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::Copy { dest, src: Operand::Value(src) } if dest.0 == cur => {
+                        next = Some(src.0);
+                        break;
+                    }
+                    Instruction::GlobalAddr { dest, name } if dest.0 == cur => {
+                        return GepBaseKey::Global(name.clone());
+                    }
+                    _ => {}
+                }
+            }
+            if next.is_some() {
+                break;
+            }
+        }
+        match next {
+            Some(v) => cur = v,
+            None => break,
+        }
+    }
+    GepBaseKey::Root(cur)
 }
 
 /// Find basic induction variables: phis in the header of the form
@@ -514,10 +586,12 @@ fn find_derived_exprs(
         }
     }
 
-    // Look up whether a value derives from an IV
-    let find_iv = |val_id: u32| -> Option<usize> {
-        iv_values.get(&val_id).or_else(|| iv_derived.get(&val_id)).copied()
-    };
+    // Track the linear scale of values derived from an IV. This also catches
+    // canonical simplification of `iv * 2` into `iv + iv`, and chained forms
+    // such as `(iv << 3) + (iv << 3)` used by two-wide vector GEPs.
+    let mut linear_scale: FxHashMap<u32, (usize, i64)> = FxHashMap::default();
+    for (&value, &idx) in &iv_values { linear_scale.insert(value, (idx, 1)); }
+    for (&value, &idx) in &iv_derived { linear_scale.insert(value, (idx, 1)); }
 
     // Find multiplications/shifts of IV values by constants
     for &bi in loop_body {
@@ -533,8 +607,8 @@ fn find_derived_exprs(
                     match (lhs, rhs) {
                         (Operand::Value(v), Operand::Const(c))
                         | (Operand::Const(c), Operand::Value(v)) => {
-                            if let (Some(idx), Some(s)) = (find_iv(v.0), c.to_i64()) {
-                                (*dest, idx, s)
+                            if let (Some(&(idx, base_scale)), Some(s)) = (linear_scale.get(&v.0), c.to_i64()) {
+                                (*dest, idx, base_scale.saturating_mul(s))
                             } else {
                                 continue;
                             }
@@ -546,9 +620,9 @@ fn find_derived_exprs(
                 Instruction::BinOp {
                     dest, op: IrBinOp::Shl, lhs: Operand::Value(v), rhs: Operand::Const(c), ..
                 } => {
-                    if let (Some(idx), Some(shift)) = (find_iv(v.0), c.to_i64()) {
+                    if let (Some(&(idx, base_scale)), Some(shift)) = (linear_scale.get(&v.0), c.to_i64()) {
                         if (0..64).contains(&shift) {
-                            (*dest, idx, 1i64 << shift)
+                            (*dest, idx, base_scale.saturating_mul(1i64 << shift))
                         } else {
                             continue;
                         }
@@ -556,8 +630,20 @@ fn find_derived_exprs(
                         continue;
                     }
                 }
+                Instruction::BinOp {
+                    dest, op: IrBinOp::Add,
+                    lhs: Operand::Value(a), rhs: Operand::Value(b), ..
+                } if a == b => {
+                    if let Some(&(idx, scale)) = linear_scale.get(&a.0) {
+                        (*dest, idx, scale.saturating_mul(2))
+                    } else {
+                        continue;
+                    }
+                }
                 _ => continue,
             };
+
+            linear_scale.insert(mul_dest.0, (iv_idx, stride));
 
             // Only worthwhile for strides that are common element sizes
             if stride <= 0 || stride > MAX_IV_STRIDE {
@@ -597,7 +683,70 @@ fn find_derived_exprs(
         }
     }
 
+    // Forward discovery above is intentionally cheap, but instruction ordering
+    // across transformed blocks can leave a chained expression undiscovered.
+    // Resolve each remaining GEP offset recursively from its use instead.
+    let mut defs: FxHashMap<u32, &Instruction> = FxHashMap::default();
+    for &bi in loop_body {
+        for inst in &func.blocks[bi].instructions {
+            if let Some(dest) = inst.dest() { defs.insert(dest.0, inst); }
+        }
+    }
+    let already: FxHashSet<u32> = derived.iter().flat_map(|d| d.gep_uses.iter().map(|u| u.2.0)).collect();
+    for &bi in loop_body {
+        for (ii, inst) in func.blocks[bi].instructions.iter().enumerate() {
+            let Instruction::GetElementPtr { dest, base, offset: Operand::Value(off), .. } = inst else { continue };
+            if already.contains(&dest.0) { continue; }
+            if let Some((iv_index, stride)) = resolve_linear_iv_expr(off.0, &defs, &iv_values, 0) {
+                if stride > 0 && stride <= MAX_IV_STRIDE {
+                    derived.push(DerivedExpr {
+                        stride,
+                        iv_index,
+                        gep_uses: vec![(bi, ii, *dest, *base)],
+                    });
+                }
+            }
+        }
+    }
+
     derived
+}
+
+fn resolve_linear_iv_expr(
+    value: u32,
+    defs: &FxHashMap<u32, &Instruction>,
+    iv_values: &FxHashMap<u32, usize>,
+    depth: usize,
+) -> Option<(usize, i64)> {
+    if depth >= MAX_CAST_CHAIN_LENGTH { return None; }
+    if let Some(&idx) = iv_values.get(&value) { return Some((idx, 1)); }
+    match defs.get(&value)? {
+        Instruction::Copy { src: Operand::Value(v), .. }
+        | Instruction::Cast { src: Operand::Value(v), .. } =>
+            resolve_linear_iv_expr(v.0, defs, iv_values, depth + 1),
+        Instruction::BinOp { op: IrBinOp::Mul, lhs, rhs, .. } => {
+            let (v, c) = match (lhs, rhs) {
+                (Operand::Value(v), Operand::Const(c)) | (Operand::Const(c), Operand::Value(v)) => (v, c),
+                _ => return None,
+            };
+            let factor = c.to_i64()?;
+            let (idx, scale) = resolve_linear_iv_expr(v.0, defs, iv_values, depth + 1)?;
+            Some((idx, scale.checked_mul(factor)?))
+        }
+        Instruction::BinOp { op: IrBinOp::Shl, lhs: Operand::Value(v), rhs: Operand::Const(c), .. } => {
+            let shift = c.to_i64()?;
+            if !(0..63).contains(&shift) { return None; }
+            let (idx, scale) = resolve_linear_iv_expr(v.0, defs, iv_values, depth + 1)?;
+            Some((idx, scale.checked_mul(1i64 << shift)?))
+        }
+        Instruction::BinOp { op: IrBinOp::Add, lhs: Operand::Value(a), rhs: Operand::Value(b), .. } => {
+            let (ia, sa) = resolve_linear_iv_expr(a.0, defs, iv_values, depth + 1)?;
+            let (ib, sb) = resolve_linear_iv_expr(b.0, defs, iv_values, depth + 1)?;
+            if ia != ib { return None; }
+            Some((ia, sa.checked_add(sb)?))
+        }
+        _ => None,
+    }
 }
 
 /// Look through Cast and Copy instructions to find the root value.

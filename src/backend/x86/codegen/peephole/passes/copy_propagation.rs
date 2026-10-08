@@ -116,8 +116,10 @@ pub(super) fn propagate_register_copies(store: &mut LineStore, infos: &mut [Line
 
     let mut i = 0;
     while i < len {
-        // At basic block boundaries, clear all copies
-        if infos[i].is_barrier() {
+        // At basic block boundaries, clear all copies.
+        // Exception: conditional jumps (jCC) don't clobber registers, so
+        // copy state remains valid on the fall-through path.
+        if infos[i].is_barrier() && infos[i].kind != LineKind::CondJmp {
             copy_src = [REG_NONE; 16];
             i += 1;
             continue;

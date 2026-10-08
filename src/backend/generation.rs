@@ -13,6 +13,7 @@ use crate::ir::reexports::{
     BasicBlock,
     GlobalInit,
     Instruction,
+    IrBinOp,
     IrConst,
     IrFunction,
     IrModule,
@@ -39,6 +40,151 @@ pub(super) struct GepFoldInfo {
     pub(super) offset: i64,
 }
 
+/// Information about a GEP with a *variable* offset that can be folded into
+/// indexed (register+register) addressing on targets that support it.
+/// `GEP(base, idx<<shift)` becomes `[base_reg, idx_reg, lsl #shift]`.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct IndexedGepInfo {
+    /// The base pointer value.
+    pub(super) base: Value,
+    /// The (unscaled) index value.
+    pub(super) index: Value,
+    /// Log2 scale: offset = index << shift (0 for byte offsets).
+    pub(super) shift: u8,
+}
+
+/// Build a map of value-offset GEPs foldable into indexed addressing.
+/// Conditions: offset is a Value that resolves to `index` or `index << const`
+/// (or `index * 2^k`), and the GEP dest is used only as a Load/Store pointer.
+/// Only populated for AArch64 (indexed addressing with optional LSL shift).
+fn build_indexed_gep_map(func: &IrFunction, use_counts: &[u32]) -> FxHashMap<u32, IndexedGepInfo> {
+    if std::env::var("CCC_NO_GEP_FOLD").is_ok() {
+        return FxHashMap::default();
+    }
+
+    // Resolve an offset value to (index, shift): look through a single
+    // `Shl(idx, k)` / `Mul(idx, 2^k)` / widening Cast of those.
+    let resolve_index = |off_id: u32| -> Option<(Value, u8)> {
+        // Find the defining instruction of off_id.
+        let mut def: Option<&Instruction> = None;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if inst.dest().is_some_and(|d| d.0 == off_id) {
+                    def = Some(inst);
+                }
+            }
+        }
+        // Peel a widening cast (i32 -> i64 index).
+        let mut cur = def?;
+        if let Instruction::Cast { src: Operand::Value(v), from_ty, to_ty, .. } = cur {
+            if to_ty.size() >= from_ty.size() {
+                for block in &func.blocks {
+                    for inst in &block.instructions {
+                        if inst.dest().is_some_and(|d| d.0 == v.0) {
+                            cur = inst;
+                        }
+                    }
+                }
+            }
+        }
+        match cur {
+            Instruction::BinOp { op: IrBinOp::Shl, lhs: Operand::Value(idx), rhs: Operand::Const(c), .. } => {
+                let k = c.to_i64()?;
+                if (0..=3).contains(&k) { Some((*idx, k as u8)) } else { None }
+            }
+            Instruction::BinOp { op: IrBinOp::Mul, lhs: Operand::Value(idx), rhs: Operand::Const(c), .. }
+            | Instruction::BinOp { op: IrBinOp::Mul, lhs: Operand::Const(c), rhs: Operand::Value(idx), .. } => {
+                let n = c.to_i64()?;
+                if n > 0 && (n as u64).is_power_of_two() && n <= 8 {
+                    Some((*idx, n.trailing_zeros() as u8))
+                } else {
+                    None
+                }
+            }
+            _ => {
+                // Plain value offset: treat as index with shift 0 (byte offset).
+                Some((Value(off_id), 0))
+            }
+        }
+    };
+
+    let mut map: FxHashMap<u32, IndexedGepInfo> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::GetElementPtr { dest, base, offset: Operand::Value(off), .. } = inst {
+                if let Some((index, shift)) = resolve_index(off.0) {
+                    map.insert(dest.0, IndexedGepInfo { base: *base, index, shift });
+                }
+            }
+        }
+    }
+    if map.is_empty() {
+        return map;
+    }
+
+    // Reuse the same "used only as Load/Store ptr" verification as the
+    // constant-offset fold, plus a type/shift feasibility check: the emitters
+    // must be able to fold every use, or the GEP must not be skipped.
+    let mut non_ptr_uses: FxHashSet<u32> = FxHashSet::default();
+    let mut mark_non_ptr = |id: u32| {
+        if map.contains_key(&id) {
+            non_ptr_uses.insert(id);
+        }
+    };
+    // Type-vs-shift feasibility: sub-word (8/16-bit) accesses have no shifted
+    // register-offset encoding, so a shifted index cannot fold into them.
+    let mut type_incompat: FxHashSet<u32> = FxHashSet::default();
+    let mut check_use = |map: &FxHashMap<u32, IndexedGepInfo>, ptr: u32, ty: &IrType, incompat: &mut FxHashSet<u32>| {
+        if let Some(info) = map.get(&ptr) {
+            let sub_word = matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16);
+            if sub_word && info.shift != 0 {
+                incompat.insert(ptr);
+            }
+        }
+    };
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Load { ptr, ty, seg_override, .. } => {
+                    if matches!(ty, IrType::I128 | IrType::U128)
+                        || *seg_override != AddressSpace::Default {
+                        mark_non_ptr(ptr.0);
+                    }
+                    check_use(&map, ptr.0, ty, &mut type_incompat);
+                }
+                Instruction::Store { val, ptr, ty, seg_override, .. } => {
+                    if let Operand::Value(v) = val { mark_non_ptr(v.0); }
+                    if matches!(ty, IrType::I128 | IrType::U128)
+                        || *seg_override != AddressSpace::Default {
+                        mark_non_ptr(ptr.0);
+                    }
+                    check_use(&map, ptr.0, ty, &mut type_incompat);
+                }
+                _ => {
+                    for_each_operand_in_instruction(inst, |op| {
+                        if let Operand::Value(v) = op { mark_non_ptr(v.0); }
+                    });
+                    for_each_value_use_in_instruction(inst, |v| mark_non_ptr(v.0));
+                }
+            }
+        }
+        for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op { mark_non_ptr(v.0); }
+        });
+    }
+    for val_id in &non_ptr_uses {
+        map.remove(val_id);
+    }
+    for val_id in &type_incompat {
+        map.remove(val_id);
+    }
+    map.retain(|val_id, _| {
+        (*val_id as usize) < use_counts.len() && use_counts[*val_id as usize] > 0
+    });
+    map
+}
+
+
 /// Build a map of GEP destinations that can be folded into Load/Store instructions.
 ///
 /// A GEP is foldable when:
@@ -50,6 +196,9 @@ pub(super) struct GepFoldInfo {
 /// When all conditions are met, the GEP instruction is skipped during codegen,
 /// and each Load/Store that uses it receives the (base, offset) directly.
 fn build_gep_fold_map(func: &IrFunction, use_counts: &[u32]) -> FxHashMap<u32, GepFoldInfo> {
+    if std::env::var("CCC_NO_GEP_FOLD").is_ok() {
+        return FxHashMap::default();
+    }
     let mut gep_map: FxHashMap<u32, GepFoldInfo> = FxHashMap::default();
 
     // Phase 1: Collect all GEPs with constant offsets.
@@ -437,7 +586,7 @@ fn count_value_uses(func: &IrFunction) -> Vec<u32> {
 /// Detect if a block's last instruction is a Cmp whose result is only used
 /// by the block's CondBranch terminator. Returns the index of the Cmp if
 /// fusion is possible, None otherwise.
-fn detect_cmp_branch_fusion(block: &BasicBlock, use_counts: &[u32]) -> Option<usize> {
+fn detect_cmp_branch_fusion(block: &BasicBlock, use_counts: &[u32], fuse_fp: bool) -> Option<(usize, Option<usize>)> {
     // Terminator must be a CondBranch
     let (cond, _, _) = match &block.terminator {
         Terminator::CondBranch { cond, true_label, false_label } => (cond, true_label, false_label),
@@ -450,36 +599,332 @@ fn detect_cmp_branch_fusion(block: &BasicBlock, use_counts: &[u32]) -> Option<us
         _ => return None,
     };
 
-    // Find the last instruction that is a Cmp producing this value
-    let last_idx = block.instructions.len().checked_sub(1)?;
-    let last_inst = &block.instructions[last_idx];
-
-    let (dest, _op, _lhs, _rhs, ty) = match last_inst {
-        Instruction::Cmp { dest, op, lhs, rhs, ty } => (dest, op, lhs, rhs, ty),
+    // Locate the Cmp feeding the branch, plus an optional dead trailing Copy
+    // to skip (common after phi-web lowering: Cmp ; Copy ; CondBranch).
+    let n = block.instructions.len();
+    if n == 0 {
+        return None;
+    }
+    let (cmp_idx, dead_copy_idx) = match &block.instructions[n - 1] {
+        // Common case: the Cmp is the last instruction.
+        Instruction::Cmp { dest, .. } if dest.0 == cond_val.0 => (n - 1, None),
+        _ if n >= 2 => {
+            let (cmp_dest, copy_idx) = match &block.instructions[n - 2] {
+                Instruction::Cmp { dest, .. } => (dest.0, n - 1),
+                _ => return None,
+            };
+            let Instruction::Copy { dest: cd, src: Operand::Value(cs) } = &block.instructions[copy_idx]
+            else {
+                return None;
+            };
+            if cs.0 != cmp_dest {
+                return None;
+            }
+            let cmp_uses = use_counts.get(cmp_dest as usize).copied().unwrap_or(u32::MAX);
+            if cond_val.0 == cmp_dest {
+                // Branch reads the Cmp directly; the Copy must be dead.
+                if use_counts.get(cd.0 as usize).copied().unwrap_or(0) != 0 || cmp_uses != 2 {
+                    return None;
+                }
+            } else if cond_val.0 == cd.0 {
+                // Branch reads the Copy; the Cmp must feed only the Copy.
+                if use_counts.get(cd.0 as usize).copied().unwrap_or(u32::MAX) != 1 || cmp_uses != 1 {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+            (n - 2, Some(copy_idx))
+        }
         _ => return None,
     };
 
-    // The Cmp dest must be the same as the CondBranch cond
-    if dest.0 != cond_val.0 {
-        return None;
-    }
+    let (_, ty) = match &block.instructions[cmp_idx] {
+        Instruction::Cmp { dest, ty, .. } => (dest, ty),
+        _ => return None,
+    };
 
-    // Don't fuse wide-int or float comparisons (they have special codegen paths).
+    // Don't fuse wide-int comparisons (they have special codegen paths).
+    // FP comparisons only on backends with a fused FP compare-and-branch.
     // On 32-bit targets, also exclude I64/U64: the fused compare-and-branch
     // uses 32-bit cmpl which only tests the low half of a 64-bit value.
-    if is_wide_int_type(*ty) || ty.is_float() {
+    if is_wide_int_type(*ty) || (ty.is_float() && !fuse_fp) {
         return None;
     }
     if crate::common::types::target_is_32bit() && matches!(ty, IrType::I64 | IrType::U64) {
         return None;
     }
 
-    // The Cmp result must be used exactly once (by the CondBranch terminator)
-    if (cond_val.0 as usize) < use_counts.len() && use_counts[cond_val.0 as usize] == 1 {
-        Some(last_idx)
-    } else {
-        None
+    // For the simple case the Cmp result must be used exactly once (by the
+    // CondBranch terminator). The dead-Copy case carries its own counts above.
+    if dead_copy_idx.is_none()
+        && !((cond_val.0 as usize) < use_counts.len() && use_counts[cond_val.0 as usize] == 1)
+    {
+        return None;
     }
+    Some((cmp_idx, dead_copy_idx))
+}
+
+/// Detect compare-and-select fusion opportunities within a block.
+///
+/// Finds `Select` instructions whose condition is an integer Cmp result used
+/// nowhere else (optionally through one dead Copy), e.g. what if-conversion
+/// produces for `if (a > 0) s += a`. Fusing skips the cset materialization
+/// and emits compare + conditional-select directly.
+///
+/// Soundness: fusion moves the flag-setting compare from the Cmp's position
+/// to the Select's. The register allocator computed operand live ranges from
+/// the Cmp's IR position, so any intervening instruction may legally recycle
+/// the compare operands' physical registers — the late compare would then
+/// read a stale register (sqlite's vdbeSorterCompareInt returned a constant
+/// ±1 because the `(v1^v2)&0x80` compare operand was overwritten by an
+/// intervening cast). We therefore require the Cmp to immediately precede
+/// the Select (modulo one dead Copy), the same discipline as
+/// detect_cmp_branch_fusion.
+///
+/// Returns one entry per fusable Select: (select_idx, cmp_idx, dead_copy_idx).
+/// The cmp_idx/dead_copy_idx instructions are skipped by the caller.
+fn detect_cmp_select_fusion(
+    block: &BasicBlock,
+    use_counts: &[u32],
+) -> Vec<(usize, usize, Option<usize>)> {
+    let uses = |v: u32| -> u32 { use_counts.get(v as usize).copied().unwrap_or(u32::MAX) };
+    let mut out = Vec::new();
+    for (sel_idx, inst) in block.instructions.iter().enumerate() {
+        let Instruction::Select { cond: Operand::Value(cond_v), ty: sel_ty, .. } = inst else {
+            continue;
+        };
+        if sel_ty.is_long_double() || sel_ty.is_128bit() {
+            continue;
+        }
+        // Find the defining Cmp of the select condition, either directly or
+        // through one Copy — it must be ADJACENT (immediately before the
+        // Select, or before one trailing dead Copy) so no intervening
+        // instruction can recycle the compare operands' registers.
+        let mut cmp_idx = None;
+        let mut copy_idx = None;
+        if sel_idx >= 1 {
+            if let Instruction::Cmp { dest, .. } = &block.instructions[sel_idx - 1] {
+                if dest.0 == cond_v.0 {
+                    cmp_idx = Some(sel_idx - 1);
+                }
+            }
+        }
+        if cmp_idx.is_none() && sel_idx >= 2 {
+            if let Instruction::Copy { dest, src: Operand::Value(src) } = &block.instructions[sel_idx - 1] {
+                if dest.0 == cond_v.0 {
+                    if let Instruction::Cmp { dest: cd, .. } = &block.instructions[sel_idx - 2] {
+                        if cd.0 == src.0 {
+                            cmp_idx = Some(sel_idx - 2);
+                            copy_idx = Some(sel_idx - 1);
+                        }
+                    }
+                }
+            }
+        }
+        let Some(ci) = cmp_idx else { continue };
+        let Instruction::Cmp { dest: cmp_dest, ty: cmp_ty, .. } = &block.instructions[ci] else {
+            continue;
+        };
+        // Integer comparisons only: FP compares need fcmp and a different
+        // condition-code mapping.
+        if cmp_ty.is_float() || cmp_ty.is_long_double() || cmp_ty.is_128bit() {
+            continue;
+        }
+        // The cmp result must feed only the select (directly, or via the copy).
+        if copy_idx.is_some() {
+            if uses(cmp_dest.0) != 1 || uses(cond_v.0) != 1 {
+                continue;
+            }
+        } else if uses(cmp_dest.0) != 1 {
+            continue;
+        }
+        out.push((sel_idx, ci, copy_idx));
+    }
+    out
+}
+
+
+/// Detect multiply-add fusion opportunities within a block.
+///
+/// Finds `BinOp::Mul` instructions whose result is used exactly once as an
+/// operand of the immediately following `BinOp::Add` instruction. When fused,
+/// the multiply result stays in %eax (the accumulator) and is added directly
+/// to the accumulator variable, avoiding the multiply temp being register-
+/// allocated (which would consume a callee-saved register needed for ILP).
+///
+/// Returns a set of instruction indices that should be skipped because they
+/// will be handled by the preceding Mul's fused emission.
+fn detect_mul_add_fusions(block: &BasicBlock, use_counts: &[u32], fuse_float: bool, accumulator_dests: &FxHashSet<u32>) -> FxHashSet<usize> {
+    let mut skip_set = FxHashSet::default();
+
+    for (idx, inst) in block.instructions.iter().enumerate() {
+        // Look for BinOp::Mul
+        let (mul_dest, mul_ty) = match inst {
+            Instruction::BinOp { dest, op: crate::ir::reexports::IrBinOp::Mul, ty, .. } => (dest, ty),
+            _ => continue,
+        };
+
+        // Float fusion is enabled only when the backend has a native implementation.
+        if (mul_ty.is_float() && !fuse_float) || matches!(mul_ty, IrType::F128 | IrType::I128 | IrType::U128) {
+            continue;
+        }
+
+        // Multiply result must have exactly 1 use
+        let mul_uses = if (mul_dest.0 as usize) < use_counts.len() {
+            use_counts[mul_dest.0 as usize]
+        } else {
+            0
+        };
+        if mul_uses != 1 {
+            continue;
+        }
+
+        // Next instruction must be a BinOp::Add (or, for floats with native
+        // fused multiply-subtract, a BinOp::Sub) that uses the multiply result
+        let next_idx = idx + 1;
+        if next_idx >= block.instructions.len() {
+            continue;
+        }
+        let next_inst = &block.instructions[next_idx];
+        let (add_lhs, add_rhs, add_ty) = match next_inst {
+            Instruction::BinOp { op: crate::ir::reexports::IrBinOp::Add, lhs, rhs, ty, .. } => (lhs, rhs, ty),
+            // a - b*c → fmsub, b*c - a → fnmsub (single-rounding, matching
+            // GCC -O2's -ffp-contract=fast). Float-only: integer mul-temp
+            // fusion stays Add-only. CCC_NO_FMSUB restores Add-only behavior.
+            // Skipped when the Sub dest is a loop-carried accumulator: fusing
+            // an accumulator update lengthens the serial dependency chain.
+            Instruction::BinOp { dest: sub_dest, op: crate::ir::reexports::IrBinOp::Sub, lhs, rhs, ty, .. }
+                if mul_ty.is_float() && fuse_float && std::env::var("CCC_NO_FMSUB").is_err()
+                    && !accumulator_dests.contains(&sub_dest.0) =>
+            {
+                (lhs, rhs, ty)
+            }
+            // Integer a - b*c → msub (single instruction on AArch64). Only
+            // when the mul is the Sub's right operand; b*c - a has no msub
+            // form. CCC_NO_MSUB restores separate mul + sub.
+            Instruction::BinOp { op: crate::ir::reexports::IrBinOp::Sub, lhs, rhs, ty, .. }
+                if !mul_ty.is_float() && std::env::var("CCC_NO_MSUB").is_err()
+                    && matches!(rhs, Operand::Value(v) if v.0 == mul_dest.0) =>
+            {
+                (lhs, rhs, ty)
+            }
+            _ => continue,
+        };
+
+        // The multiply result must be one of the add operands
+        let mul_is_lhs = matches!(add_lhs, Operand::Value(v) if v.0 == mul_dest.0);
+        let mul_is_rhs = matches!(add_rhs, Operand::Value(v) if v.0 == mul_dest.0);
+        if !mul_is_lhs && !mul_is_rhs {
+            continue;
+        }
+
+        // Types must be compatible
+        if mul_ty != add_ty {
+            continue;
+        }
+
+        // Mark the add instruction to be skipped — it will be emitted fused with the mul
+        skip_set.insert(next_idx);
+    }
+
+    skip_set
+}
+
+/// Find gap-fused multiply-add candidates: `fmul` at idx, one or two harmless
+/// instructions (Load/GEP — the j-side address computation and velocity load
+/// in nbody), then `fadd` consuming the mul result. The fmadd is emitted AT
+/// the Add so the gap instructions land in between. Returns
+/// (mul_idx, add_idx, gap_indices). The driver validates register aliasing
+/// before committing. CCC_NO_GAP_FMA disables.
+fn detect_gap_fma_fusions(
+    block: &BasicBlock,
+    use_counts: &[u32],
+    fuse_float: bool,
+    accumulator_dests: &FxHashSet<u32>,
+) -> Vec<(usize, usize, Vec<usize>)> {
+    let mut out = Vec::new();
+    if !fuse_float || std::env::var("CCC_NO_GAP_FMA").is_ok() {
+        return out;
+    }
+    for (idx, inst) in block.instructions.iter().enumerate() {
+        let (mul_dest, mul_ty) = match inst {
+            Instruction::BinOp { dest, op: crate::ir::reexports::IrBinOp::Mul, ty, .. } => (dest, ty),
+            _ => continue,
+        };
+        if !mul_ty.is_float() || matches!(mul_ty, IrType::F128) {
+            continue;
+        }
+        // Multiply result must have exactly 1 use (the add).
+        let mul_uses = if (mul_dest.0 as usize) < use_counts.len() {
+            use_counts[mul_dest.0 as usize]
+        } else {
+            0
+        };
+        if mul_uses != 1 {
+            continue;
+        }
+        let mut gap: Vec<usize> = Vec::new();
+        let mut found = None;
+        for j in (idx + 1)..block.instructions.len() {
+            match &block.instructions[j] {
+                Instruction::Load { .. } | Instruction::GetElementPtr { .. } if gap.len() < 2 => {
+                    gap.push(j);
+                }
+                Instruction::BinOp { dest: add_dest, op: crate::ir::reexports::IrBinOp::Add, lhs, rhs, ty: add_ty, .. }
+                    if !gap.is_empty() =>
+                {
+                    let mul_used = matches!(lhs, Operand::Value(v) if v.0 == mul_dest.0)
+                        || matches!(rhs, Operand::Value(v) if v.0 == mul_dest.0);
+                    if mul_used && *add_ty == *mul_ty && !accumulator_dests.contains(&add_dest.0) {
+                        found = Some(j);
+                    }
+                    break;
+                }
+                _ => break,
+            }
+        }
+        if let Some(add_idx) = found {
+            if std::env::var("CCC_DEBUG_GAPFMA").is_ok() {
+                eprintln!("[GAPFMA] candidate mul={} add={} gap={:?}", idx, add_idx, gap);
+            }
+            out.push((idx, add_idx, gap));
+        }
+    }
+    out
+}
+
+/// Find adjacent `shift; logical` pairs that AArch64 can encode as one
+/// shifted-register logical instruction.  Requiring one use makes eliding the
+/// standalone shift safe.
+fn detect_shifted_logical_fusions(block: &BasicBlock, use_counts: &[u32]) -> FxHashSet<usize> {
+    let mut logical_indices = FxHashSet::default();
+    for (idx, pair) in block.instructions.windows(2).enumerate() {
+        let (shift_dest, shift_ty) = match &pair[0] {
+            Instruction::BinOp { dest, op, rhs: Operand::Const(_), ty, .. }
+                if matches!(op, crate::ir::reexports::IrBinOp::Shl
+                    | crate::ir::reexports::IrBinOp::LShr
+                    | crate::ir::reexports::IrBinOp::AShr)
+                    && matches!(ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64) => (dest, ty),
+            _ => continue,
+        };
+        if use_counts.get(shift_dest.0 as usize).copied().unwrap_or(0) != 1 {
+            continue;
+        }
+        let (lhs, rhs, logical_ty) = match &pair[1] {
+            Instruction::BinOp { op, lhs, rhs, ty, .. }
+                if matches!(op, crate::ir::reexports::IrBinOp::And
+                    | crate::ir::reexports::IrBinOp::Or
+                    | crate::ir::reexports::IrBinOp::Xor) => (lhs, rhs, ty),
+            _ => continue,
+        };
+        let uses_shift = matches!(lhs, Operand::Value(v) if v.0 == shift_dest.0)
+            || matches!(rhs, Operand::Value(v) if v.0 == shift_dest.0);
+        if uses_shift && logical_ty == shift_ty {
+            logical_indices.insert(idx + 1);
+        }
+    }
+    logical_indices
 }
 
 /// Generate assembly for a module using the given architecture's codegen.
@@ -522,6 +967,9 @@ pub fn generate_module(cg: &mut dyn ArchCodegen, module: &IrModule, source_mgr: 
 
     // Emit architecture-specific runtime helper stubs (e.g., i686 __divdi3)
     cg.emit_runtime_stubs();
+
+    // Emit floating-point constant pool (.rodata)
+    cg.state().emit_fp_const_pool();
 
     // Emit .note.GNU-stack section to indicate non-executable stack
     cg.state().emit("");
@@ -891,9 +1339,39 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
     cg.state().has_dyn_alloca = has_dyn_alloca;
     cg.state().uses_sret = func.uses_sret;
 
+    // Determine if we can omit the frame pointer for this function.
+    // Eligible if: no dynamic alloca, not variadic, no inline asm referencing %rbp.
+    let has_inline_asm_rbp = func.blocks.iter().any(|block| {
+        block.instructions.iter().any(|inst| {
+            if let Instruction::InlineAsm { template, .. } = inst {
+                template.contains("%rbp") || template.contains("{rbp}")
+            } else {
+                false
+            }
+        })
+    });
+    // Frame pointer omission: eligible when no DynAlloca, not variadic, no inline asm %rbp,
+    // and no vector intrinsics (which have special stack slot requirements).
+    let has_vector_intrinsics = func.blocks.iter().any(|block| {
+        block.instructions.iter().any(|inst| {
+            matches!(inst, Instruction::Intrinsic { op, .. }
+                if matches!(op,
+                    crate::ir::intrinsics::IntrinsicOp::FmaF64x4
+                    | crate::ir::intrinsics::IntrinsicOp::FmaF64x2
+                    | crate::ir::intrinsics::IntrinsicOp::FmaF64x2Hoisted
+                    | crate::ir::intrinsics::IntrinsicOp::VecZeroF64x4
+                    | crate::ir::intrinsics::IntrinsicOp::VecZeroF64x2
+                    | crate::ir::intrinsics::IntrinsicOp::LoadF64x4
+                    | crate::ir::intrinsics::IntrinsicOp::LoadF64x2
+                ))
+        })
+    });
+    cg.state().omit_frame_pointer = !has_dyn_alloca && !func.is_variadic && !has_inline_asm_rbp && !has_vector_intrinsics;
+
     // Calculate stack space and emit prologue
     let raw_space = cg.calculate_stack_space(func);
     let frame_size = cg.aligned_frame_size(raw_space);
+    cg.state().frame_size = frame_size;
     cg.emit_prologue(func, frame_size);
 
     // Store parameters
@@ -905,10 +1383,19 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
     // Pre-scan: count uses of each Value across the entire function to identify
     // single-use Cmp results eligible for compare-branch fusion.
     let value_use_counts = count_value_uses(func);
+    cg.state().value_use_counts = value_use_counts.clone();
 
     // Pre-scan: identify GEPs with constant offsets that can be folded into
     // Load/Store addressing modes, eliminating the GEP instruction entirely.
     let gep_fold_map = build_gep_fold_map(func, &value_use_counts);
+
+    // Pre-scan: identify GEPs with variable offsets that can be folded into
+    // indexed (register+register) addressing on targets that support it.
+    let indexed_gep_map = if cg.supports_indexed_addr() {
+        build_indexed_gep_map(func, &value_use_counts)
+    } else {
+        FxHashMap::default()
+    };
 
     // Pre-scan: map Value IDs to global symbol names (with offsets from GEP).
     // Used to emit direct symbol(%rip) references for segment-overridden loads/stores.
@@ -937,6 +1424,61 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
     let emit_debug = cg.state_ref().debug_info && source_mgr.is_some() && !file_table.is_empty();
     let mut last_debug_file: u32 = 0;
     let mut last_debug_line: u32 = 0;
+    cg.state().current_program_point = 0;
+
+    // Loop-carried accumulator destinations. Fusing `acc -= a*b` into fmsub
+    // puts the multiply on the accumulator's serial dependency chain (fmsub
+    // has longer latency than fsub), which measurably slows latency-bound
+    // accumulate loops (nbody: +13%). Such Subs stay split so the multiply
+    // issues independently of the chain. Accumulators are recognized as:
+    // surviving Phi dests (if elimination hasn't run), dests of multiple
+    // Copies (the phi-web shape after phi elimination), and memory-promoted
+    // loop F64 values.
+    let mut accumulator_dests: FxHashSet<u32> = func
+        .loop_promoted_f64_values
+        .iter()
+        .map(|v| v.0)
+        .collect();
+    {
+        let mut copy_def_count: FxHashMap<u32, u32> = FxHashMap::default();
+        for b in &func.blocks {
+            for inst in &b.instructions {
+                match inst {
+                    Instruction::Phi { dest, .. } => {
+                        accumulator_dests.insert(dest.0);
+                    }
+                    Instruction::Copy { dest, .. } => {
+                        let c = copy_def_count.entry(dest.0).or_insert(0);
+                        *c += 1;
+                        if *c == 2 {
+                            accumulator_dests.insert(dest.0);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Pull in values feeding accumulators through Copy chains: the backedge
+        // source of an accumulator phi (e.g. the fresh `Sub` dest that is
+        // copied into the accumulator register at the latch) sits on the same
+        // serial chain, so fusing it is just as harmful.
+        loop {
+            let mut grew = false;
+            for b in &func.blocks {
+                for inst in &b.instructions {
+                    if let Instruction::Copy { dest, src: Operand::Value(s) } = inst {
+                        if accumulator_dests.contains(&dest.0) && !accumulator_dests.contains(&s.0) {
+                            accumulator_dests.insert(s.0);
+                            grew = true;
+                        }
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+    }
 
     for block in &func.blocks {
         if Some(block.label) != entry_label {
@@ -951,25 +1493,153 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
         // If the last instruction is a Cmp whose result is only used by the
         // CondBranch terminator, emit a fused compare-and-conditional-jump
         // instead of materializing the boolean result to a register/stack slot.
-        let fuse_idx = detect_cmp_branch_fusion(block, &value_use_counts);
+        let fuse_idx = detect_cmp_branch_fusion(block, &value_use_counts, cg.supports_fused_fp_cmp_branch());
+        let mul_add_fusions = detect_mul_add_fusions(block, &value_use_counts, cg.supports_fused_float_mul_add(), &accumulator_dests);
+        // Gap-fused fmadd candidates: Mul, Load, Add. Validated against
+        // register assignments below — the intervening load's destination
+        // register must not alias either multiply operand's register.
+        let mut gap_mul_skips: FxHashSet<usize> = FxHashSet::default();
+        let mut gap_add_fusions: FxHashMap<usize, usize> = FxHashMap::default();
+        for &(mul_idx, add_idx, ref gap) in &detect_gap_fma_fusions(block, &value_use_counts, cg.supports_fused_float_mul_add(), &accumulator_dests) {
+            let (mul_lhs, mul_rhs) = match &block.instructions[mul_idx] {
+                Instruction::BinOp { lhs, rhs, .. } => (lhs.clone(), rhs.clone()),
+                _ => continue,
+            };
+            // Register safety: no gap instruction's destination register may
+            // alias either multiply operand's register (GEP dests are GPRs,
+            // disjoint from the FP operands; the load's FP dest is checked).
+            let mut clash = false;
+            for &g in gap {
+                let gap_dest = match &block.instructions[g] {
+                    Instruction::Load { dest, .. } => Some(*dest),
+                    Instruction::GetElementPtr { dest, .. } => Some(*dest),
+                    _ => None,
+                };
+                if let Some(gd) = gap_dest {
+                    let gap_phys = cg.get_phys_reg_for_value(gd.0);
+                    if gap_phys.is_none() {
+                        continue;
+                    }
+                    for op in [&mul_lhs, &mul_rhs] {
+                        if let Operand::Value(v) = op {
+                            if cg.get_phys_reg_for_value(v.0) == gap_phys {
+                                clash = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if clash {
+                if std::env::var("CCC_DEBUG_GAPFMA").is_ok() { eprintln!("[GAPFMA] REJECT physreg clash mul={}", mul_idx); }
+                continue;
+            }
+            gap_mul_skips.insert(mul_idx);
+            gap_add_fusions.insert(add_idx, mul_idx);
+        }
+        let cmp_select_fusions = if cg.supports_fused_cmp_select() {
+            detect_cmp_select_fusion(block, &value_use_counts)
+        } else {
+            Vec::new()
+        };
+        let shifted_logical_fusions = if cg.supports_shifted_logical() {
+            detect_shifted_logical_fusions(block, &value_use_counts)
+        } else {
+            FxHashSet::default()
+        };
+        let mut skip_fused_add = false;
+        let mut skip_fused_logical = false;
+        let mi_enabled = cg.is_machinst_enabled();
+
+        // Compute per-block use counts for liveness-aware MachInst store-back.
+        if mi_enabled {
+            cg.state().block_use_counts.clear();
+            for inst in &block.instructions {
+                use crate::backend::liveness::for_each_operand_in_instruction;
+                for_each_operand_in_instruction(inst, |op| {
+                    if let Operand::Value(v) = op {
+                        *cg.state().block_use_counts.entry(v.0).or_insert(0) += 1;
+                    }
+                });
+                // Load ptr and Store ptr not visited by for_each_operand
+                match inst {
+                    Instruction::Load { ptr, .. } | Instruction::Store { ptr, .. } => {
+                        *cg.state().block_use_counts.entry(ptr.0).or_insert(0) += 1;
+                    }
+                    Instruction::GetElementPtr { base, .. } => {
+                        *cg.state().block_use_counts.entry(base.0).or_insert(0) += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
 
         for (idx, inst) in block.instructions.iter().enumerate() {
-            if Some(idx) == fuse_idx {
+            if Some(idx) == fuse_idx.map(|f| f.0) {
                 // Skip this Cmp -- it will be emitted fused with the terminator
                 continue;
             }
+            if fuse_idx.and_then(|f| f.1) == Some(idx) {
+                // Skip the dead Copy between the Cmp and the fused branch.
+                continue;
+            }
+            if cmp_select_fusions.iter().any(|&(_, ci, copy_i)| ci == idx || copy_i == Some(idx)) {
+                // Skip the Cmp (and dead Copy) folded into a fused
+                // compare-and-select emitted at the Select below.
+                cg.state().current_program_point += 1;
+                continue;
+            }
+            // Skip the Add that was already emitted as part of a fused Mul-Add.
+            // This flag is set by the Mul handler below when fusion fires.
+            if skip_fused_add {
+                skip_fused_add = false;
+                cg.state().current_program_point += 1;
+                continue;
+            }
+            // Gap-fused fmadd: skip the Mul (its result is computed by the
+            // fmadd emitted at the Add, after the intervening Load).
+            if gap_mul_skips.contains(&idx) {
+                cg.state().current_program_point += 1;
+                continue;
+            }
+            if let Some(&mul_idx) = gap_add_fusions.get(&idx) {
+                if let (
+                    Instruction::BinOp { dest: mul_dest, lhs: mul_lhs, rhs: mul_rhs, ty: mul_ty, .. },
+                    Instruction::BinOp { dest: add_dest, lhs: add_lhs, rhs: add_rhs, .. },
+                ) = (&block.instructions[mul_idx], inst)
+                {
+                    let mul_is_lhs = matches!(add_lhs, Operand::Value(v) if v.0 == mul_dest.0);
+                    let acc_op = if mul_is_lhs { add_rhs } else { add_lhs };
+                    cg.emit_fused_mul_add(mul_dest, mul_lhs, mul_rhs, acc_op, add_dest, *mul_ty);
+                    cg.state().current_program_point += 1;
+                    continue;
+                }
+            }
+            if skip_fused_logical {
+                skip_fused_logical = false;
+                cg.state().current_program_point += 1;
+                continue;
+            }
             // Skip GEP instructions whose offset has been folded into Load/Store.
-            // Safe to skip when:
-            // 1. Base is an alloca (Direct or OverAligned): alloca slots are stable
-            //    and never reused by liveness packing.
-            // 2. Base has a register assignment: the liveness analysis has been
-            //    extended to keep the base alive through all Load/Store uses of
-            //    this GEP result (see extend_gep_base_liveness in liveness.rs),
-            //    so the register holds the correct value at the use points.
+            // Note: the base must be alloca- or register-resident. A slot-homed
+            // (Indirect) base may have its interval end at the GEP — its last
+            // IR use — and the folded load would read the slot AFTER Tier-2
+            // slot packing may have reused it. Do not widen to Indirect.
             if let Instruction::GetElementPtr { dest, base, .. } = inst {
                 if gep_fold_map.contains_key(&dest.0) &&
                    (cg.state_ref().is_alloca(base.0) || cg.get_phys_reg_for_value(base.0).is_some()) {
+                    cg.state().folded_gep_values.insert(dest.0);
+                    cg.state().current_program_point += 1;
                     continue;
+                }
+                // Skip GEPs folded into indexed (register+register) addressing:
+                // both base and index must be register-resident to fold.
+                if let Some(info) = indexed_gep_map.get(&dest.0) {
+                    if cg.get_phys_reg_for_value(base.0).is_some()
+                        && cg.get_phys_reg_for_value(info.index.0).is_some() {
+                        cg.state().folded_gep_values.insert(dest.0);
+                        cg.state().current_program_point += 1;
+                        continue;
+                    }
                 }
             }
 
@@ -981,10 +1651,94 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
                 }
             }
 
-            generate_instruction(cg, inst, &gep_fold_map, &global_addr_map, &global_addr_ptr_set, &dead_global_addrs);
+            // Multiply-add fusion: when a Mul's result is not register-allocated
+            // and feeds directly into the next Add, emit a fused 3-instruction
+            // sequence through %eax. This creates a 3rd multiply ILP channel
+            // alongside the 2 register-allocated temp channels (r12, rbx).
+            if let Instruction::BinOp { dest, op: crate::ir::reexports::IrBinOp::Mul, lhs, rhs, ty } = inst {
+                if mul_add_fusions.contains(&(idx + 1)) {
+                    // Fuse for floats (native fmadd) and for integers alike:
+                    // one madd/msub replaces mul+add/sub — same latency as
+                    // the mul on Apple Silicon, one fewer instruction, and
+                    // the temp's register is freed. CCC_NO_INT_MADD restores
+                    // the slot-homed-only integer behavior.
+                    if cg.get_phys_reg_for_value(dest.0).is_none() || ty.is_float()
+                        || std::env::var("CCC_NO_INT_MADD").is_err() {
+                        match block.instructions.get(idx + 1) {
+                            Some(Instruction::BinOp { dest: add_dest, op: crate::ir::reexports::IrBinOp::Add,
+                                                      lhs: add_lhs, rhs: add_rhs, ty: add_ty, .. }) => {
+                                let mul_is_lhs = matches!(add_lhs, Operand::Value(v) if v.0 == dest.0);
+                                let acc_op = if mul_is_lhs { add_rhs } else { add_lhs };
+                                cg.emit_fused_mul_add(dest, lhs, rhs, acc_op, add_dest, *add_ty);
+                                skip_fused_add = true;
+                                cg.state().current_program_point += 1;
+                                continue;
+                            }
+                            Some(Instruction::BinOp { dest: sub_dest, op: crate::ir::reexports::IrBinOp::Sub,
+                                                      lhs: sub_lhs, rhs: sub_rhs, ty: sub_ty, .. }) => {
+                                // a - b*c: fmsub(acc=a). b*c - a: fnmsub(acc=a).
+                                let mul_is_lhs = matches!(sub_lhs, Operand::Value(v) if v.0 == dest.0);
+                                let acc_op = if mul_is_lhs { sub_rhs } else { sub_lhs };
+                                cg.emit_fused_mul_sub(dest, lhs, rhs, acc_op, sub_dest, *sub_ty, mul_is_lhs);
+                                skip_fused_add = true;
+                                cg.state().current_program_point += 1;
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            if let Instruction::BinOp { dest: shift_dest, op: shift_op, lhs: shift_lhs,
+                                        rhs: shift_amount, ty } = inst {
+                if shifted_logical_fusions.contains(&(idx + 1)) {
+                    if let Some(Instruction::BinOp { dest, op: logical_op, lhs, rhs, .. }) =
+                        block.instructions.get(idx + 1)
+                    {
+                        let shift_is_lhs = matches!(lhs, Operand::Value(v) if v.0 == shift_dest.0);
+                        let other = if shift_is_lhs { rhs } else { lhs };
+                        cg.emit_shifted_logical(shift_dest, *shift_op, shift_lhs, shift_amount,
+                                                *logical_op, other, dest, *ty);
+                        skip_fused_logical = true;
+                        cg.state().current_program_point += 1;
+                        continue;
+                    }
+                }
+            }
+
+            // Fused compare-and-select: the Cmp feeding this Select was skipped
+            // above; emit compare + conditional-select directly.
+            if let Some(&(_, ci, _)) = cmp_select_fusions.iter().find(|&&(si, _, _)| si == idx) {
+                if let (Instruction::Select { dest, true_val, false_val, ty: sel_ty, .. },
+                        Instruction::Cmp { op, lhs, rhs, ty: cmp_ty, .. }) =
+                    (inst, &block.instructions[ci])
+                {
+                    cg.emit_fused_cmp_select(*op, lhs, rhs, *cmp_ty, true_val, false_val, dest, *sel_ty);
+                    cg.state().current_program_point += 1;
+                    continue;
+                }
+            }
+
+            // Try MachInst pipeline first (virtual register ISel).
+            // If the instruction is handled, it's accumulated in the MachInst buffer.
+            // When an unhandled instruction is encountered, the buffer is flushed
+            // (allocated and emitted) before falling through to the default codegen.
+            if cg.try_lower_machinst(inst) {
+                cg.state().current_program_point += 1;
+                continue;
+            }
+            // Flush any accumulated MachInst buffer before emitting via default path
+            cg.flush_machinst();
+
+            generate_instruction(cg, inst, &gep_fold_map, &indexed_gep_map, &global_addr_map, &global_addr_ptr_set, &dead_global_addrs);
+            cg.state().current_program_point += 1;
         }
 
-        if let Some(fi) = fuse_idx {
+        // Flush MachInst buffer at end of block (before terminator)
+        cg.flush_machinst();
+
+        if let Some((fi, _)) = fuse_idx {
             // Emit fused compare-and-branch: cmp + jCC directly
             if let Instruction::Cmp { dest: _, op, lhs, rhs, ty } = &block.instructions[fi] {
                 if let Terminator::CondBranch { cond: _, true_label, false_label } = &block.terminator {
@@ -994,6 +1748,8 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
         } else {
             generate_terminator(cg, &block.terminator, frame_size);
         }
+        // Count terminator as a program point (matches liveness analysis)
+        cg.state().current_program_point += 1;
     }
 
     if emit_cfi {
@@ -1041,7 +1797,7 @@ fn emit_loc_directive(
 ///
 /// Instructions that clobber the accumulator unpredictably (calls, stores, atomics,
 /// inline asm, va_arg, memcpy, etc.) invalidate the cache after execution.
-fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction, gep_fold_map: &FxHashMap<u32, GepFoldInfo>, global_addr_map: &FxHashMap<u32, String>, global_addr_ptr_set: &FxHashSet<u32>, dead_global_addrs: &FxHashSet<u32>) {
+fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction, gep_fold_map: &FxHashMap<u32, GepFoldInfo>, indexed_gep_map: &FxHashMap<u32, IndexedGepInfo>, global_addr_map: &FxHashMap<u32, String>, global_addr_ptr_set: &FxHashSet<u32>, dead_global_addrs: &FxHashSet<u32>) {
     match inst {
         Instruction::Alloca { .. } => {
             // Space already allocated in prologue; does not touch registers
@@ -1056,7 +1812,7 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction, gep_fold_m
         // value after execution, so we do NOT invalidate.
 
         Instruction::Load { dest, ptr, ty, seg_override } => {
-            generate_load(cg, dest, ptr, *ty, *seg_override, gep_fold_map, global_addr_map);
+            generate_load(cg, dest, ptr, *ty, *seg_override, gep_fold_map, indexed_gep_map, global_addr_map);
         }
         Instruction::BinOp { dest, op, lhs, rhs, ty } => {
             cg.emit_binop(dest, *op, lhs, rhs, *ty);
@@ -1080,6 +1836,10 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction, gep_fold_m
             }
         }
         Instruction::GetElementPtr { dest, base, offset, .. } => {
+            // Record GEP decomposition for SIB addressing in FMA intrinsics
+            if let Operand::Value(off_val) = offset {
+                cg.state().gep_base_offset.insert(dest.0, (base.0, off_val.0));
+            }
             cg.emit_gep(dest, base, offset);
         }
         Instruction::GlobalAddr { dest, name } => {
@@ -1115,11 +1875,15 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction, gep_fold_m
         // simple acc → dest result. Each arm invalidates the reg cache.
 
         Instruction::Store { val, ptr, ty, seg_override } => {
-            generate_store(cg, val, ptr, *ty, *seg_override, gep_fold_map, global_addr_map);
+            generate_store(cg, val, ptr, *ty, *seg_override, gep_fold_map, indexed_gep_map, global_addr_map);
             cg.state().reg_cache.invalidate_all();
         }
         Instruction::DynAlloca { dest, size, align } => {
             cg.emit_dyn_alloca(dest, size, *align);
+            // Mark DynAlloca results as protected — their stack slots must not be
+            // reused for other values, since they hold pointers to dynamically
+            // allocated stack space that may be referenced throughout the function.
+            cg.state().protected_slot_values.insert(dest.0);
             cg.state().reg_cache.invalidate_all();
         }
         Instruction::Call { func, info } => {
@@ -1224,6 +1988,36 @@ fn generate_instruction(cg: &mut dyn ArchCodegen, inst: &Instruction, gep_fold_m
 
 /// Generate a Copy instruction, handling coalesced slots, i128, and wide values.
 fn generate_copy(cg: &mut dyn ArchCodegen, dest: &Value, src: &Operand) {
+    // When the source is an alloca, the Copy must materialize the alloca's
+    // ADDRESS (via leaq), not load a value from the alloca's slot or register.
+    // We must bypass emit_load_operand/operand_to_rax because they check the
+    // accumulator cache and register assignments, which would return the wrong
+    // value (a loaded byte from the array instead of the array's address).
+    if let Operand::Value(src_val) = src {
+        if cg.state_ref().is_alloca(src_val.0) {
+            if let Some(addr) = cg.state_ref().resolve_slot_addr(src_val.0) {
+                // Materialize the address through architecture hooks.  This used
+                // to emit an x86 `leaq` directly from shared code, leaking x86
+                // assembly into ARM/RISC-V output whenever an array decayed via
+                // a Copy instruction.
+                match addr {
+                    crate::backend::state::SlotAddr::OverAligned(slot, id) => {
+                        cg.emit_alloca_aligned_addr_to_acc(slot, id);
+                    }
+                    crate::backend::state::SlotAddr::Direct(slot) => {
+                        cg.emit_gep_direct_const(slot, 0);
+                    }
+                    crate::backend::state::SlotAddr::Indirect(_) => {
+                        unreachable!("alloca address cannot use an indirect slot");
+                    }
+                }
+                cg.state().reg_cache.set_acc(src_val.0, true);
+                cg.emit_store_result(dest);
+                return;
+            }
+        }
+    }
+
     // Skip Copy when dest and src share the same stack slot (from copy coalescing).
     if let Operand::Value(src_val) = src {
         let dest_slot = cg.state_ref().get_slot(dest.0);
@@ -1274,6 +2068,7 @@ fn generate_load(
     cg: &mut dyn ArchCodegen,
     dest: &Value, ptr: &Value, ty: IrType, seg_override: AddressSpace,
     gep_fold_map: &FxHashMap<u32, GepFoldInfo>,
+    indexed_gep_map: &FxHashMap<u32, IndexedGepInfo>,
     global_addr_map: &FxHashMap<u32, String>,
 ) {
     if seg_override != AddressSpace::Default {
@@ -1308,6 +2103,17 @@ fn generate_load(
             return;
         }
     }
+    // Fold GEP with variable offset into indexed (register+register) addressing.
+    // Condition must match the GEP-skip in the block-emission loop.
+    if let Some(info) = indexed_gep_map.get(&ptr.0) {
+        if !is_wide_int_type(ty)
+            && cg.get_phys_reg_for_value(info.base.0).is_some()
+            && cg.get_phys_reg_for_value(info.index.0).is_some()
+            && cg.emit_load_indexed(dest, &info.base, &info.index, info.shift, ty)
+        {
+            return;
+        }
+    }
     cg.emit_load(dest, ptr, ty);
     if is_wide_int_type(ty) {
         cg.state().reg_cache.invalidate_all();
@@ -1320,6 +2126,7 @@ fn generate_store(
     cg: &mut dyn ArchCodegen,
     val: &Operand, ptr: &Value, ty: IrType, seg_override: AddressSpace,
     gep_fold_map: &FxHashMap<u32, GepFoldInfo>,
+    indexed_gep_map: &FxHashMap<u32, IndexedGepInfo>,
     global_addr_map: &FxHashMap<u32, String>,
 ) {
     if seg_override != AddressSpace::Default {
@@ -1346,6 +2153,17 @@ fn generate_store(
         if !is_wide_int_type(ty) &&
            (cg.state_ref().is_alloca(gep_info.base.0) || cg.get_phys_reg_for_value(gep_info.base.0).is_some()) {
             cg.emit_store_with_const_offset(val, &gep_info.base, gep_info.offset, ty);
+            return;
+        }
+    }
+    // Fold GEP with variable offset into indexed (register+register) addressing.
+    // Condition must match the GEP-skip in the block-emission loop.
+    if let Some(info) = indexed_gep_map.get(&ptr.0) {
+        if !is_wide_int_type(ty)
+            && cg.get_phys_reg_for_value(info.base.0).is_some()
+            && cg.get_phys_reg_for_value(info.index.0).is_some()
+            && cg.emit_store_indexed(val, &info.base, &info.index, info.shift, ty)
+        {
             return;
         }
     }
@@ -1403,4 +2221,3 @@ pub use super::stack_layout::{
     calculate_stack_space_common,
     find_param_alloca,
 };
-

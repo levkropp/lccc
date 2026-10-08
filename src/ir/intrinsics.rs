@@ -69,6 +69,192 @@ pub enum IntrinsicOp {
     /// args[0] = input float value; dest = |x|
     FabsF32,
     FabsF64,
+    /// Packed double FMA for vectorized matmul inner loop.
+    /// Computes: *dest_ptr[0..2] += broadcast(*args[0]) * *args[1][0..2]
+    /// dest_ptr: pointer to 2×F64 accumulator (read+write, 16 bytes)
+    /// args[0]: pointer to scalar F64 (broadcast to both SSE lanes)
+    /// args[1]: pointer to 2×F64 (one SSE register worth)
+    /// NOT pure: modifies memory at dest_ptr.
+    FmaF64x2,
+    /// Two-wide FMA using a broadcast previously loaded by BroadcastLoadF64.
+    /// dest_ptr is C and args[0] is the B vector pointer.
+    FmaF64x2Hoisted,
+    /// Packed double FMA for AVX2 4-wide vectorized loops.
+    /// Computes: *dest_ptr[0..4] += broadcast(*args[0]) * *args[1][0..4]
+    /// dest_ptr: pointer to 4×F64 accumulator (read+write, 32 bytes)
+    /// args[0]: pointer to scalar F64 (broadcast to all 4 lanes)
+    /// args[1]: pointer to 4×F64 source vector
+    /// NOT pure: modifies memory at dest_ptr.
+    FmaF64x4,
+    /// Like FmaF64x4, but the A[i][k] broadcast has been hoisted out of the
+    /// inner loop. The codegen assumes ymm1 already holds the broadcast value
+    /// (set by a preceding BroadcastLoadF64 instruction).
+    /// dest_ptr = C pointer (read+write, 4×F64)
+    /// args[0] = B pointer (4×F64)  (no A pointer needed)
+    FmaF64x4Hoisted,
+    /// Load a scalar F64 from a pointer and broadcast to all 4 lanes of ymm1.
+    /// Placed before the vectorized j-loop to hoist the A[i][k] broadcast.
+    /// args[0] = pointer to scalar F64
+    BroadcastLoadF64,
+    /// FMA with SIB addressing: uses base + byte_offset for B and C accesses.
+    /// This eliminates the GEP address computation from the inner loop by
+    /// using x86 SIB addressing directly: vmovupd (%base, %offset), %ymm0.
+    /// args[0] = A pointer (scalar F64, broadcast inside)
+    /// args[1] = C base pointer (row base, loop-invariant in j-loop)
+    /// args[2] = B base pointer (row base, loop-invariant in j-loop)
+    /// args[3] = byte offset (the j-loop IV, increments by 32 each iteration)
+    FmaF64x4SIB,
+
+    // --- Vector loads for reduction patterns ---
+    /// Load 4 packed doubles (256-bit unaligned): vmovupd
+    /// args[0] = base pointer, args[1] = byte offset
+    /// dest_ptr = result ptr (32 bytes, 4×F64)
+    LoadF64x4,
+    /// Load 2 packed doubles (128-bit unaligned): movupd
+    /// args[0] = base pointer, args[1] = byte offset
+    /// dest_ptr = result ptr (16 bytes, 2×F64)
+    LoadF64x2,
+    /// Load 8 packed 32-bit ints (256-bit unaligned): vmovdqu
+    /// args[0] = base pointer, args[1] = byte offset
+    /// dest_ptr = result ptr (32 bytes, 8×I32)
+    LoadI32x8,
+    /// Load 4 packed 32-bit ints (128-bit unaligned): movdqu
+    /// args[0] = base pointer, args[1] = byte offset
+    /// dest_ptr = result ptr (16 bytes, 4×I32)
+    LoadI32x4,
+
+    // --- Vector arithmetic for reductions ---
+    /// Packed 4×F64 add (256-bit): vaddpd
+    /// args[0] = src1 ptr, args[1] = src2 ptr; dest_ptr = result ptr
+    AddF64x4,
+    /// Packed 2×F64 add (128-bit): addpd
+    /// args[0] = src1 ptr, args[1] = src2 ptr; dest_ptr = result ptr
+    AddF64x2,
+    /// Packed 4×F64 multiply (256-bit): vmulpd
+    /// args[0] = src1 ptr, args[1] = src2 ptr; dest_ptr = result ptr
+    MulF64x4,
+    /// Packed 2×F64 multiply (128-bit): mulpd
+    /// args[0] = src1 ptr, args[1] = src2 ptr; dest_ptr = result ptr
+    MulF64x2,
+    /// Packed 8×I32 add (256-bit): vpaddd
+    /// args[0] = src1 ptr, args[1] = src2 ptr; dest_ptr = result ptr
+    AddI32x8,
+    /// Packed 4×I32 add (128-bit): paddd
+    /// args[0] = src1 ptr, args[1] = src2 ptr; dest_ptr = result ptr
+    AddI32x4,
+
+    // --- Horizontal reduction (vector → scalar) ---
+    /// Horizontal add 4×F64 → 1×F64 (AVX2)
+    /// Reduces {a, b, c, d} to a+b+c+d
+    /// args[0] = src vector ptr (32 bytes); dest = scalar F64
+    HorizontalAddF64x4,
+    /// Horizontal add 2×F64 → 1×F64 (SSE2)
+    /// Reduces {a, b} to a+b
+    /// args[0] = src vector ptr (16 bytes); dest = scalar F64
+    HorizontalAddF64x2,
+    /// Horizontal add 8×I32 → 1×I32 (AVX2)
+    /// Reduces {a,b,c,d,e,f,g,h} to a+b+c+d+e+f+g+h
+    /// args[0] = src vector ptr (32 bytes); dest = scalar I32
+    HorizontalAddI32x8,
+    /// Horizontal add 4×I32 → 1×I32 (SSE2)
+    /// Reduces {a,b,c,d} to a+b+c+d
+    /// args[0] = src vector ptr (16 bytes); dest = scalar I32
+    HorizontalAddI32x4,
+
+    // --- Register-based vector operations for reductions (SSA-friendly) ---
+    /// Vector load: %dest_vec = load_vector(base_ptr, offset) - AVX2 4×F64
+    /// Returns vector value in SSA, lives in %ymm register
+    /// args[0] = base pointer, args[1] = byte offset; dest = vector value
+    VecLoadF64x4,
+    /// Vector load: %dest_vec = load_vector(base_ptr, offset) - SSE2 2×F64
+    /// Returns vector value in SSA, lives in %xmm register
+    /// args[0] = base pointer, args[1] = byte offset; dest = vector value
+    VecLoadF64x2,
+    /// Vector load: %dest_vec = load_vector(base_ptr, offset) - AVX2 8×I32
+    /// args[0] = base pointer, args[1] = byte offset; dest = vector value
+    VecLoadI32x8,
+    /// Vector load: %dest_vec = load_vector(base_ptr, offset) - SSE2 4×I32
+    /// args[0] = base pointer, args[1] = byte offset; dest = vector value
+    VecLoadI32x4,
+
+    /// Vector add: %dest_vec = %src1_vec + %src2_vec - AVX2 4×F64
+    /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
+    VecAddF64x4,
+    /// Vector add: %dest_vec = %src1_vec + %src2_vec - SSE2 2×F64
+    /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
+    VecAddF64x2,
+    /// Vector multiply: %dest_vec = %src1_vec * %src2_vec - AVX2 4×F64
+    /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
+    VecMulF64x4,
+    /// Vector multiply: %dest_vec = %src1_vec * %src2_vec - SSE2 2×F64
+    /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
+    VecMulF64x2,
+    /// Vector add: %dest_vec = %src1_vec + %src2_vec - AVX2 8×I32
+    /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
+    VecAddI32x8,
+    /// Vector add: %dest_vec = %src1_vec + %src2_vec - SSE2 4×I32
+    /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
+    VecAddI32x4,
+    /// Vector multiply: %dest_vec = %src1_vec * %src2_vec - 4×I32
+    /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
+    VecMulI32x4,
+    /// Broadcast a scalar I32 to all 4 lanes: %dest_vec = {x, x, x, x}
+    /// args[0] = scalar I32 value; dest = result vector
+    VecBroadcastI32x4,
+    /// Vector store: store 4×I32 vector to memory.
+    /// dest_ptr = destination pointer; args[0] = source vector value.
+    VecStoreI32x4,
+    /// Load two signed I32 lanes and widen to two I64 lanes.
+    VecLoadWidenI32ToI64x2,
+    VecAddI64x2,
+    VecMulI64x2,
+
+    /// NEON sadalp: sign-extend 4×I32 lanes and accumulate adjacent pairs into
+    /// a 2×I64 accumulator: dest = args[0] + pairwise_sums(args[1]).
+    /// Integer addition is associative, so this matches sequential scalar order.
+    VecSadalpI32x4,
+    /// NEON smlal (low half): dest = args[0] + widen_mul(low2(args[1]), low2(args[2]))
+    /// where args[1]/args[2] are 4×I32 vectors and the accumulator is 2×I64.
+    VecSmlalLoI32x4,
+    /// NEON smlal2 (high half): same as VecSmlalLoI32x4 but for lanes 2-3.
+    VecSmlalHiI32x4,
+    /// NEON smax against zero: dest = max(args[0], 0) per lane (4×I32).
+    /// Used to clamp conditional-sum addends: sum(x>0 ? x : 0) == sum(max(x,0)).
+    VecSmaxZeroI32x4,
+    /// NEON smax: per-lane max of two 4×I32 vectors (args[0] vs args[1]).
+    /// Integer max is associative, commutative, and idempotent, so lane-order
+    /// reduction matches sequential scalar max bit-for-bit.
+    VecSmaxI32x4,
+    /// NEON smaxv: horizontal max of 4×I32 lanes; dest = scalar I32.
+    VecHorizontalMaxI32x4,
+
+    /// Horizontal reduction: %scalar = horizontal_add(%vec) - AVX2 4×F64 → F64
+    /// args[0] = source vector value; dest = scalar F64 result
+    VecHorizontalAddF64x4,
+    /// Horizontal reduction: %scalar = horizontal_add(%vec) - SSE2 2×F64 → F64
+    /// args[0] = source vector value; dest = scalar F64 result
+    VecHorizontalAddF64x2,
+    /// Horizontal reduction: %scalar = horizontal_add(%vec) - AVX2 8×I32 → I32
+    /// args[0] = source vector value; dest = scalar I32 result
+    VecHorizontalAddI32x8,
+    /// Horizontal reduction: %scalar = horizontal_add(%vec) - SSE2 4×I32 → I32
+    /// args[0] = source vector value; dest = scalar I32 result
+    VecHorizontalAddI32x4,
+    VecHorizontalAddI64x2,
+
+    /// Vector zero: %dest_vec = {0.0, 0.0, 0.0, 0.0} - AVX2 4×F64
+    /// No args; dest = zero vector
+    VecZeroF64x4,
+    /// Vector zero: %dest_vec = {0.0, 0.0} - SSE2 2×F64
+    /// No args; dest = zero vector
+    VecZeroF64x2,
+    /// Vector zero: %dest_vec = {0, 0, 0, 0, 0, 0, 0, 0} - AVX2 8×I32
+    /// No args; dest = zero vector
+    VecZeroI32x8,
+    /// Vector zero: %dest_vec = {0, 0, 0, 0} - SSE2 4×I32
+    /// No args; dest = zero vector
+    VecZeroI32x4,
+    VecZeroI64x2,
     /// AES-NI: aesenc (single round encrypt)
     /// args[0] = state ptr, args[1] = round key ptr; dest_ptr = result ptr
     Aesenc128,
@@ -220,7 +406,38 @@ impl IntrinsicOp {
             // SSE4.1 insert/extract are pure
             IntrinsicOp::Pinsrd128 | IntrinsicOp::Pextrd128 |
             IntrinsicOp::Pinsrb128 | IntrinsicOp::Pextrb128 |
-            IntrinsicOp::Pinsrq128 | IntrinsicOp::Pextrq128
+            IntrinsicOp::Pinsrq128 | IntrinsicOp::Pextrq128 |
+            // Vector reduction operations are pure
+            IntrinsicOp::LoadF64x4 | IntrinsicOp::LoadF64x2 |
+            IntrinsicOp::LoadI32x8 | IntrinsicOp::LoadI32x4 |
+            IntrinsicOp::AddF64x4 | IntrinsicOp::AddF64x2 |
+            IntrinsicOp::MulF64x4 | IntrinsicOp::MulF64x2 |
+            IntrinsicOp::AddI32x8 | IntrinsicOp::AddI32x4 |
+            IntrinsicOp::HorizontalAddF64x4 | IntrinsicOp::HorizontalAddF64x2 |
+            IntrinsicOp::HorizontalAddI32x8 | IntrinsicOp::HorizontalAddI32x4
+        )
+    }
+
+    /// Returns true if this intrinsic produces a 128/256-bit vector value
+    /// (as opposed to a scalar).  These values cannot live in a GPR; backends
+    /// either home them on the stack or allocate SIMD registers for them.
+    pub fn produces_vector_value(&self) -> bool {
+        matches!(self,
+            IntrinsicOp::VecZeroF64x4 | IntrinsicOp::VecZeroF64x2 |
+            IntrinsicOp::VecZeroI32x8 | IntrinsicOp::VecZeroI32x4 |
+            IntrinsicOp::VecLoadF64x4 | IntrinsicOp::VecLoadF64x2 |
+            IntrinsicOp::VecLoadI32x8 | IntrinsicOp::VecLoadI32x4 |
+            IntrinsicOp::VecAddF64x4 | IntrinsicOp::VecAddF64x2 |
+            IntrinsicOp::VecAddI32x8 | IntrinsicOp::VecAddI32x4 |
+            IntrinsicOp::VecMulF64x4 | IntrinsicOp::VecMulF64x2
+            | IntrinsicOp::VecLoadWidenI32ToI64x2
+            | IntrinsicOp::VecAddI64x2 | IntrinsicOp::VecMulI64x2
+            | IntrinsicOp::VecZeroI64x2
+            | IntrinsicOp::VecMulI32x4 | IntrinsicOp::VecBroadcastI32x4
+            | IntrinsicOp::VecSadalpI32x4
+            | IntrinsicOp::VecSmlalLoI32x4 | IntrinsicOp::VecSmlalHiI32x4
+            | IntrinsicOp::VecSmaxZeroI32x4
+            | IntrinsicOp::VecSmaxI32x4
         )
     }
 }

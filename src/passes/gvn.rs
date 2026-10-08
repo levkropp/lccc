@@ -111,11 +111,15 @@ struct GvnState {
     /// parameter values from the alloca slot, which may be modified by
     /// stores through aliased pointers.
     escaped_param_allocas: FxHashSet<u32>,
+    /// Volatile allocas must not participate in store-to-load forwarding.
+    /// These are used for post-increment/decrement temporaries that must
+    /// survive through the stack slot to prevent register coalescing issues.
+    volatile_allocas: FxHashSet<u32>,
 }
 
 impl GvnState {
     /// Create a new GVN state sized for `max_value_id` values.
-    fn new(max_value_id: usize, escaped_param_allocas: FxHashSet<u32>) -> Self {
+    fn new(max_value_id: usize, escaped_param_allocas: FxHashSet<u32>, volatile_allocas: FxHashSet<u32>) -> Self {
         Self {
             value_numbers: vec![u32::MAX; max_value_id + 1],
             next_vn: 0,
@@ -129,6 +133,7 @@ impl GvnState {
             vn_log: Vec::new(),
             total_eliminated: 0,
             escaped_param_allocas,
+            volatile_allocas,
         }
     }
 
@@ -213,10 +218,11 @@ impl GvnState {
                 let src_vn = self.operand_to_vn(src);
                 Some((ExprKey::Cast { src: src_vn, from_ty: *from_ty, to_ty: *to_ty }, *dest))
             }
-            Instruction::GetElementPtr { dest, base, offset, ty } => {
-                let base_vn = self.operand_to_vn(&Operand::Value(*base));
-                let offset_vn = self.operand_to_vn(offset);
-                Some((ExprKey::Gep { base: base_vn, offset: offset_vn, ty: *ty }, *dest))
+            Instruction::GetElementPtr { .. } => {
+                // GEP CSE disabled: creates Copy chains whose base register
+                // may be stale at fold points. Both constant-offset (foldable)
+                // and variable-offset GEPs are affected.
+                None
             }
             // Load CSE: two loads from the same pointer with the same type can be
             // CSE'd if no intervening memory modification occurred. The caller
@@ -225,14 +231,13 @@ impl GvnState {
             // Excluded from CSE:
             // - Segment-overridden loads: access thread-local or CPU-local storage
             //   that may differ between accesses even without visible stores
-            // - Float, long double, i128 types: use different register paths in
-            //   codegen that complicate Copy instruction handling
+            // - Long double and i128 types: need multi-register handling
             // - AtomicLoad: has ordering semantics (falls through to _ => None)
             Instruction::Load { dest, ptr, ty, seg_override } => {
                 if *seg_override != AddressSpace::Default {
                     return None;
                 }
-                if ty.is_float() || ty.is_long_double() || ty.is_128bit() {
+                if ty.is_long_double() || ty.is_128bit() {
                     return None;
                 }
                 let ptr_vn = self.operand_to_vn(&Operand::Value(*ptr));
@@ -372,6 +377,22 @@ fn find_escaped_param_allocas(func: &IrFunction) -> FxHashSet<u32> {
     escaped
 }
 
+/// Find volatile allocas in the function. These must not participate in
+/// store-to-load forwarding because they are used to preserve values that
+/// would otherwise be lost to register coalescing (e.g., post-decrement
+/// return values in `while(n--)` patterns).
+fn find_volatile_allocas(func: &IrFunction) -> FxHashSet<u32> {
+    let mut volatile = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Alloca { dest, volatile: true, .. } = inst {
+                volatile.insert(dest.0);
+            }
+        }
+    }
+    volatile
+}
+
 /// Run dominator-based GVN on a single function.
 pub(crate) fn run_gvn_function(func: &mut IrFunction) -> usize {
     let num_blocks = func.blocks.len();
@@ -380,10 +401,11 @@ pub(crate) fn run_gvn_function(func: &mut IrFunction) -> usize {
     }
 
     let escaped = find_escaped_param_allocas(func);
+    let volatile = find_volatile_allocas(func);
 
     // Fast path for single-block functions: skip CFG/dominator computation.
     if num_blocks == 1 {
-        let mut state = GvnState::new(func.max_value_id() as usize, escaped);
+        let mut state = GvnState::new(func.max_value_id() as usize, escaped, volatile);
         return process_block(0, func, &mut state);
     }
 
@@ -401,14 +423,15 @@ pub(crate) fn run_gvn_with_analysis(func: &mut IrFunction, cfg: &analysis::CfgAn
     }
 
     let escaped = find_escaped_param_allocas(func);
+    let volatile = find_volatile_allocas(func);
 
     // Fast path for single-block functions.
     if num_blocks == 1 {
-        let mut state = GvnState::new(func.max_value_id() as usize, escaped);
+        let mut state = GvnState::new(func.max_value_id() as usize, escaped, volatile);
         return process_block(0, func, &mut state);
     }
 
-    let mut state = GvnState::new(func.max_value_id() as usize, escaped);
+    let mut state = GvnState::new(func.max_value_id() as usize, escaped, volatile);
 
     // DFS over the dominator tree
     gvn_dfs(0, func, &cfg.dom_children, &cfg.preds, &mut state);
@@ -532,7 +555,8 @@ fn process_block(
         // aliased pointer may write to the same slot.
         if is_forwardable_store(&inst) {
             if let Instruction::Store { val, ptr, ty, .. } = &inst {
-                if !state.escaped_param_allocas.contains(&ptr.0) {
+                if !state.escaped_param_allocas.contains(&ptr.0)
+                    && !state.volatile_allocas.contains(&ptr.0) {
                     let ptr_vn = state.operand_to_vn(&Operand::Value(*ptr));
                     let fwd_key = StoreFwdKey { ptr_vn, ty: *ty };
                     let fwd_key_for_log = fwd_key.clone();
@@ -604,8 +628,17 @@ fn process_block(
                     state.expr_to_value.get(&expr_key).copied()
                 };
 
-                if let Some(existing_value) = existing {
-                    // This expression was already computed
+                // Only CSE within the same block to avoid cross-block Copy issues.
+                // Cross-block CSE creates Copies whose source values may have
+                // their registers reused by the allocator before the Copy executes.
+                let same_block_existing = existing.filter(|ev| {
+                    // Check if existing_value was defined in the current block
+                    // (by checking new_instructions, which holds this block's output)
+                    new_instructions.iter().any(|i| {
+                        i.dest().map_or(false, |d| d.0 == ev.0)
+                    })
+                });
+                if let Some(existing_value) = same_block_existing {
                     let idx = existing_value.0 as usize;
                     let existing_vn = if idx < state.value_numbers.len() && state.value_numbers[idx] != u32::MAX {
                         state.value_numbers[idx]
@@ -725,6 +758,7 @@ mod tests {
             is_noinline: false,
             is_declaration: false,
             next_value_id: 4,
+            next_label: 0,
             section: None,
             visibility: None,
             is_weak: false,
@@ -735,6 +769,7 @@ mod tests {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
+            loop_promoted_f64_values: Vec::new(),
         };
 
         let mut module = IrModule {
@@ -801,6 +836,7 @@ mod tests {
             is_noinline: false,
             is_declaration: false,
             next_value_id: 4,
+            next_label: 0,
             section: None,
             visibility: None,
             is_weak: false,
@@ -811,6 +847,7 @@ mod tests {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
+            loop_promoted_f64_values: Vec::new(),
         };
 
         let mut module = IrModule {
@@ -868,6 +905,7 @@ mod tests {
             is_noinline: false,
             is_declaration: false,
             next_value_id: 2,
+            next_label: 0,
             section: None,
             visibility: None,
             is_weak: false,
@@ -878,6 +916,7 @@ mod tests {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
+            loop_promoted_f64_values: Vec::new(),
         };
 
         let mut module = IrModule {
@@ -941,6 +980,7 @@ mod tests {
             is_noinline: false,
             is_declaration: false,
             next_value_id: 3,
+            next_label: 0,
             section: None,
             visibility: None,
             is_weak: false,
@@ -951,6 +991,7 @@ mod tests {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
+            loop_promoted_f64_values: Vec::new(),
         };
 
         let mut module = IrModule {
@@ -981,7 +1022,8 @@ mod tests {
 
     #[test]
     fn test_gep_cse() {
-        // Two identical GEPs should be CSE'd
+        // GEP CSE is currently disabled (creates Copy chains with stale registers).
+        // This test verifies GEPs are NOT CSE'd.
         let func = IrFunction {
             name: "test".to_string(),
             params: vec![],
@@ -1014,6 +1056,7 @@ mod tests {
             is_noinline: false,
             is_declaration: false,
             next_value_id: 4,
+            next_label: 0,
             section: None,
             visibility: None,
             is_weak: false,
@@ -1024,6 +1067,7 @@ mod tests {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
+            loop_promoted_f64_values: Vec::new(),
         };
 
         let mut module = IrModule {
@@ -1041,12 +1085,13 @@ mod tests {
         };
 
         let eliminated = module.for_each_function(run_gvn_function);
-        assert_eq!(eliminated, 1);
+        assert_eq!(eliminated, 0); // GEP CSE disabled
     }
 
     #[test]
     fn test_cross_block_cse() {
-        // Test that expressions in dominating blocks are visible to dominated blocks
+        // Cross-block CSE is currently restricted to same-block only.
+        // This test verifies cross-block expressions are NOT CSE'd.
         // CFG: block0 -> block1 (block0 dominates block1)
         let func = IrFunction {
             name: "test".to_string(),
@@ -1092,6 +1137,7 @@ mod tests {
             is_noinline: false,
             is_declaration: false,
             next_value_id: 4,
+            next_label: 0,
             section: None,
             visibility: None,
             is_weak: false,
@@ -1102,6 +1148,7 @@ mod tests {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
+            loop_promoted_f64_values: Vec::new(),
         };
 
         let mut module = IrModule {
@@ -1119,15 +1166,14 @@ mod tests {
         };
 
         let eliminated = module.for_each_function(run_gvn_function);
-        assert_eq!(eliminated, 1);
+        assert_eq!(eliminated, 0); // Cross-block CSE disabled (same-block only)
 
-        // The expression in block1 should be replaced with a Copy
+        // The expression in block1 should NOT be replaced (cross-block CSE disabled)
         match &module.functions[0].blocks[1].instructions[0] {
-            Instruction::Copy { dest, src: Operand::Value(v) } => {
-                assert_eq!(dest.0, 3);
-                assert_eq!(v.0, 2);
+            Instruction::BinOp { dest, .. } => {
+                assert_eq!(dest.0, 3); // Original BinOp preserved
             }
-            other => panic!("Expected Copy instruction, got {:?}", other),
+            other => panic!("Expected BinOp (cross-block CSE disabled), got {:?}", other),
         }
     }
 
@@ -1199,6 +1245,7 @@ mod tests {
             is_noinline: false,
             is_declaration: false,
             next_value_id: 4,
+            next_label: 0,
             section: None,
             visibility: None,
             is_weak: false,
@@ -1209,6 +1256,7 @@ mod tests {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
+            loop_promoted_f64_values: Vec::new(),
         };
 
         let mut module = IrModule {
@@ -1256,6 +1304,7 @@ mod tests {
             is_noinline: false,
             is_declaration: false,
             next_value_id,
+            next_label: 0,
             section: None,
             visibility: None,
             is_weak: false,
@@ -1266,6 +1315,7 @@ mod tests {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
+            loop_promoted_f64_values: Vec::new(),
         }
     }
 
@@ -1406,8 +1456,8 @@ mod tests {
 
     #[test]
     fn test_load_cse_across_dominating_block() {
-        // Load in block0 should CSE with load in block1 (block0 dominates block1,
-        // single predecessor, no memory clobber)
+        // Cross-block Load CSE is currently disabled (same-block CSE only).
+        // Load in block1 should NOT be CSE'd with load in block0.
         let func = make_func(vec![
             BasicBlock {
                 label: BlockId(0),
@@ -1439,14 +1489,14 @@ mod tests {
 
         let mut module = make_module(func);
         let eliminated = module.for_each_function(run_gvn_function);
-        assert_eq!(eliminated, 1);
+        assert_eq!(eliminated, 0); // Cross-block Load CSE disabled
 
+        // Load should be preserved (not replaced with Copy)
         match &module.functions[0].blocks[1].instructions[0] {
-            Instruction::Copy { dest, src: Operand::Value(v) } => {
+            Instruction::Load { dest, .. } => {
                 assert_eq!(dest.0, 2);
-                assert_eq!(v.0, 1);
             }
-            other => panic!("Expected Copy, got {:?}", other),
+            other => panic!("Expected Load (cross-block CSE disabled), got {:?}", other),
         }
     }
 

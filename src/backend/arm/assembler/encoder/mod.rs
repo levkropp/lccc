@@ -335,6 +335,13 @@ pub fn encode_instruction(mnemonic: &str, operands: &[Operand], raw_operands: &s
         "ldrsh" => encode_ldrs(operands, 0b01),
         "ldur" => encode_ldur_stur(operands, true, 0b00),
         "stur" => encode_ldur_stur(operands, false, 0b00),
+        "ldurb" => encode_ldur_gp(operands, 0b00, 0b01),
+        "sturb" => encode_ldur_gp(operands, 0b00, 0b00),
+        "ldurh" => encode_ldur_gp(operands, 0b01, 0b01),
+        "sturh" => encode_ldur_gp(operands, 0b01, 0b00),
+        "ldursw" => encode_ldur_gp(operands, 0b10, 0b10),
+        "ldursb" => encode_ldurs_gp(operands, 0b00),
+        "ldursh" => encode_ldurs_gp(operands, 0b01),
         "ldtr" => encode_ldur_stur(operands, true, 0b10),
         "sttr" => encode_ldur_stur(operands, false, 0b10),
         "ldtrh" => encode_ldtr_sized(operands, true, 0b01),
@@ -579,10 +586,10 @@ pub fn encode_instruction(mnemonic: &str, operands: &[Operand], raw_operands: &s
         "rev32" => if matches!(operands.first(), Some(Operand::RegArrangement { .. })) {
             encode_neon_two_misc(operands, 1, 0b00000)
         } else { encode_rev32(operands) },
-        "saddlp" => encode_neon_two_misc(operands, 0, 0b00010),
-        "uaddlp" => encode_neon_two_misc(operands, 1, 0b00010),
-        "sadalp" => encode_neon_two_misc(operands, 0, 0b00110),
-        "uadalp" => encode_neon_two_misc(operands, 1, 0b00110),
+        "saddlp" => encode_neon_pairwise_long(operands, 0, 0b00010),
+        "uaddlp" => encode_neon_pairwise_long(operands, 1, 0b00010),
+        "sadalp" => encode_neon_pairwise_long(operands, 0, 0b00110),
+        "uadalp" => encode_neon_pairwise_long(operands, 1, 0b00110),
         "sqxtun" => encode_neon_two_misc_narrow(operands, 1, 0b10010, false),
         "sqxtun2" => encode_neon_two_misc_narrow(operands, 1, 0b10010, true),
         "sqabs" => if matches!(operands.first(), Some(Operand::RegArrangement { .. })) {

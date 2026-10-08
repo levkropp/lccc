@@ -15,6 +15,7 @@ impl ArmCodegen {
         use crate::ir::reexports::Instruction;
         use crate::backend::regalloc::PhysReg;
 
+        self.loop_promoted_f64_values = func.loop_promoted_f64_values.clone();
         let mut asm_clobbered_regs: Vec<PhysReg> = Vec::new();
         Self::prescan_inline_asm_callee_saved(func, &mut asm_clobbered_regs);
         let base_regs: &[PhysReg] = if func.is_variadic { &[] } else { &ARM_CALLEE_SAVED };
@@ -26,6 +27,7 @@ impl ArmCodegen {
             ARM_CALLER_SAVED.to_vec()
         };
         let mut has_f128_ops = false;
+        let mut has_i128_ops = false;
         for block in &func.blocks {
             for inst in &block.instructions {
                 match inst {
@@ -40,26 +42,147 @@ impl ArmCodegen {
                     Instruction::Cast { from_ty, .. } if *from_ty == IrType::F128 => {
                         has_f128_ops = true;
                     }
+                    Instruction::BinOp { ty, .. } | Instruction::UnaryOp { ty, .. }
+                    | Instruction::Cmp { ty, .. } | Instruction::Load { ty, .. }
+                    | Instruction::Store { ty, .. }
+                        if matches!(ty, IrType::I128 | IrType::U128) => has_i128_ops = true,
+                    Instruction::Cast { from_ty, to_ty, .. }
+                        if matches!(from_ty, IrType::I128 | IrType::U128)
+                            || matches!(to_ty, IrType::I128 | IrType::U128) => has_i128_ops = true,
                     _ => {}
                 }
             }
         }
-        if has_f128_ops {
+        // Leaf functions have no call that can clobber the caller-saved pool,
+        // so scan it first and let the callee-saved pool catch the overflow.
+        // Values placed there need no prologue save, eliminating the
+        // save/restore storm in tiny hot callbacks.
+        let inst_count: usize = func.blocks.iter().map(|b| b.instructions.len()).sum();
+        let is_leaf = !func.blocks.iter().any(|b| {
+            b.instructions.iter().any(|i| {
+                matches!(i, Instruction::Call { .. } | Instruction::CallIndirect { .. })
+            })
+        });
+        // Inline asm draws scratches from the caller-saved pool; leave those
+        // functions on the default order and do not treat its operands as
+        // permanent register-backed parameter homes.
+        let has_inline_asm = func.blocks.iter().any(|b| {
+            b.instructions.iter().any(|i| matches!(i, Instruction::InlineAsm { .. }))
+        });
+        let caller_first = is_leaf
+            && !has_inline_asm
+            && std::env::var("CCC_NO_GPR_CALLER_FIRST").is_err();
+        let swap_pools = {
+            let swap = is_leaf
+                && !has_inline_asm
+                && inst_count <= 40
+                && !caller_first
+                && !func.is_variadic
+                && !caller_saved_regs.is_empty()
+                && asm_clobbered_regs.is_empty()
+                && std::env::var("CCC_NO_LEAF_SWAP").is_err();
+            if std::env::var("CCC_DEBUG_LEAF_SWAP").is_ok() {
+                eprintln!("[LEAF_SWAP] func={} insts={} leaf={} caller_first={} swap={}",
+                    func.name, inst_count, is_leaf, caller_first, swap);
+            }
+            swap
+        };
+        let caller_first_leaf_homes = caller_first
+            && is_leaf
+            && !has_inline_asm
+            && inst_count <= 40
+            && !func.is_variadic
+            && !caller_saved_regs.is_empty()
+            && asm_clobbered_regs.is_empty();
+        if has_f128_ops || has_i128_ops || has_inline_asm {
+            // Inline assembly draws scratches from this pool.  Disabling the
+            // pool entirely also keeps ordinary live values out of registers
+            // that an opaque template may overwrite.
             caller_saved_regs.clear();
+        } else {
+            // Pure scalar-ALU functions never invoke the address, memcpy,
+            // call-staging, intrinsic, or inline-assembly scratch paths. Make
+            // the otherwise-reserved caller-saved registers available to
+            // high-pressure kernels (cryptographic rounds, arithmetic loops).
+            // Excluded when the pools are swapped: x9-x12/x15 double as
+            // emitter scratch that callers may hold live across a call into
+            // such a function (ternary_chains miscompile).
+            let pure_scalar_alu = func.blocks.iter().all(|block| block.instructions.iter().all(|inst| matches!(inst,
+                Instruction::Alloca { .. } | Instruction::ParamRef { .. }
+                | Instruction::Copy { .. } | Instruction::Phi { .. }
+                | Instruction::BinOp { .. } | Instruction::UnaryOp { .. }
+                | Instruction::Cmp { .. } | Instruction::Cast { .. }
+                | Instruction::Select { .. }
+            )));
+            if pure_scalar_alu && !swap_pools {
+                caller_saved_regs.extend([PhysReg(9), PhysReg(10), PhysReg(11),
+                    PhysReg(12), PhysReg(15)]);
+            }
         }
 
-        let (reg_assigned, cached_liveness) = crate::backend::generation::run_regalloc_and_merge_clobbers(
-            func, available_regs, caller_saved_regs, &asm_clobbered_regs,
-            &mut self.reg_assignments, &mut self.used_callee_saved,
-            false,
-        );
+        let (reg_assigned, cached_liveness, _caller_save_spans) = {
+            let (avail, caller) = if swap_pools {
+                (caller_saved_regs.clone(), available_regs)
+            } else {
+                (available_regs, caller_saved_regs.clone())
+            };
+            let (ra, cl, css) = crate::backend::generation::run_regalloc_and_merge_clobbers(
+                func, avail, caller, &asm_clobbered_regs,
+                &mut self.reg_assignments, &mut self.used_callee_saved,
+                false,
+            );
+            if swap_pools {
+                // The scan's used_regs bookkeeping assumes the phase-1 pool is
+                // the callee-saved one; recompute from the assignments.
+                let mut v: Vec<PhysReg> = self
+                    .reg_assignments
+                    .values()
+                    .copied()
+                    .filter(|r| ARM_CALLEE_SAVED.contains(r))
+                    .collect();
+                v.sort_by_key(|r| r.0);
+                v.dedup();
+                self.used_callee_saved = v;
+            }
+            (ra, cl, css)
+        };
 
+        // Callee-saved FP registers (d8-d14, allocator IDs 32-38) assigned by
+        // the FP scan must be preserved by the prologue/epilogue.
+        self.used_fp_callee_saved = {
+            let mut v: Vec<PhysReg> = self
+                .reg_assignments
+                .values()
+                .copied()
+                .filter(|r| (32..=38).contains(&r.0))
+                .collect();
+            v.sort_by_key(|r| r.0);
+            v.dedup();
+            v
+        };
+
+        // With caller-first allocation, x4-x8 are legitimate full homes in a
+        // leaf: let the dead-param-alloca analysis treat them like callee-saved
+        // registers so params assigned there skip the slot round-trip.
+        // Restricted to <=4 params so incoming args (x0-x3) never sit under a
+        // pre-store destination.
+        let home_regs;
+        let home_regs: &[PhysReg] = if (swap_pools || caller_first_leaf_homes)
+            && func.params.len() <= 4
+        {
+            let mut v = ARM_CALLEE_SAVED.to_vec();
+            v.extend(ARM_CALLER_SAVED.iter().copied());
+            home_regs = v;
+            home_regs.as_slice()
+        } else {
+            &ARM_CALLEE_SAVED[..]
+        };
         let mut space = calculate_stack_space_common(&mut self.state, func, 16, |space, alloc_size, align| {
             let effective_align = if align > 0 { align.max(8) } else { 8 };
             let slot = (space + effective_align - 1) & !(effective_align - 1);
             let new_space = slot + ((alloc_size + 7) & !7).max(8);
             (slot, new_space)
-        }, &reg_assigned, &ARM_CALLEE_SAVED, cached_liveness, false);
+        }, &reg_assigned, home_regs, cached_liveness, false);
 
         if func.is_variadic {
             space = (space + 7) & !7;
@@ -102,6 +225,13 @@ impl ArmCodegen {
             space += save_count * 8;
         }
 
+        let fp_save_count = self.used_fp_callee_saved.len() as i64;
+        if fp_save_count > 0 {
+            space = (space + 7) & !7;
+            self.fp_callee_save_offset = space;
+            space += fp_save_count * 8;
+        }
+
         space
     }
 
@@ -134,6 +264,24 @@ impl ArmCodegen {
             let r = callee_saved_name(used_regs[i]);
             let offset = base + (i as i64) * 8;
             self.emit_store_to_sp(r, offset, "str");
+        }
+
+        // Save callee-saved FP registers (d8-d14) used by the FP allocator.
+        let used_fp = self.used_fp_callee_saved.clone();
+        let fp_base = self.fp_callee_save_offset;
+        let m = used_fp.len();
+        let mut j = 0;
+        while j + 1 < m {
+            let r1 = format!("d{}", used_fp[j].0 - 24);
+            let r2 = format!("d{}", used_fp[j + 1].0 - 24);
+            let offset = fp_base + (j as i64) * 8;
+            self.emit_stp_to_sp(&r1, &r2, offset);
+            j += 2;
+        }
+        if j < m {
+            let r = format!("d{}", used_fp[j].0 - 24);
+            let offset = fp_base + (j as i64) * 8;
+            self.emit_store_to_sp(&r, offset, "str");
         }
     }
 
@@ -207,8 +355,18 @@ impl ArmCodegen {
                 if let Some(&phys_reg) = self.reg_assignments.get(&paramref_dest.0) {
                     // Only pre-store to callee-saved registers (x20-x28).
                     // Caller-saved registers (x13, x14) cannot be used because
-                    // they may overlap with scratch registers.
-                    let is_callee_saved = phys_reg.0 >= 20 && phys_reg.0 <= 28;
+                    // they may overlap with scratch registers. x4-x8 are safe
+                    // in leaf functions: no call staging can clobber them, and
+                    // with at most four GP params the incoming args sit in
+                    // x0-x3, never under a pre-store destination.
+                    let gp_param_count = param_classes.iter().filter(|c| c.uses_gp_reg()).count();
+                    let is_leaf = !func.blocks.iter().any(|b| {
+                        b.instructions.iter().any(|inst| {
+                            matches!(inst, Instruction::Call { .. } | Instruction::CallIndirect { .. })
+                        })
+                    });
+                    let is_callee_saved = (phys_reg.0 >= 20 && phys_reg.0 <= 28)
+                        || (is_leaf && gp_param_count <= 4 && (4..=8).contains(&phys_reg.0));
                     if is_callee_saved {
                         // Safety check: if another param's dest is also assigned
                         // to this register, skip pre-store to avoid conflicts.

@@ -88,6 +88,14 @@ pub struct Lowerer {
     pub(super) func_meta: FunctionMeta,
     /// Set of emitted global variable names (O(1) dedup)
     pub(super) emitted_global_names: FxHashSet<String>,
+    /// String literal deduplication: maps string content → label.
+    /// Identical string literals share the same .rodata entry so that
+    /// pointer equality (`"hello" == "hello"`) holds, matching GCC behavior.
+    pub(super) string_dedup: FxHashMap<String, String>,
+    /// Wide and UTF-16 literals have different element widths and therefore
+    /// need independent intern tables from ordinary byte strings.
+    pub(super) wide_string_dedup: FxHashMap<String, String>,
+    pub(super) char16_string_dedup: FxHashMap<String, String>,
     /// Function signatures from semantic analysis.
     /// Used as authoritative source for function return types and parameter types,
     /// reducing the lowerer's need to re-derive type information from the raw AST.
@@ -205,6 +213,9 @@ impl Lowerer {
             types: type_context,
             func_meta: FunctionMeta::default(),
             emitted_global_names: FxHashSet::default(),
+            string_dedup: FxHashMap::default(),
+            wide_string_dedup: FxHashMap::default(),
+            char16_string_dedup: FxHashMap::default(),
             sema_functions,
             sema_expr_types,
             sema_const_values,
@@ -1050,37 +1061,54 @@ impl Lowerer {
     pub(super) fn fresh_label(&mut self) -> BlockId {
         let l = BlockId(self.next_label);
         self.next_label += 1;
+        if std::env::var("LCCC_DEBUG_LABELS").is_ok() {
+            eprintln!("[LABEL] Allocated BlockId({}) in function {:?}, next_label now {}",
+                      l.0, self.func_state.as_ref().map(|f| &f.name), self.next_label);
+        }
         l
     }
 
     /// Intern a string literal: add it to the module's .rodata string table and
-    /// return its unique label.
+    /// return its unique label. Identical strings are deduplicated so that
+    /// pointer equality holds (matching GCC behavior).
     pub(super) fn intern_string_literal(&mut self, s: &str) -> String {
+        if let Some(existing) = self.string_dedup.get(s) {
+            return existing.clone();
+        }
         let label = format!(".Lstr{}", self.next_string);
         self.next_string += 1;
         self.module.string_literals.push((label.clone(), s.to_string()));
+        self.string_dedup.insert(s.to_string(), label.clone());
         label
     }
 
     /// Intern a wide string literal (L"...") and return its label.
     /// Each character is stored as a u32 (wchar_t), plus a null terminator.
     pub(super) fn intern_wide_string_literal(&mut self, s: &str) -> String {
+        if let Some(existing) = self.wide_string_dedup.get(s) {
+            return existing.clone();
+        }
         let label = format!(".Lwstr{}", self.next_string);
         self.next_string += 1;
         let mut chars: Vec<u32> = s.chars().map(|c| c as u32).collect();
         chars.push(0); // null terminator
         self.module.wide_string_literals.push((label.clone(), chars));
+        self.wide_string_dedup.insert(s.to_string(), label.clone());
         label
     }
 
     /// Intern a char16_t string literal (u"...") and return its label.
     /// Each character is stored as a u16 (char16_t), plus a null terminator.
     pub(super) fn intern_char16_string_literal(&mut self, s: &str) -> String {
+        if let Some(existing) = self.char16_string_dedup.get(s) {
+            return existing.clone();
+        }
         let label = format!(".Lc16str{}", self.next_string);
         self.next_string += 1;
         let mut chars: Vec<u16> = s.chars().map(|c| c as u16).collect();
         chars.push(0); // null terminator
         self.module.char16_string_literals.push((label.clone(), chars));
+        self.char16_string_dedup.insert(s.to_string(), label.clone());
         label
     }
 

@@ -33,6 +33,8 @@
 
 // ── Line classification types ────────────────────────────────────────────────
 
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
+
 /// Compact classification of an assembly line.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum LineKind {
@@ -408,6 +410,9 @@ fn label_name(line: &str) -> Option<&str> {
 /// Run peephole optimization on AArch64 assembly text.
 /// Returns the optimized assembly string.
 pub fn peephole_optimize(asm: String) -> String {
+    if std::env::var("CCC_NO_PEEPHOLE").is_ok() {
+        return asm;
+    }
     let mut lines: Vec<String> = asm.lines().map(String::from).collect();
     let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
     let n = lines.len();
@@ -417,6 +422,7 @@ pub fn peephole_optimize(asm: String) -> String {
     }
 
     // Phase 1: Iterative local passes (up to 8 rounds)
+    let rotate = std::env::var("CCC_NO_LOOP_ROTATE").is_err();
     let mut changed = true;
     let mut rounds = 0;
     while changed && rounds < 8 {
@@ -424,8 +430,29 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= eliminate_adjacent_store_load(&mut lines, &mut kinds, n);
         changed |= eliminate_redundant_branches(&lines, &mut kinds, n);
         changed |= eliminate_self_moves(&mut kinds, n);
+        changed |= eliminate_redundant_sxtw(&mut lines, &mut kinds, n);
+        changed |= eliminate_redundant_sxtb(&mut lines, &mut kinds, n);
+        changed |= fold_shift_mask_ubfx(&mut lines, &mut kinds, n);
+        changed |= fold_zero_stores(&mut lines, &mut kinds, n);
+        changed |= fold_fp_gpr_roundtrips(&mut lines, &mut kinds, n);
+        changed |= retarget_single_use_accumulator_results(&mut lines, &mut kinds, n);
         changed |= eliminate_move_chains(&mut lines, &mut kinds, n);
+        changed |= fold_zext_move_chains(&mut lines, &mut kinds, n);
+        changed |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
+        changed |= propagate_address_aliases(&mut lines, &mut kinds, n);
+        changed |= forward_fp_slot_loads(&mut lines, &mut kinds, n);
+        changed |= propagate_single_use_fp_copies(&mut lines, &mut kinds, n);
+        changed |= fuse_fp_adjacent_pairs(&mut lines, &mut kinds, n);
+        changed |= eliminate_repeated_slot_loads(&mut lines, &mut kinds, n);
+        changed |= fold_destructive_pointer_updates(&mut lines, &mut kinds, n);
+        changed |= fold_csel_increment(&mut lines, &mut kinds, n);
         changed |= fuse_branch_over_branch(&mut lines, &mut kinds, n);
+        // After the folds: dead staging movs (their patterns must win first).
+        changed |= eliminate_overwritten_moves(&lines, &mut kinds, n);
+        changed |= eliminate_overwritten_stores(&lines, &mut kinds, n);
+        if rotate {
+            changed |= rotate_simple_loops(&mut lines, &mut kinds, n);
+        }
         rounds += 1;
     }
 
@@ -438,7 +465,17 @@ pub fn peephole_optimize(asm: String) -> String {
     //
     // Copy propagation and dead store elimination are independent and safe.
     propagate_register_copies(&mut lines, &mut kinds, n);
-    global_dead_store_elimination(&lines, &mut kinds, n);
+    reuse_stack_loads_within_blocks(&mut lines, &mut kinds, n);
+    propagate_register_copies(&mut lines, &mut kinds, n);
+    eliminate_dead_call_staging_moves(&lines, &mut kinds, n);
+    if std::env::var("CCC_NO_GDSE").is_err() {
+        global_dead_store_elimination(&lines, &mut kinds, n);
+    }
+    // After rotation (phase 1) and dead-store cleanup: sink loop-carried
+    // slot-home stores out of bottom-tested loops.
+    sink_loop_carried_stores(&mut lines, &mut kinds, n);
+    // Defer callee-saves past clean early returns (binary_trees check).
+    shrink_wrap_early_returns(&mut lines, &mut kinds, n);
 
     // Phase 3: Local cleanup after global passes (up to 4 rounds)
     {
@@ -449,7 +486,24 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_adjacent_store_load(&mut lines, &mut kinds, n);
             changed2 |= eliminate_redundant_branches(&lines, &mut kinds, n);
             changed2 |= eliminate_self_moves(&mut kinds, n);
+            changed2 |= eliminate_redundant_sxtw(&mut lines, &mut kinds, n);
+            changed2 |= eliminate_redundant_sxtb(&mut lines, &mut kinds, n);
+            changed2 |= fold_shift_mask_ubfx(&mut lines, &mut kinds, n);
+            changed2 |= fold_zero_stores(&mut lines, &mut kinds, n);
+            changed2 |= fold_fp_gpr_roundtrips(&mut lines, &mut kinds, n);
+            changed2 |= retarget_single_use_accumulator_results(&mut lines, &mut kinds, n);
             changed2 |= eliminate_move_chains(&mut lines, &mut kinds, n);
+            changed2 |= fold_zext_move_chains(&mut lines, &mut kinds, n);
+            changed2 |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
+            changed2 |= propagate_address_aliases(&mut lines, &mut kinds, n);
+            changed2 |= forward_fp_slot_loads(&mut lines, &mut kinds, n);
+            changed2 |= propagate_single_use_fp_copies(&mut lines, &mut kinds, n);
+            changed2 |= fuse_fp_adjacent_pairs(&mut lines, &mut kinds, n);
+            changed2 |= eliminate_repeated_slot_loads(&mut lines, &mut kinds, n);
+            changed2 |= fold_destructive_pointer_updates(&mut lines, &mut kinds, n);
+            changed2 |= fold_csel_increment(&mut lines, &mut kinds, n);
+            changed2 |= eliminate_overwritten_moves(&lines, &mut kinds, n);
+            changed2 |= eliminate_overwritten_stores(&lines, &mut kinds, n);
             rounds2 += 1;
         }
     }
@@ -465,12 +519,1529 @@ pub fn peephole_optimize(asm: String) -> String {
     result
 }
 
+/// Propagate a register copy used only as a memory-address alias within one
+/// basic block. This handles vector intrinsics where an SSA Copy gives the C
+/// pointer a short-lived register solely for `[xN]` loads/stores.
+///
+/// Soundness: the defining `mov` may only be deleted when the copy's value is
+/// provably dead after the rewritten window — every mention of `dst` from here
+/// to the end of the function's text must be accounted for. An earlier version
+/// stopped the scan at the first block boundary and deleted the mov anyway,
+/// which silently dropped the initializer of any alias used in a later block
+/// (exposed when global-address CSE made such aliases multi-use). We therefore
+/// scan to the end of the function and commit only on proof of death:
+/// overwrite of `dst` by an instruction that does not read it, or the end of
+/// the function's text. Anything unrecognized (other memory ops, unknown
+/// instruction kinds, calls) blocks the transform.
+fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    fn mentions(line: &str, reg: u8) -> bool {
+        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|tok| tok == xreg_name(reg) || tok == wreg_name(reg))
+    }
+    fn mention_count(line: &str, reg: u8) -> usize {
+        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|tok| *tok == xreg_name(reg) || *tok == wreg_name(reg))
+            .count()
+    }
+    // Column-0 identifier label: the next function or data object, i.e. the
+    // end of the current function's text. Block labels start with '.', and
+    // inline-asm numeric local labels (`1:`) start with a digit — neither
+    // terminates the function's text.
+    fn is_function_boundary(line: &str) -> bool {
+        line.ends_with(':')
+            && line.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+    }
+    // Backward branches (loop back edges) break the linear-scan assumption
+    // below: a use collected before dst/src is rewritten in text may be
+    // RE-EXECUTED after that rewrite at runtime, when dst no longer equals
+    // src. Refuse to rewrite any use that lies inside a backward-branch span.
+    let mut label_pos: FxHashMap<&str, usize> = FxHashMap::default();
+    for (idx, line) in lines.iter().enumerate() {
+        if matches!(kinds[idx], LineKind::Label) {
+            if let Some(name) = label_name(line) {
+                label_pos.insert(name, idx);
+            }
+        }
+    }
+    let mut back_spans: Vec<(usize, usize)> = Vec::new(); // (target_pos, branch_pos)
+    for (idx, line) in lines.iter().enumerate() {
+        let target = match kinds[idx] {
+            LineKind::Branch => branch_target(line),
+            LineKind::CondBranch => cond_branch_parts(line).map(|(_, t)| t),
+            LineKind::CmpBranch => {
+                let t = line.trim().rsplit(',').next().unwrap_or("").trim();
+                if t.starts_with('.') { Some(t) } else { None }
+            }
+            _ => None,
+        };
+        if let Some(t) = target {
+            if let Some(&tp) = label_pos.get(t) {
+                if tp < idx {
+                    back_spans.push((tp, idx));
+                }
+            }
+        }
+    }
+    let in_loop = |u: usize| back_spans.iter().any(|&(t, b)| t <= u && u <= b);
+    let mut changed = false;
+    for i in 0..n {
+        let LineKind::Move { dst, src, is_32bit: false } = kinds[i] else { continue };
+        if dst == src || dst >= 29 || src >= 29 { continue; }
+        let mut uses = Vec::new();
+        let mut valid = true;
+        let mut provably_dead = false;
+        let mut src_alive = true;
+        let mut j = i + 1;
+        while j < n {
+            if is_function_boundary(&lines[j]) {
+                provably_dead = true;
+                break;
+            }
+            match kinds[j] {
+                // No runtime effect. A return ends this path; textually later
+                // lines belong to other paths, so keep scanning.
+                //
+                // Note: an epilogue's `ldp xD, ...` callee-save restore is NOT
+                // treated as proof of death here — it ends the value only on
+                // that return path, and textually later blocks (other paths)
+                // may still use it, so it falls through to the plain-mention
+                // handling and blocks the transform.
+                LineKind::Nop | LineKind::Directive | LineKind::Label | LineKind::Ret => {}
+                // Calls clobber src (x0) and all caller-saved registers. Rather
+                // than reason about save/restore pairs, stop without committing.
+                LineKind::Call => { valid = false; break; }
+                _ => {
+                    // Kinds whose destination register written_gp_register
+                    // models precisely.
+                    let trusted = matches!(kinds[j],
+                        LineKind::Move { .. } | LineKind::MoveImm { .. }
+                        | LineKind::MoveWide { .. } | LineKind::Sxtw { .. }
+                        | LineKind::LoadSp { .. } | LineKind::LoadswSp { .. }
+                        | LineKind::Alu | LineKind::Compare
+                        | LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch
+                        | LineKind::StoreSp { .. });
+                    let written = written_gp_register(&lines[j], kinds[j]);
+                    if (trusted && written == Some(src))
+                        || (!trusted && mentions(&lines[j], src))
+                    {
+                        src_alive = false;
+                    }
+                    if mentions(&lines[j], dst) {
+                        if trusted && written == Some(dst) && mention_count(&lines[j], dst) == 1 {
+                            // dst overwritten without being read: the mov's
+                            // value is dead past this instruction (register
+                            // assignments are per-value with disjoint live
+                            // intervals, so no later text can use the old value).
+                            provably_dead = true;
+                            break;
+                        }
+                        let address = format!("[{}", xreg_name(dst));
+                        if src_alive && mention_count(&lines[j], dst) == 1
+                            && lines[j].contains(&address)
+                        {
+                            // dst used purely as the address base of a
+                            // load/store while src is alive: rewritable.
+                            uses.push(j);
+                        } else {
+                            // Non-address use, an unmodelled effect, or an
+                            // address use after src died: the mov must stay.
+                            valid = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            j += 1;
+        }
+        if j == n {
+            provably_dead = true; // scanned to the end of the file
+        }
+        if valid && provably_dead && !uses.is_empty() && !uses.iter().any(|&u| in_loop(u)) {
+            for use_idx in uses {
+                lines[use_idx] = replace_whole_word(&lines[use_idx], xreg_name(dst), xreg_name(src));
+                kinds[use_idx] = classify_line(&lines[use_idx]);
+            }
+            kinds[i] = LineKind::Nop;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Fold an SSA pointer update that is copied back to its loop-carried register:
+/// `mov x0,xS; add x0,xS,#K; mov xT,x0; ...; mov xS,xT` → `add xS,xS,#K`.
+/// The scan proves neither xS nor xT is referenced in the intervening region.
+fn fold_destructive_pointer_updates(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    fn mentions(line: &str, reg: u8) -> bool {
+        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|tok| tok == xreg_name(reg) || tok == wreg_name(reg))
+    }
+    let mut changed = false;
+    for i in 0..n.saturating_sub(3) {
+        let LineKind::Move { dst: 0, src, is_32bit: false } = kinds[i] else { continue };
+        if src == 0 || src >= 29 { continue; }
+        let mut j = i + 1;
+        while j < n && kinds[j] == LineKind::Nop { j += 1; }
+        if j >= n || kinds[j] != LineKind::Alu { continue; }
+        let expected = format!("add x0, {}, #", xreg_name(src));
+        let trimmed = lines[j].trim();
+        if !trimmed.starts_with(&expected) { continue; }
+        let immediate = match trimmed.rsplit_once('#').and_then(|(_, v)| v.parse::<i64>().ok()) {
+            Some(v) if (0..=4095).contains(&v) => v,
+            _ => continue,
+        };
+        let mut k = j + 1;
+        while k < n && kinds[k] == LineKind::Nop { k += 1; }
+        let temp = match kinds.get(k).copied() {
+            Some(LineKind::Move { dst, src: 0, is_32bit: false }) if dst != src => dst,
+            _ => continue,
+        };
+        let mut end = k + 1;
+        let mut valid = true;
+        let mut found = None;
+        while end < n && end <= k + 16 {
+            if matches!(kinds[end], LineKind::Label | LineKind::Branch | LineKind::CondBranch
+                | LineKind::CmpBranch | LineKind::Call | LineKind::Ret) { break; }
+            if let LineKind::Move { dst, src: move_src, is_32bit: false } = kinds[end] {
+                if dst == src && move_src == temp { found = Some(end); break; }
+            }
+            if mentions(&lines[end], src) || mentions(&lines[end], temp) {
+                valid = false;
+                break;
+            }
+            end += 1;
+        }
+        let Some(end) = found else { continue };
+        if !valid { continue; }
+        lines[i] = format!("    add {}, {}, #{}", xreg_name(src), xreg_name(src), immediate);
+        kinds[i] = LineKind::Alu;
+        kinds[j] = LineKind::Nop;
+        kinds[k] = LineKind::Nop;
+        kinds[end] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+/// Reuse a value already copied out of a stack slot inside one basic block.
+///
+/// Register-pressure-heavy code commonly contains
+/// `ldr x0, [sp,#N]; mov wD,w0` several times for the same spill.  Once the
+/// first copy is in a register, later reloads can source that register until
+/// either it or the slot is overwritten.  Keep this deliberately local and
+/// clear state for instruction classes whose register effects are ambiguous.
+fn reuse_stack_loads_within_blocks(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_REUSE_STACK_LOADS").is_ok() {
+        return false;
+    }
+    let mut cached: Vec<(i32, bool, u8, bool)> = Vec::new();
+    let mut changed = false;
+    let mut i = 0;
+    let mut block_safe = false;
+
+    while i < n {
+        if kinds[i] == LineKind::Label {
+            let mut j = i + 1;
+            block_safe = true;
+            while j < n && kinds[j] != LineKind::Label {
+                if matches!(kinds[j], LineKind::MemOther | LineKind::Other
+                    | LineKind::StorePairSp | LineKind::LoadPairSp
+                    | LineKind::LoadsbReg | LineKind::Call)
+                {
+                    block_safe = false;
+                    break;
+                }
+                j += 1;
+            }
+        }
+        match kinds[i] {
+            LineKind::Label | LineKind::Branch | LineKind::CondBranch
+            | LineKind::CmpBranch | LineKind::Call | LineKind::Ret
+            | LineKind::MemOther | LineKind::Other | LineKind::StorePairSp
+            | LineKind::LoadPairSp | LineKind::LoadsbReg => cached.clear(),
+            LineKind::StoreSp { offset, .. } => cached.retain(|(off, _, _, _)| *off != offset),
+            _ => {}
+        }
+
+        if !block_safe {
+            i += 1;
+            continue;
+        }
+
+        let (load_reg, offset, is_word) = match kinds[i] {
+            LineKind::LoadSp { reg, offset, is_word } => (reg, offset, is_word),
+            _ => {
+                if let Some(dst) = written_gp_register(&lines[i], kinds[i]) {
+                    cached.retain(|(_, _, reg, _)| *reg != dst);
+                }
+                i += 1;
+                continue;
+            }
+        };
+
+        let old = cached.iter().find(|(off, word, reg, _)| {
+            *off == offset && *word == is_word && *reg != load_reg
+        }).copied();
+        cached.retain(|(_, _, reg, _)| *reg != load_reg);
+
+        let mut j = i + 1;
+        while j < n && kinds[j] == LineKind::Nop { j += 1; }
+        if j < n {
+            if let LineKind::Move { dst, src, is_32bit } = kinds[j] {
+                if src == load_reg {
+                    if let Some((_, _, source, source_word)) = old.filter(|entry| entry.3 == is_32bit) {
+                        // NOPing the load is only sound if its register has no
+                        // other readers before it is next fully overwritten —
+                        // copy propagation can move an instruction's reference
+                        // onto the load's own register (e.g. rewriting
+                        // `add x0, x1, x2` to read x0), and deleting the load
+                        // would leave that read with stale contents.
+                        let xn = xreg_name(load_reg);
+                        let wn = wreg_name(load_reg);
+                        let mut load_dead_after = false;
+                        let mut k = j + 1;
+                        while k < n {
+                            if kinds[k] == LineKind::Nop { k += 1; continue; }
+                            let t = &lines[k];
+                            let mentions = t
+                                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                                .any(|tok| tok == xn || tok == wn);
+                            if mentions {
+                                // A pure overwrite ends the hazard; anything
+                                // else reads the (soon deleted) register.
+                                load_dead_after = match kinds[k] {
+                                    LineKind::Move { dst, src, .. } => dst == load_reg && src != load_reg,
+                                    LineKind::MoveImm { dst } | LineKind::MoveWide { dst } => dst == load_reg,
+                                    LineKind::LoadSp { reg, .. } | LineKind::LoadswSp { reg, .. } => reg == load_reg,
+                                    _ => false,
+                                };
+                                break;
+                            }
+                            match kinds[k] {
+                                LineKind::Label | LineKind::Branch | LineKind::CondBranch
+                                | LineKind::CmpBranch | LineKind::Call | LineKind::Ret
+                                | LineKind::Directive => break,
+                                _ => {}
+                            }
+                            k += 1;
+                        }
+                        if !load_dead_after {
+                            i += 1;
+                            continue;
+                        }
+                        kinds[i] = LineKind::Nop;
+                        lines[j] = format!("    mov {}, {}",
+                            if is_32bit { wreg_name(dst) } else { xreg_name(dst) },
+                            if source_word { wreg_name(source) } else { xreg_name(source) });
+                        kinds[j] = LineKind::Move { dst, src: source, is_32bit };
+                        changed = true;
+                    }
+                    cached.retain(|(_, _, reg, _)| *reg != dst);
+                    cached.retain(|(off, word, _, _)| *off != offset || *word != is_word);
+                    cached.push((offset, is_word, dst, is_32bit));
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    changed
+}
+
+/// Return the GP register written by instruction classes whose first operand
+/// is unambiguously a destination. Unknown classes are handled by clearing the
+/// cache in the caller.
+fn written_gp_register(line: &str, kind: LineKind) -> Option<u8> {
+    match kind {
+        LineKind::Move { dst, .. } | LineKind::MoveImm { dst }
+        | LineKind::MoveWide { dst } | LineKind::Sxtw { dst, .. }
+        | LineKind::LoadSp { reg: dst, .. } | LineKind::LoadswSp { reg: dst, .. } => Some(dst),
+        LineKind::Alu => {
+            let operands = line.trim().split_once(' ')?.1;
+            let dst = operands.split(',').next()?;
+            let reg = parse_reg(dst);
+            (reg != REG_NONE).then_some(reg)
+        }
+        _ => None,
+    }
+}
+
+/// Remove `mov x9, xN` immediately followed by a memory operation that already
+/// addresses through xN. Regalloc-aware loads can make the legacy x9 setup dead.
+fn eliminate_unused_x9_address_moves(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
+    fn mentions_reg(line: &str, reg: u8) -> bool {
+        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|tok| tok == xreg_name(reg) || tok == wreg_name(reg))
+    }
+    // Base register of the memory operand, e.g. "[x10, #16]" -> 10. A textual
+    // prefix match would conflate x1 with x10-x15.
+    fn mem_base_reg(line: &str) -> Option<u8> {
+        let t = line.trim();
+        let idx = t.find('[')?;
+        let rest = &t[idx + 1..];
+        let end = rest
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .unwrap_or(rest.len());
+        let r = parse_reg(&rest[..end]);
+        (r != REG_NONE).then_some(r)
+    }
+    let mut changed = false;
+    for i in 0..n.saturating_sub(1) {
+        let LineKind::Move { dst: 9, src, is_32bit: false } = kinds[i] else { continue };
+        if src == 9 { continue; }
+        let mut j = i + 1;
+        while j < n && kinds[j] == LineKind::Nop { j += 1; }
+        if j >= n || !matches!(kinds[j], LineKind::MemOther | LineKind::LoadsbReg) { continue; }
+        if mem_base_reg(&lines[j]) != Some(src) { continue; }
+        // The mov is dead only if x9 is never read afterwards (e.g. a shrink-wrap
+        // re-home `mov x19, x9` in a later block still reads it): scan forward;
+        // any read or control-flow boundary keeps the mov, a pure overwrite of
+        // x9 (or the end of the function's text) proves it dead.
+        let mut k = j + 1;
+        let mut dead = false;
+        while k < n {
+            match kinds[k] {
+                LineKind::Nop | LineKind::Directive => {}
+                LineKind::Label | LineKind::Branch | LineKind::CondBranch
+                | LineKind::CmpBranch | LineKind::Call | LineKind::Ret => break,
+                _ => {
+                    if mentions_reg(&lines[k], 9) {
+                        dead = match kinds[k] {
+                            LineKind::Move { dst: 9, src: s2, .. } => s2 != 9,
+                            LineKind::MoveImm { dst: 9 } | LineKind::MoveWide { dst: 9 } => true,
+                            LineKind::LoadSp { reg: 9, .. } | LineKind::LoadswSp { reg: 9, .. } => true,
+                            _ => false,
+                        };
+                        break;
+                    }
+                }
+            }
+            k += 1;
+        }
+        if k == n {
+            dead = true;
+        }
+        if dead {
+            kinds[i] = LineKind::Nop;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Remove a move into an AArch64 caller-saved staging register when the value
+/// is never referenced before the next call clobbers it. Copy propagation
+/// commonly turns
+/// `mov x9, x24; mov x0, x9; bl f` into
+/// `mov x9, x24; mov x0, x24; bl f`, leaving the first move dead.
+fn eliminate_dead_call_staging_moves(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
+    fn mentions_reg(line: &str, reg: u8) -> bool {
+        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|token| token == xreg_name(reg) || token == wreg_name(reg))
+    }
+
+    let mut changed = false;
+    for i in 0..n {
+        let dst = match kinds[i] {
+            LineKind::Move { dst, .. } if (9..=15).contains(&dst) => dst,
+            _ => continue,
+        };
+        let mut j = i + 1;
+        let mut used = false;
+        let mut reaches_call = false;
+        while j < n {
+            match kinds[j] {
+                LineKind::Nop | LineKind::Directive => {}
+                LineKind::Call => { reaches_call = true; break; }
+                LineKind::Label | LineKind::Branch | LineKind::CondBranch
+                | LineKind::CmpBranch | LineKind::Ret => break,
+                _ => {
+                    if mentions_reg(&lines[j], dst) { used = true; break; }
+                }
+            }
+            j += 1;
+        }
+        if reaches_call && !used {
+            kinds[i] = LineKind::Nop;
+            changed = true;
+        }
+    }
+    changed
+}
+
 // ── Pass 1: Adjacent store/load elimination ──────────────────────────────────
 //
 // Pattern: str xN, [sp, #off]  →  ldr xN, [sp, #off]  (same reg, same offset)
 // The load is redundant since the value is already in the register.
 // Also: str xN, [sp, #off]  →  ldr xM, [sp, #off]  → replace load with mov xM, xN
 // Also handles: str wN, [sp, #off]  →  ldrsw xN, [sp, #off]
+
+// ── FP spill slot load forwarding ────────────────────────────────────────────
+//
+// Pattern: `str dS, [sp, #off]` (or via a materialized `sp`-derived base
+// register) followed by `ldr dD, [sp, #off]` in the same block. The slot-home
+// emission produces these store/reload round-trips for unallocated FP
+// temporaries; the load is replaceable with `fmov dD, dS` (or deleted when
+// dD == dS) as long as neither the slot nor dS is clobbered in between.
+//
+// Tracking is deliberately conservative: any store through an unknown base,
+// any call, and any control-flow boundary drops all state, and any write of
+// a source register drops the entries that forward from it.
+
+/// Parse an FP register name token (`d7`, `s3`, `q16`, `v2`, `v2.2d`) to its
+/// register number.
+fn fp_token_reg(tok: &str) -> Option<u8> {
+    let tok = tok.trim();
+    let digits = match tok.as_bytes().first() {
+        Some(b'd') | Some(b's') | Some(b'q') | Some(b'v') => {
+            let mut end = 1;
+            while end < tok.len() && tok.as_bytes()[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end == 1 {
+                return None;
+            }
+            &tok[1..end]
+        }
+        _ => return None,
+    };
+    digits.parse::<u8>().ok().filter(|&r| r <= 31)
+}
+
+/// An FP memory operand location: direct `[sp, #off]` slot, or a register
+/// base with a byte offset (`[xN]` / `[xN, #k]`).
+#[derive(Clone, Copy)]
+enum FpAddr {
+    Sp(i32),
+    Base(u8, i32),
+}
+
+/// Parse `str dS, ...` / `ldr dD, ...` (d/s/q widths) into (reg, FpAddr).
+fn parse_fp_mem(line: &str) -> Option<(bool, u8, FpAddr, u8)> {
+    let t = line.trim();
+    let (is_store, rest) = if let Some(r) = t.strip_prefix("str ") {
+        (true, r)
+    } else if let Some(r) = t.strip_prefix("ldr ") {
+        (false, r)
+    } else {
+        return None;
+    };
+    let (reg_str, addr) = rest.split_once(", ")?;
+    let reg_str = reg_str.trim();
+    let width = reg_str.as_bytes().first().copied()?;
+    if !matches!(width, b'd' | b's' | b'q') {
+        return None;
+    }
+    let reg = fp_token_reg(reg_str)?;
+    let addr = addr.trim();
+    if let Some(off) = parse_sp_offset(addr) {
+        return Some((is_store, reg, FpAddr::Sp(off), width));
+    }
+    if addr.starts_with("[x") && addr.ends_with(']') && !addr.contains('!') {
+        let inner = &addr[1..addr.len() - 1];
+        let (base, off) = match inner.split_once(", ") {
+            Some((b, o)) => (b.trim(), o.trim().strip_prefix('#')?.parse::<i32>().ok()?),
+            None => (inner.trim(), 0),
+        };
+        let base_reg = parse_reg(base);
+        if base_reg < 29 {
+            return Some((is_store, reg, FpAddr::Base(base_reg, off), width));
+        }
+    }
+    None
+}
+
+/// Width in bytes of an FP spill slot access kind.
+fn fp_access_width(width: u8) -> i32 {
+    match width {
+        b's' => 4,
+        b'q' => 16,
+        _ => 8, // d
+    }
+}
+
+/// Does this line write FP register `num` (any d/s/q/v name form) as its
+/// destination? Store/branch/compare mnemonics never write a register.
+fn fp_reg_written(line: &str, num: u8) -> bool {
+    let t = line.trim();
+    let Some((mnem, rest)) = t.split_once(' ') else { return false };
+    if matches!(
+        mnem,
+        "str" | "stp" | "strb" | "strh" | "stur" | "sturb" | "sturh" | "stlr"
+            | "stlrb" | "stlrh" | "fcmp" | "fcmpe" | "b" | "bl" | "ret" | "cbz"
+            | "cbnz" | "tbz" | "tbnz" | "cmp" | "cmn"
+    ) || mnem.starts_with("b.")
+    {
+        return false;
+    }
+    rest.split(',')
+        .next()
+        .is_some_and(|first| fp_token_reg(first) == Some(num))
+}
+
+/// Count mentions of one architectural FP/SIMD register, treating its
+/// `sN`/`dN`/`qN`/`vN` spellings as aliases of the same register.
+fn fp_reg_mention_count(line: &str, num: u8) -> usize {
+    line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|tok| fp_token_reg(tok) == Some(num))
+        .count()
+}
+
+/// Parse a scalar register copy (`fmov dA, dB` or `fmov sA, sB`).
+fn parse_scalar_fp_copy(line: &str) -> Option<(u8, u8, u8)> {
+    fn parse_exact(tok: &str) -> Option<(u8, u8)> {
+        let tok = tok.trim();
+        let width = *tok.as_bytes().first()?;
+        if !matches!(width, b's' | b'd') {
+            return None;
+        }
+        let reg = tok[1..].parse::<u8>().ok()?;
+        (reg <= 31).then_some((width, reg))
+    }
+
+    let rest = line.trim().strip_prefix("fmov ")?;
+    let (dst, src) = rest.split_once(',')?;
+    let (dst_width, dst_reg) = parse_exact(dst)?;
+    let (src_width, src_reg) = parse_exact(src)?;
+    if dst_width != src_width || dst_reg == src_reg {
+        return None;
+    }
+    Some((dst_width, dst_reg, src_reg))
+}
+
+/// True when `line` may overwrite an FP register.  `fp_reg_written` handles
+/// ordinary one-destination instructions; pair/structure loads need an
+/// explicit check because they have multiple FP destinations.
+fn fp_reg_may_be_written(line: &str, num: u8) -> bool {
+    if fp_reg_written(line, num) {
+        return true;
+    }
+    let t = line.trim();
+    let Some((mnem, rest)) = t.split_once(' ') else { return false };
+    if mnem == "ldp" {
+        return rest
+            .split(',')
+            .take(2)
+            .any(|op| fp_token_reg(op) == Some(num));
+    }
+    if matches!(mnem, "ld1" | "ld2" | "ld3" | "ld4") {
+        return fp_reg_mention_count(rest.split('}').next().unwrap_or(rest), num) != 0;
+    }
+    false
+}
+
+/// Replace only the first (destination) operand of an instruction. Unlike a
+/// whole-line register substitution, this preserves accumulator inputs in
+/// read/modify/write forms such as `add x0, x0, #8`.
+fn retarget_first_operand(line: &str, old: &str, new: &str) -> Option<String> {
+    if line.contains('\n') {
+        return None;
+    }
+    let t = line.trim();
+    let (mnem, rest) = t.split_once(' ')?;
+    let (first, suffix) = rest.split_once(',')?;
+    if first.trim() != old {
+        return None;
+    }
+    Some(format!("    {} {},{}", mnem, new, suffix))
+}
+
+fn gp_reg_mention_count(line: &str, num: u8) -> usize {
+    line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|tok| *tok == xreg_name(num) || *tok == wreg_name(num))
+        .count()
+}
+
+/// Instructions whose first GP operand is a pure result. In particular,
+/// `movk`, atomics, and bitfield inserts are deliberately absent because they
+/// read their destination even when it appears only once in assembly syntax.
+fn gp_pure_result_mnemonic(mnem: &str) -> bool {
+    matches!(
+        mnem,
+        "mov" | "movz" | "movn" | "add" | "sub" | "adds" | "subs"
+            | "and" | "ands" | "orr" | "eor" | "bic" | "orn" | "eon"
+            | "mul" | "madd" | "msub" | "smaddl" | "umaddl" | "smsubl"
+            | "umsubl" | "sdiv" | "udiv" | "neg" | "negs" | "mvn"
+            | "lsl" | "lsr" | "asr" | "ror" | "extr" | "rbit" | "rev"
+            | "rev16" | "rev32" | "clz" | "cls" | "sxtb" | "sxth"
+            | "sxtw" | "uxtb" | "uxth" | "uxtw" | "csel" | "csinc"
+            | "csinv" | "csneg" | "cset" | "csetm" | "cinc" | "cinv"
+            | "cneg" | "ldr" | "ldur" | "ldrb" | "ldrh" | "ldrsb"
+            | "ldrsh" | "ldrsw" | "adr" | "adrp" | "fmov" | "fcvtzs"
+            | "fcvtzu"
+    )
+}
+
+/// Instructions whose first scalar FP operand is a pure result. Accumulating
+/// forms such as `fmla`/`fmls` are intentionally excluded because their old
+/// destination is an implicit input.
+fn fp_pure_result_mnemonic(mnem: &str) -> bool {
+    matches!(
+        mnem,
+        "ldr" | "ldur" | "fmov" | "fadd" | "fsub" | "fmul" | "fdiv"
+            | "fmadd" | "fmsub" | "fnmadd" | "fnmsub" | "fneg" | "fabs"
+            | "fsqrt" | "fmax" | "fmin" | "fmaxnm" | "fminnm" | "fcsel"
+            | "fcvt" | "scvtf" | "ucvtf" | "frinta" | "frinti" | "frintm"
+            | "frintn" | "frintp" | "frintx" | "frintz"
+    )
+}
+
+fn accumulator_gp_write_only(line: &str) -> bool {
+    let Some(mnem) = line.trim().split_once(' ').map(|(mnem, _)| mnem) else {
+        return false;
+    };
+    gp_pure_result_mnemonic(mnem) && gp_reg_write_only(line, 0)
+}
+
+fn accumulator_fp_write_only(line: &str) -> bool {
+    let Some(mnem) = line.trim().split_once(' ').map(|(mnem, _)| mnem) else {
+        return false;
+    };
+    fp_pure_result_mnemonic(mnem)
+        && fp_reg_written(line, 0)
+        && fp_reg_mention_count(line, 0) == 1
+}
+
+/// Prove that the accumulator value copied at `copy_idx` is killed inside the
+/// same basic block before any subsequent read. Calls and returns count as
+/// reads because x0/d0 carry ABI arguments and results.
+fn accumulator_value_dies_after_copy(
+    lines: &[String],
+    kinds: &[LineKind],
+    n: usize,
+    copy_idx: usize,
+    is_fp: bool,
+) -> bool {
+    let mut i = copy_idx + 1;
+    while i < n {
+        if kinds[i] == LineKind::Nop {
+            i += 1;
+            continue;
+        }
+        if lines[i].contains('\n')
+            || matches!(
+                kinds[i],
+                LineKind::Label
+                    | LineKind::Branch
+                    | LineKind::CondBranch
+                    | LineKind::CmpBranch
+                    | LineKind::Call
+                    | LineKind::Ret
+                    | LineKind::Directive
+            )
+        {
+            return false;
+        }
+        if is_fp {
+            let mentions = fp_reg_mention_count(&lines[i], 0);
+            if mentions != 0 {
+                return accumulator_fp_write_only(&lines[i]);
+            }
+        } else {
+            let mentions = gp_reg_mention_count(&lines[i], 0);
+            if mentions != 0 {
+                return accumulator_gp_write_only(&lines[i]);
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn retarget_gp_accumulator_producer(
+    line: &str,
+    is_32bit: bool,
+    new_dst: u8,
+) -> Option<String> {
+    let t = line.trim();
+    let (mnem, _) = t.split_once(' ')?;
+    if !gp_pure_result_mnemonic(mnem) {
+        return None;
+    }
+    retarget_first_operand(
+        line,
+        if is_32bit { "w0" } else { "x0" },
+        if is_32bit {
+            wreg_name(new_dst)
+        } else {
+            xreg_name(new_dst)
+        },
+    )
+}
+
+fn retarget_fp_accumulator_producer(
+    line: &str,
+    width: u8,
+    new_dst: u8,
+) -> Option<String> {
+    let t = line.trim();
+    let (mnem, _) = t.split_once(' ')?;
+    if !fp_pure_result_mnemonic(mnem) {
+        return None;
+    }
+    let old = format!("{}0", width as char);
+    let new = format!("{}{}", width as char, new_dst);
+    retarget_first_operand(line, &old, &new)
+}
+
+/// Retarget a short-lived accumulator producer into the allocated destination:
+///
+///   add x0, x1, x2          ldr d0, [x3]
+///   mov x20, x0             fmov d18, d0
+///
+/// becomes `add x20, x1, x2` / `ldr d18, [x3]`. The transformation is only
+/// committed when x0/d0 is provably overwritten before any later read in the
+/// block. Multi-instruction integer constants are retargeted as one unit.
+fn retarget_single_use_accumulator_results(
+    lines: &mut [String],
+    kinds: &mut [LineKind],
+    n: usize,
+) -> bool {
+    if std::env::var("CCC_NO_ACCUM_RETARGET").is_ok() {
+        return false;
+    }
+    let mut changed = false;
+
+    for i in 0..n {
+        if kinds[i] == LineKind::Nop {
+            continue;
+        }
+
+        if let LineKind::Move {
+            dst,
+            src: 0,
+            is_32bit,
+        } = kinds[i]
+        {
+            if dst == 0
+                || dst >= 29
+                || !accumulator_value_dies_after_copy(lines, kinds, n, i, false)
+            {
+                continue;
+            }
+            let mut p = i;
+            while p > 0 {
+                p -= 1;
+                if kinds[p] != LineKind::Nop {
+                    break;
+                }
+            }
+            if p >= i
+                || matches!(
+                    kinds[p],
+                    LineKind::Label
+                        | LineKind::Branch
+                        | LineKind::CondBranch
+                        | LineKind::CmpBranch
+                        | LineKind::Call
+                        | LineKind::Ret
+                        | LineKind::Directive
+                )
+            {
+                continue;
+            }
+
+            if let Some(rewritten) =
+                retarget_gp_accumulator_producer(&lines[p], is_32bit, dst)
+            {
+                lines[p] = rewritten;
+                kinds[p] = classify_line(&lines[p]);
+                kinds[i] = LineKind::Nop;
+                changed = true;
+                continue;
+            }
+
+            // movz/movn + one or more movk instructions form a single
+            // constant materialization. Retarget every member together.
+            let width_name = if is_32bit { "w0" } else { "x0" };
+            let mut start = p;
+            let mut saw_initializer = false;
+            loop {
+                let t = lines[start].trim();
+                let Some((mnem, rest)) = t.split_once(' ') else {
+                    break;
+                };
+                let first = rest.split(',').next().map(str::trim);
+                if first != Some(width_name) {
+                    break;
+                }
+                if matches!(mnem, "movz" | "movn")
+                    || (mnem == "mov"
+                        && rest.split_once(',').is_some_and(|(_, s)| {
+                            let s = s.trim();
+                            s.starts_with('#') || s.starts_with('-')
+                        }))
+                {
+                    saw_initializer = true;
+                    break;
+                }
+                if mnem != "movk" || start == 0 {
+                    break;
+                }
+                let mut prev = start;
+                while prev > 0 {
+                    prev -= 1;
+                    if kinds[prev] != LineKind::Nop {
+                        break;
+                    }
+                }
+                if prev >= start
+                    || matches!(
+                        kinds[prev],
+                        LineKind::Label
+                            | LineKind::Branch
+                            | LineKind::CondBranch
+                            | LineKind::CmpBranch
+                            | LineKind::Call
+                            | LineKind::Ret
+                            | LineKind::Directive
+                    )
+                {
+                    break;
+                }
+                start = prev;
+            }
+            if saw_initializer {
+                let new_name = if is_32bit {
+                    wreg_name(dst)
+                } else {
+                    xreg_name(dst)
+                };
+                let mut rewritten = Vec::new();
+                for k in start..=p {
+                    if kinds[k] == LineKind::Nop {
+                        continue;
+                    }
+                    let Some(line) =
+                        retarget_first_operand(&lines[k], width_name, new_name)
+                    else {
+                        rewritten.clear();
+                        break;
+                    };
+                    rewritten.push((k, line));
+                }
+                if !rewritten.is_empty() {
+                    for (k, line) in rewritten {
+                        lines[k] = line;
+                        kinds[k] = classify_line(&lines[k]);
+                    }
+                    kinds[i] = LineKind::Nop;
+                    changed = true;
+                }
+            }
+            continue;
+        }
+
+        let Some((width, dst, 0)) = parse_scalar_fp_copy(&lines[i]) else {
+            continue;
+        };
+        if dst == 0 || !accumulator_value_dies_after_copy(lines, kinds, n, i, true) {
+            continue;
+        }
+        let mut p = i;
+        while p > 0 {
+            p -= 1;
+            if kinds[p] != LineKind::Nop {
+                break;
+            }
+        }
+        if p >= i
+            || matches!(
+                kinds[p],
+                LineKind::Label
+                    | LineKind::Branch
+                    | LineKind::CondBranch
+                    | LineKind::CmpBranch
+                    | LineKind::Call
+                    | LineKind::Ret
+                    | LineKind::Directive
+            )
+        {
+            continue;
+        }
+        if let Some(rewritten) = retarget_fp_accumulator_producer(&lines[p], width, dst) {
+            lines[p] = rewritten;
+            kinds[p] = classify_line(&lines[p]);
+            kinds[i] = LineKind::Nop;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Rewrite a scalar FP register only in source operands of a floating-point
+/// arithmetic instruction.  Keeping the first operand unchanged is important
+/// for read/modify/write forms such as `fadd d24, d24, d12`.
+fn rewrite_fp_arith_source(line: &str, width: u8, from: u8, to: u8) -> Option<String> {
+    if line.contains('\n') {
+        return None;
+    }
+    let t = line.trim();
+    let (mnem, rest) = t.split_once(' ')?;
+    if !matches!(
+        mnem,
+        "fadd" | "fsub" | "fmul" | "fdiv" | "fmadd" | "fmsub" | "fnmadd"
+            | "fnmsub" | "fmax" | "fmin" | "fmaxnm" | "fminnm"
+    ) {
+        return None;
+    }
+    let (dst, sources) = rest.split_once(',')?;
+    let from_name = format!("{}{}", width as char, from);
+    let to_name = format!("{}{}", width as char, to);
+
+    // A differently-sized alias (for example s24 after fmov d24, d11) does
+    // not read the same copied bit-width and must not be substituted.
+    let exact_mentions = sources
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|tok| *tok == from_name)
+        .count();
+    if exact_mentions == 0 || fp_reg_mention_count(sources, from) != exact_mentions {
+        return None;
+    }
+
+    let rewritten = replace_whole_word(sources, &from_name, &to_name);
+    Some(format!("    {} {},{}", mnem, dst.trim(), rewritten))
+}
+
+/// Eliminate short-lived scalar FP copies by substituting their source into
+/// the copy's sole arithmetic consumer:
+///
+///   fmov d24, d11
+///   fmov d25, d14
+///   fsub d28, d24, d25
+///
+/// becomes `fsub d28, d11, d14`.  This is deliberately basic-block-local and
+/// requires proof that (1) the source is not overwritten before the consumer,
+/// and (2) the copied destination is overwritten before any second use.  The
+/// latter rule avoids extending the source live range and keeps the transform
+/// sound without reconstructing the machine CFG.
+fn propagate_single_use_fp_copies(
+    lines: &mut [String],
+    kinds: &mut [LineKind],
+    n: usize,
+) -> bool {
+    if std::env::var("CCC_NO_FP_COPY_PROP").is_ok() {
+        return false;
+    }
+    let mut changed = false;
+
+    for i in 0..n {
+        if kinds[i] == LineKind::Nop {
+            continue;
+        }
+        let Some((width, dst, src)) = parse_scalar_fp_copy(&lines[i]) else { continue };
+
+        let mut j = i + 1;
+        while j < n {
+            if kinds[j] == LineKind::Nop {
+                j += 1;
+                continue;
+            }
+            if lines[j].contains('\n') {
+                break;
+            }
+            match kinds[j] {
+                LineKind::Label | LineKind::Branch | LineKind::CondBranch
+                | LineKind::CmpBranch | LineKind::Call | LineKind::Ret
+                | LineKind::Directive => break,
+                _ => {}
+            }
+
+            // The replacement reads src at the consumer rather than at the
+            // copy, so any intervening write would change the value.
+            if fp_reg_may_be_written(&lines[j], src) {
+                break;
+            }
+            if fp_reg_mention_count(&lines[j], dst) == 0 {
+                j += 1;
+                continue;
+            }
+
+            let Some(rewritten) = rewrite_fp_arith_source(&lines[j], width, dst, src) else {
+                break;
+            };
+
+            // If the consumer itself writes dst, its old copied value dies
+            // there.  Otherwise the next mention in this block must be a
+            // write-only definition; a second read or a boundary refuses.
+            let mut copied_value_dies = fp_reg_written(&lines[j], dst);
+            if !copied_value_dies {
+                let mut k = j + 1;
+                while k < n {
+                    if kinds[k] == LineKind::Nop {
+                        k += 1;
+                        continue;
+                    }
+                    if lines[k].contains('\n') {
+                        break;
+                    }
+                    match kinds[k] {
+                        LineKind::Label | LineKind::Branch | LineKind::CondBranch
+                        | LineKind::CmpBranch | LineKind::Call | LineKind::Ret
+                        | LineKind::Directive => break,
+                        _ => {}
+                    }
+                    let mentions = fp_reg_mention_count(&lines[k], dst);
+                    if mentions == 0 {
+                        k += 1;
+                        continue;
+                    }
+                    let Some(mnem) = lines[k].trim().split_once(' ').map(|(mnem, _)| mnem)
+                    else {
+                        break;
+                    };
+                    copied_value_dies = fp_pure_result_mnemonic(mnem)
+                        && fp_reg_written(&lines[k], dst)
+                        && mentions == 1;
+                    break;
+                }
+            }
+
+            if copied_value_dies {
+                lines[j] = rewritten;
+                kinds[j] = classify_line(&lines[j]);
+                kinds[i] = LineKind::Nop;
+                changed = true;
+            }
+            break;
+        }
+    }
+    changed
+}
+
+/// Does this line write GP register `num` (x or w form)? Checks the first two
+/// operand positions (pair loads write the second). False positives are fine
+/// (callers only use this to drop tracking state, never to enable a rewrite);
+/// false negatives are not, so store/branch/compare mnemonics are excluded and
+/// anything unrecognized counts as a write when the register appears early.
+fn gp_reg_written_broad(line: &str, num: u8) -> bool {
+    let t = line.trim();
+    let Some((mnem, rest)) = t.split_once(' ') else { return false };
+    if matches!(
+        mnem,
+        "str" | "stp" | "strb" | "strh" | "stur" | "sturb" | "sturh" | "stlr"
+            | "stlrb" | "stlrh" | "fcmp" | "fcmpe" | "b" | "bl" | "ret" | "cbz"
+            | "cbnz" | "tbz" | "tbnz" | "cmp" | "cmn"
+    ) || mnem.starts_with("b.")
+    {
+        return false;
+    }
+    rest.split(',')
+        .take(2)
+        .any(|op| {
+            let op = op.trim();
+            op == xreg_name(num) || op == wreg_name(num)
+        })
+}
+
+// ── Adjacent FP field pair fusion (ldp/stp) ─────────────────────────────────
+//
+// `ldr dA, [xB]` + `ldr dC, [xB, #8]` (within a small window) → `ldp dA, dC,
+// [xB]`, and likewise `str` pairs → `stp`. Struct-of-double loops (nbody,
+// spectral_norm, struct_copy) load/store adjacent fields in pairs; fusing
+// halves the memory-op issue slots. Bit-identical: ldp/stp move the same
+// bytes as the two scalar accesses. CCC_NO_FP_PAIR disables.
+//
+// Soundness: the second access moves up to the first's position, so nothing
+// in the gap may write memory (for loads), touch memory at all (for stores),
+// or mention either destination register or the base.
+fn fuse_fp_adjacent_pairs(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_FP_PAIR").is_ok() {
+        return false;
+    }
+    let mention = |line: &str, reg: u8, is_fp: bool| {
+        let (a, b) = if is_fp {
+            (format!("d{}", reg), format!("q{}", reg))
+        } else {
+            (xreg_name(reg).to_string(), wreg_name(reg).to_string())
+        };
+        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|tok| tok == a || tok == b)
+    };
+    let mut changed = false;
+    for i in 0..n {
+        // Skip lines already Nop'd by earlier fusions/passes: their text is
+        // stale and must not be re-paired.
+        if kinds[i] == LineKind::Nop {
+            continue;
+        }
+        let Some((is_store, ra, addra, b'd')) = parse_fp_mem(&lines[i]) else { continue };
+        let base_reg = match addra {
+            FpAddr::Sp(_) => u8::MAX, // sp is never rewritten mid-body
+            FpAddr::Base(b, _) => b,
+        };
+        // Find a mergeable partner within a 4-instruction window.
+        let mut partner = None;
+        let mut j = i + 1;
+        while j < n && j <= i + 4 {
+            if kinds[j] == LineKind::Nop {
+                j += 1;
+                continue;
+            }
+            match kinds[j] {
+                LineKind::Label | LineKind::Branch | LineKind::CondBranch
+                | LineKind::CmpBranch | LineKind::Call | LineKind::Ret
+                | LineKind::Directive => break,
+                _ => {}
+            }
+            let tj = lines[j].trim();
+            // A valid merge partner is not a hazard to itself — check for it
+            // before the generic memory-hazard break.
+            if let Some((is_store2, rc, addrc, b'd')) = parse_fp_mem(&lines[j]) {
+                if is_store2 == is_store && rc != ra {
+                    let same_base = match (addra, addrc) {
+                        (FpAddr::Sp(a), FpAddr::Sp(b)) => Some((a, b)),
+                        (FpAddr::Base(x, a), FpAddr::Base(y, b)) if x == y => Some((a, b)),
+                        _ => None,
+                    };
+                    if let Some((oa, ob)) = same_base {
+                        if (oa - ob).abs() == 8 {
+                            // The partner's load/store moves up to position i:
+                            // no gap line may mention rc (its physical register
+                            // could carry a live older value), write ra, or
+                            // write the base.
+                            let mut ok = true;
+                            for k in (i + 1)..j {
+                                if kinds[k] == LineKind::Nop {
+                                    continue;
+                                }
+                                if mention(&lines[k], rc, true)
+                                    || fp_reg_written(&lines[k], ra)
+                                    || (base_reg != u8::MAX
+                                        && gp_reg_written_broad(&lines[k], base_reg))
+                                {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            if ok {
+                                partner = Some((j, rc, ob));
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            let is_mem = parse_fp_mem(&lines[j]).is_some()
+                || matches!(kinds[j], LineKind::StoreSp { .. } | LineKind::LoadSp { .. }
+                    | LineKind::LoadswSp { .. } | LineKind::MemOther
+                    | LineKind::StorePairSp | LineKind::LoadPairSp | LineKind::LoadsbReg);
+            // A store in the gap could alias the pending load; for store
+            // fusion any memory access is a hazard.
+            if is_mem && (is_store || tj.starts_with("st")) {
+                break;
+            }
+            j += 1;
+        }
+        let Some((pj, rc, ob)) = partner else { continue };
+        let oa = match addra {
+            FpAddr::Sp(o) => o,
+            FpAddr::Base(_, o) => o,
+        };
+        let (lo_reg, hi_reg, lo) = if oa <= ob { (ra, rc, oa) } else { (rc, ra, ob) };
+        let base_str = match addra {
+            FpAddr::Sp(_) => "sp".to_string(),
+            FpAddr::Base(b, _) => xreg_name(b).to_string(),
+        };
+        let mnem = if is_store { "stp" } else { "ldp" };
+        lines[i] = if lo == 0 {
+            format!("    {} d{}, d{}, [{}]", mnem, lo_reg, hi_reg, base_str)
+        } else {
+            format!("    {} d{}, d{}, [{}, #{}]", mnem, lo_reg, hi_reg, base_str, lo)
+        };
+        kinds[i] = classify_line(&lines[i]);
+        kinds[pj] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+// ── Repeated GP slot load elimination ───────────────────────────────────────
+//
+// `ldr x9, [sp, #off]` ... `ldr x9, [sp, #off]` (same slot, no clobber):
+// spill-heavy code reloads slot-homed pointers once per field access. The
+// second load is redundant (or becomes a `mov` when the destination differs).
+// Same tracking discipline as forward_fp_slot_loads: stores through unknown
+// bases, calls, and control-flow boundaries drop all state; a write of the
+// cached register drops the entry.
+fn eliminate_repeated_slot_loads(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_SLOT_LOAD_DEDUP").is_ok() {
+        return false;
+    }
+    // (offset, is_word) -> register holding the slot's content
+    let mut cached: FxHashMap<(i32, bool), u8> = FxHashMap::default();
+    let mut changed = false;
+    for i in 0..n {
+        match kinds[i] {
+            LineKind::Label | LineKind::Branch | LineKind::CondBranch
+            | LineKind::CmpBranch | LineKind::Call | LineKind::Ret => {
+                cached.clear();
+                continue;
+            }
+            LineKind::Directive | LineKind::Nop => continue,
+            LineKind::StoreSp { offset, is_word, .. } => {
+                // Invalidate entries overlapping the stored range.
+                let (lo, hi) = (offset, offset + if is_word { 4 } else { 8 });
+                cached.retain(|&(off, word), _| {
+                    let (l2, h2) = (off, off + if word { 4 } else { 8 });
+                    h2 <= lo || l2 >= hi
+                });
+                continue;
+            }
+            LineKind::LoadSp { reg, offset, is_word } => {
+                if let Some(&prev) = cached.get(&(offset, is_word)) {
+                    if prev == reg {
+                        kinds[i] = LineKind::Nop;
+                        changed = true;
+                        continue;
+                    }
+                    lines[i] = format!(
+                        "    mov {}, {}",
+                        if is_word { wreg_name(reg) } else { xreg_name(reg) },
+                        if is_word { wreg_name(prev) } else { xreg_name(prev) }
+                    );
+                    kinds[i] = LineKind::Move { dst: reg, src: prev, is_32bit: is_word };
+                    changed = true;
+                }
+                // The load (or its mov replacement) writes `reg`: any entry
+                // cached under it is stale. Then record the new mapping.
+                cached.retain(|_, &mut r| r != reg);
+                cached.insert((offset, is_word), reg);
+                continue;
+            }
+            _ => {}
+        }
+        let t = lines[i].trim();
+        // Stores through untracked bases may hit the frame: drop everything.
+        if t.starts_with("st") {
+            cached.clear();
+            continue;
+        }
+        // Loads and other instructions only invalidate via their destination.
+        if let Some(w) = written_gp_register(&lines[i], kinds[i]) {
+            cached.retain(|_, &mut r| r != w);
+        } else {
+            // Unrecognized kinds: check destination-position mentions broadly.
+            let mut dead = Vec::new();
+            for &r in cached.values() {
+                if gp_reg_written_broad(&lines[i], r) {
+                    dead.push(r);
+                }
+            }
+            for r in dead {
+                cached.retain(|_, &mut v| v != r);
+            }
+        }
+    }
+    changed
+}
+
+/// Strict single-destination form: only the first operand position, and only
+/// when it is the line's sole mention of the register (a read-write like
+/// `add x0, x0, #1` is NOT a pure overwrite).
+fn gp_reg_write_only(line: &str, num: u8) -> bool {
+    let t = line.trim();
+    let Some((mnem, rest)) = t.split_once(' ') else { return false };
+    if matches!(
+        mnem,
+        "str" | "stp" | "strb" | "strh" | "stur" | "sturb" | "sturh" | "stlr"
+            | "stlrb" | "stlrh" | "fcmp" | "fcmpe" | "b" | "bl" | "ret" | "cbz"
+            | "cbnz" | "tbz" | "tbnz" | "cmp" | "cmn"
+    ) || mnem.starts_with("b.")
+    {
+        return false;
+    }
+    let (xa, wa) = (xreg_name(num), wreg_name(num));
+    let first = rest.split(',').next().map(str::trim);
+    if first != Some(xa) && first != Some(wa) {
+        return false;
+    }
+    t.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|tok| *tok == xa || *tok == wa)
+        .count()
+        == 1
+}
+
+fn forward_fp_slot_loads(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_FP_SLOT_FWD").is_ok() {
+        return false;
+    }
+    // slot (offset, width) -> source FP register number
+    let mut slot_src: FxHashMap<(i32, u8), u8> = FxHashMap::default();
+    // sp-derived base register -> sp offset (`add xN, sp, #off` / `mov xN, sp`)
+    let mut base_off: FxHashMap<u8, i32> = FxHashMap::default();
+    let mut changed = false;
+
+    let mut i = 0;
+    while i < n {
+        match kinds[i] {
+            LineKind::Label | LineKind::Branch | LineKind::CondBranch
+            | LineKind::CmpBranch | LineKind::Call | LineKind::Ret => {
+                slot_src.clear();
+                base_off.clear();
+                i += 1;
+                continue;
+            }
+            LineKind::Directive | LineKind::Nop => {
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        let t = lines[i].trim().to_string();
+
+        // Track sp-derived base registers: `add xN, sp, #off`, `mov xN, sp`.
+        if let Some(rest) = t.strip_prefix("add ") {
+            if let Some((dst_s, srcs)) = rest.split_once(", ") {
+                if let Some((src_s, imm_s)) = srcs.split_once(", ") {
+                    if src_s.trim() == "sp" {
+                        let dst = parse_reg(dst_s.trim());
+                        if dst < 29 {
+                            if let Some(imm) = imm_s.trim().strip_prefix('#').and_then(|v| v.parse::<i32>().ok()) {
+                                base_off.insert(dst, imm);
+                                i += 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        } else if let Some(rest) = t.strip_prefix("mov ") {
+            if let Some((dst_s, src_s)) = rest.split_once(", ") {
+                if src_s.trim() == "sp" {
+                    let dst = parse_reg(dst_s.trim());
+                    if dst < 29 {
+                        base_off.insert(dst, 0);
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Any write of a tracked base register invalidates its mapping.
+        // (Broad check: loads through untracked bases and pair loads can also
+        // rewrite the register; over-dropping only loses optimization.)
+        {
+            let mut dead_bases = Vec::new();
+            for &b in base_off.keys() {
+                if written_gp_register(&lines[i], kinds[i]) == Some(b)
+                    || gp_reg_written_broad(&lines[i], b)
+                {
+                    dead_bases.push(b);
+                }
+            }
+            for b in dead_bases {
+                base_off.remove(&b);
+            }
+        }
+
+        if let Some((is_store, reg, addr, width)) = parse_fp_mem(&lines[i]) {
+            let slot_off = match addr {
+                FpAddr::Sp(off) => Some(off),
+                FpAddr::Base(b, k) => base_off.get(&b).map(|&base| base + k),
+            };
+            let Some(slot_off) = slot_off else {
+                // Unknown base: a store through it may alias anything tracked.
+                if is_store {
+                    slot_src.clear();
+                    base_off.clear();
+                } else {
+                    // Unknown-base load still clobbers its destination.
+                    let mut to_drop = Vec::new();
+                    for (&key, &s) in slot_src.iter() {
+                        if s == reg {
+                            to_drop.push(key);
+                        }
+                    }
+                    for key in to_drop {
+                        slot_src.remove(&key);
+                    }
+                }
+                i += 1;
+                continue;
+            };
+            if is_store {
+                let (lo, hi) = (slot_off, slot_off + fp_access_width(width));
+                slot_src.retain(|&(off, w), _| {
+                    let (l2, h2) = (off, off + fp_access_width(w));
+                    h2 <= lo || l2 >= hi
+                });
+                slot_src.insert((slot_off, width), reg);
+            } else {
+                if let Some(&src) = slot_src.get(&(slot_off, width)) {
+                    if src == reg {
+                        // Loading a slot into the register that already holds
+                        // its content: redundant.
+                        kinds[i] = LineKind::Nop;
+                        changed = true;
+                        i += 1;
+                        continue;
+                    }
+                    lines[i] = if width == b'q' {
+                        format!("    mov v{}.16b, v{}.16b", reg, src)
+                    } else {
+                        format!("    fmov {}{}, {}{}", width as char, reg, width as char, src)
+                    };
+                    kinds[i] = classify_line(&lines[i]);
+                    changed = true;
+                }
+                // The load writes its destination register, whether or not a
+                // forward happened: entries forwarding FROM that register are
+                // now stale. (Missing this clobbered a still-tracked entry
+                // whose source was silently reloaded between store and use.)
+                slot_src.retain(|_, &mut s| s != reg);
+            }
+            i += 1;
+            continue;
+        }
+
+        // GP stack stores invalidate overlapping FP entries.
+        if let LineKind::StoreSp { offset, is_word, .. } = kinds[i] {
+            let (lo, hi) = (offset, offset + if is_word { 4 } else { 8 });
+            slot_src.retain(|&(off, w), _| {
+                let (l2, h2) = (off, off + fp_access_width(w));
+                h2 <= lo || l2 >= hi
+            });
+            i += 1;
+            continue;
+        }
+
+        match kinds[i] {
+            // Untracked store forms may write anywhere: drop all state.
+            LineKind::MemOther | LineKind::StorePairSp if t.starts_with("st") => {
+                slot_src.clear();
+                base_off.clear();
+            }
+            // Pair loads write two registers: drop entries sourcing either.
+            LineKind::LoadPairSp => {
+                let mut ops = t
+                    .trim_start_matches("ldp ")
+                    .split(',')
+                    .take(2)
+                    .filter_map(|tok| fp_token_reg(tok));
+                let (a, b) = (ops.next(), ops.next());
+                slot_src.retain(|_, &mut s| Some(s) != a && Some(s) != b);
+            }
+            // Other instructions: drop entries whose source register they write.
+            _ => {
+                let mut to_drop = Vec::new();
+                for (&key, &s) in slot_src.iter() {
+                    if fp_reg_written(&lines[i], s) {
+                        to_drop.push(key);
+                    }
+                }
+                for key in to_drop {
+                    slot_src.remove(&key);
+                }
+            }
+        }
+        i += 1;
+    }
+    changed
+}
 
 fn eliminate_adjacent_store_load(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
@@ -567,6 +2138,606 @@ fn eliminate_self_moves(kinds: &mut [LineKind], n: usize) -> bool {
     changed
 }
 
+// ── Shift-mask to ubfx folding ───────────────────────────────────────────────
+//
+// `(x >> K) & ((1<<N)-1)` lowers to `mov wM, #mask; and wD, wM, wS, lsr #K`
+// because the shifted-and form needs the mask in a register. When K+N fits
+// the 32-bit lane, this is exactly `ubfx wD, wS, #K, #N` — one instruction,
+// no constant materialization (switch_dispatch's dispatch loop).
+fn fold_shift_mask_ubfx(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_UBFX").is_ok() {
+        return false;
+    }
+    let mut changed = false;
+    for i in 0..n {
+        if kinds[i] != LineKind::Alu || lines[i].contains('\n') {
+            continue;
+        }
+        let t = lines[i].trim();
+        let Some(ops) = t.strip_prefix("and ") else { continue };
+        let parts: Vec<&str> = ops.split(", ").collect();
+        if parts.len() != 4 {
+            continue;
+        }
+        let Some(shift) = parts[3]
+            .strip_prefix("lsr #")
+            .and_then(|v| v.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if shift == 0 || shift >= 32 {
+            continue;
+        }
+        // Both operands must be plain w-regs (no xzr/sp games).
+        let Some(dst) = parts[0].strip_prefix('w').and_then(|v| v.parse::<u8>().ok()) else { continue };
+        let Some(mask_reg) = parts[1].strip_prefix('w').and_then(|v| v.parse::<u8>().ok()) else { continue };
+        if !parts[2].starts_with('w') || dst > 30 || mask_reg > 30 {
+            continue;
+        }
+        // Find the mask register's defining mov immediate earlier in the
+        // block (stop at any barrier or rewrite of the register).
+        let mut mask: Option<u64> = None;
+        let mut j = i;
+        while j > 0 {
+            j -= 1;
+            match kinds[j] {
+                LineKind::Nop => continue,
+                LineKind::Label
+                | LineKind::Branch
+                | LineKind::CondBranch
+                | LineKind::CmpBranch
+                | LineKind::Call
+                | LineKind::Ret
+                | LineKind::Directive => break,
+                _ => {}
+            }
+            if lines[j].contains('\n') {
+                break;
+            }
+            let tj = lines[j].trim();
+            let mut found = false;
+            for pfx in ["mov w", "mov x", "movz w", "movz x"] {
+                if let Some(rest) = tj.strip_prefix(pfx) {
+                    if let Some((reg_s, imm_s)) = rest.split_once(", ") {
+                        let reg_num = reg_s.trim().parse::<u8>().ok();
+                        if reg_num == Some(mask_reg) {
+                            if let Some(imm) = imm_s.trim().strip_prefix('#') {
+                                if let Ok(m) = imm.parse::<i64>() {
+                                    if m >= 0 {
+                                        mask = Some(m as u64);
+                                    }
+                                }
+                            }
+                            found = true;
+                        }
+                    }
+                }
+            }
+            if found {
+                break;
+            }
+            if instr_clobbers_reg(tj, mask_reg) {
+                break;
+            }
+        }
+        let Some(m) = mask else { continue };
+        if m == 0 || (m & (m + 1)) != 0 {
+            continue; // not 2^N - 1
+        }
+        let width = 64 - (m + 1).leading_zeros(); // log2(m+1)
+        let width = width - 1;
+        if width == 0 || shift + width > 32 {
+            continue;
+        }
+        lines[i] = format!("    ubfx {}, {}, #{}, #{}", parts[0], parts[2], shift, width);
+        kinds[i] = LineKind::Alu;
+        changed = true;
+    }
+    changed
+}
+
+// ── Pass 3b: Redundant sign-extension elimination ───────────────────────────
+//
+// Pattern: `sxtw xD, wS` where xS already holds a sign-extended value (written
+// by `ldrsw`, an earlier `sxtw`, or a 64-bit mov of an extended register).
+// The sxtw recomputes what is already true — replace with `mov xD, xS`
+// (or drop entirely when D == S). Common after `ldrsw x0, [..]; mov xR, x0`
+// feeding an I32→I64 cast (e.g. dot_product's per-load sxtw).
+//
+// A register stops being known-extended on any write: w-writes zero the upper
+// bits, x-writes of unknown provenance clobber conservatively. All tracking is
+// cleared at labels, branches, and calls.
+
+fn eliminate_redundant_sxtw(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    // Function boundaries (the peephole sees the whole module's text).
+    let mut fn_start = vec![false; n];
+    let mut fn_end = vec![false; n];
+    for i in 0..n {
+        let t = lines[i].trim();
+        if t.starts_with(".cfi_startproc") {
+            fn_start[i] = true;
+        } else if t.starts_with(".cfi_endproc") {
+            fn_end[i] = true;
+        }
+    }
+    // Single-write constant registers within the current function: the
+    // hoisted loop-invariant masks from int_const_hoist. Their value is known
+    // even across block boundaries where extended[] conservatively resets.
+    let mut const_nonneg = [false; 33];
+    let mut extended = [false; 33];
+    extended[32] = true; // xzr is always "extended" (sxtw xD, wzr ≡ mov xD, xzr)
+    let mut changed = false;
+    for i in 0..n {
+        if fn_start[i] {
+            // (Re)build the per-function constant-register map. A register is
+            // a known constant when it has exactly one mov/movz immediate
+            // write at position p, no other write after p and before its last
+            // use, and no non-store use before p (prologue saves read the
+            // caller's value; epilogue restores land after all uses).
+            const_nonneg = [false; 33];
+            let mut mov_pos = [usize::MAX; 33];
+            let mut mov_val = [0u64; 33];
+            let mut mov_cnt = [0u8; 33];
+            let mut other_write = [false; 33]; // non-mov write seen (position checked later)
+            let mut other_write_pos = [usize::MAX; 33];
+            let mut max_use = [0usize; 33];
+            let mut early_bad_use = [false; 33];
+            let mut j = i;
+            while j < n && !fn_end[j] {
+                if kinds[j] != LineKind::Nop {
+                    for sub in lines[j].split('\n') {
+                        let t = sub.trim();
+                        if t.is_empty() || t.ends_with(':') || t.starts_with('.') {
+                            continue;
+                        }
+                        let is_store = t.starts_with("st");
+                        // mov/movz immediate write?
+                        let mut is_const_mov = false;
+                        for pfx in ["mov w", "mov x", "movz w", "movz x"] {
+                            if let Some(rest) = t.strip_prefix(pfx) {
+                                if let Some((reg_s, imm_s)) = rest.split_once(", ") {
+                                    if let Some(imm_s) = imm_s.trim().strip_prefix('#') {
+                                        let v = if let Some((base, lsl)) = imm_s.split_once(", lsl #") {
+                                            match (base.parse::<i64>(), lsl.parse::<u32>()) {
+                                                (Ok(b), Ok(k)) if b >= 0 && k < 32 => Some((b as u64) << k),
+                                                _ => None,
+                                            }
+                                        } else {
+                                            imm_s.parse::<i64>().ok().filter(|&b| b >= 0).map(|b| b as u64)
+                                        };
+                                        if let (Ok(d), Some(v)) = (reg_s.trim().parse::<u8>(), v) {
+                                            if d < 33 {
+                                                mov_cnt[d as usize] = mov_cnt[d as usize].saturating_add(1);
+                                                mov_pos[d as usize] = j;
+                                                mov_val[d as usize] = v;
+                                                is_const_mov = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        for b in 0..33u8 {
+                            let written = gp_reg_written_broad(t, b);
+                            let mentioned = written
+                                || t.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                                    .any(|tok| tok == xreg_name(b) || tok == wreg_name(b));
+                            if !mentioned {
+                                continue;
+                            }
+                            if written && !is_const_mov {
+                                other_write[b as usize] = true;
+                                if other_write_pos[b as usize] == usize::MAX || j > other_write_pos[b as usize] {
+                                    // track writes after the mov below via max_use
+                                }
+                                other_write_pos[b as usize] = j;
+                            }
+                            if !written || is_store {
+                                // a use (stores read the register)
+                                if j > max_use[b as usize] {
+                                    max_use[b as usize] = j;
+                                }
+                                if !is_store && mov_cnt[b as usize] == 0 {
+                                    early_bad_use[b as usize] = true;
+                                }
+                            }
+                            if written && is_const_mov {
+                                // the mov itself also "uses" nothing
+                            }
+                        }
+                        let _ = is_const_mov;
+                    }
+                }
+                j += 1;
+            }
+            for b in 0..33usize {
+                if mov_cnt[b] == 1 && mov_val[b] < (1u64 << 31) && !early_bad_use[b] {
+                    // Any other write must land after the last use.
+                    if !other_write[b] || other_write_pos[b] > max_use[b] {
+                        const_nonneg[b] = true;
+                    }
+                }
+            }
+        }
+        if fn_end[i] {
+            const_nonneg = [false; 33];
+        }
+        match kinds[i] {
+            // Control-flow barriers: nothing is known across them.
+            LineKind::Label | LineKind::Branch | LineKind::CondBranch
+            | LineKind::CmpBranch | LineKind::Call | LineKind::Ret => {
+                extended = [false; 33];
+                extended[32] = true;
+            }
+            // Unknown/memory kinds may clobber registers — except ldrsw with
+            // non-sp addressing (classifies as MemOther), which CREATES a
+            // sign-extended register.
+            LineKind::MemOther | LineKind::Other | LineKind::LoadsbReg | LineKind::LoadPairSp => {
+                let t = lines[i].trim();
+                let mut ldrsw_dst: Option<u8> = None;
+                if let Some(rest) = t.strip_prefix("ldrsw ") {
+                    if let Some((reg_str, _)) = rest.split_once(',') {
+                        let r = parse_reg(reg_str.trim());
+                        if r != REG_NONE && r < 32 {
+                            ldrsw_dst = Some(r);
+                        }
+                    }
+                }
+                extended = [false; 33];
+                extended[32] = true;
+                if let Some(r) = ldrsw_dst {
+                    extended[r as usize] = true;
+                }
+            }
+            LineKind::LoadswSp { reg, .. } => {
+                if reg < 32 {
+                    extended[reg as usize] = true;
+                }
+            }
+            LineKind::Sxtw { dst, src } => {
+                if extended[src as usize] {
+                    if dst == src {
+                        kinds[i] = LineKind::Nop;
+                    } else {
+                        lines[i] = format!("    mov {}, {}", xreg_name(dst), xreg_name(src));
+                        kinds[i] = LineKind::Move { dst, src, is_32bit: false };
+                    }
+                    changed = true;
+                }
+                // Whether redundant or not, the sxtw result is sign-extended.
+                if dst < 32 {
+                    extended[dst as usize] = true;
+                }
+            }
+            LineKind::Move { dst, src, is_32bit } => {
+                if is_32bit {
+                    // mov wN, wM zero-extends into xN — NOT a sign extension.
+                    if dst < 32 {
+                        extended[dst as usize] = false;
+                    }
+                } else if dst < 32 {
+                    extended[dst as usize] = extended[src as usize];
+                }
+            }
+            _ => {
+                // Producers of values with bit 31 clear: their 64-bit form
+                // equals their sign extension, so a later sxtw is redundant.
+                let t = lines[i].trim();
+                let mut nonneg_dst: Option<u8> = None;
+                // mov/movz with a non-negative constant below 2^31.
+                for pfx in ["mov w", "mov x", "movz w", "movz x"] {
+                    if let Some(rest) = t.strip_prefix(pfx) {
+                        if let Some((reg_s, imm_s)) = rest.split_once(", ") {
+                            if let Some(imm_s) = imm_s.trim().strip_prefix('#') {
+                                // Optional ", lsl #K" second shift component.
+                                let mut val: Option<u64> = None;
+                                if let Some((base, lsl)) = imm_s.split_once(", lsl #") {
+                                    if let (Ok(b), Ok(k)) = (base.parse::<i64>(), lsl.parse::<u32>()) {
+                                        if b >= 0 && k < 32 {
+                                            let v = (b as u64) << k;
+                                            val = Some(v);
+                                        }
+                                    }
+                                } else if let Ok(b) = imm_s.parse::<i64>() {
+                                    if b >= 0 {
+                                        val = Some(b as u64);
+                                    }
+                                }
+                                if let Some(v) = val {
+                                    if v < (1u64 << 31) {
+                                        if let Ok(d) = reg_s.trim().parse::<u8>() {
+                                            if d < 32 {
+                                                nonneg_dst = Some(d);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if nonneg_dst.is_none() {
+                    if let Some(rest) = t.strip_prefix("ubfx ") {
+                    // ubfx wD, wS, #K, #N — bit 31 clear when K+N <= 31
+                    let parts: Vec<&str> = rest.split(", ").collect();
+                    if parts.len() == 4 {
+                        let d = parse_reg(parts[0]);
+                        let k = parts[2].strip_prefix('#').and_then(|v| v.parse::<u32>().ok());
+                        let wd = parts[3].strip_prefix('#').and_then(|v| v.parse::<u32>().ok());
+                        if let (Some(k), Some(wd)) = (k, wd) {
+                            if k + wd <= 31 && d < 32 {
+                                nonneg_dst = Some(d);
+                            }
+                        }
+                    }
+                } else if let Some(rest) = t.strip_prefix("lsr ") {
+                    // lsr wD, wS, #K with K >= 1: bit 31 clear
+                    let parts: Vec<&str> = rest.split(", ").collect();
+                    if parts.len() == 3 {
+                        let d = parse_reg(parts[0]);
+                        let k = parts[2].strip_prefix('#').and_then(|v| v.parse::<u32>().ok());
+                        if let Some(k) = k {
+                            if k >= 1 && d < 32 {
+                                nonneg_dst = Some(d);
+                            }
+                        }
+                    }
+                } else if let Some(rest) = t.strip_prefix("and ") {
+                    // and wD, wS, #imm with imm's bit 31 clear
+                    let parts: Vec<&str> = rest.split(", ").collect();
+                    if parts.len() == 3 {
+                        let d = parse_reg(parts[0]);
+                        let m = parts[2].strip_prefix('#').and_then(|v| v.parse::<i64>().ok());
+                        if let Some(m) = m {
+                            if m >= 0 && m < (1i64 << 31) && d < 32 {
+                                nonneg_dst = Some(d);
+                            }
+                        } else {
+                            // Register mask: bit 31 of the result is clear
+                            // when clear in EITHER input (and = bitwise &).
+                            let a = parse_reg(parts[1]);
+                            let b = parse_reg(parts[2]);
+                            let nonneg = |r: u8| {
+                                (r < 33 && extended[r as usize]) || (r < 33 && const_nonneg[r as usize])
+                            };
+                            if d < 32 && a < 33 && b < 33 && (nonneg(a) || nonneg(b)) {
+                                nonneg_dst = Some(d);
+                            }
+                        }
+                    }
+                }
+                }
+                if let Some(d) = nonneg_dst {
+                    extended[d as usize] = true;
+                } else if let Some(dst) = written_gp_register(&lines[i], kinds[i]) {
+                    if dst < 32 {
+                        extended[dst as usize] = false;
+                    }
+                }
+            }
+        }
+    }
+    changed
+}
+
+// ── Pass 3b: Redundant byte sign-extension elimination ──────────────────────
+//
+// Mirror of eliminate_redundant_sxtw for byte-level extensions: `ldrsb`
+// produces a value whose bits 7..63 are uniform (a sign-extended byte), so a
+// later `sxtb xD, wS` on it is redundant. Fires on char-byte loops like
+// sieve's count loop (`ldrsb x0, [p]` then `sxtb` before the zero test).
+
+fn eliminate_redundant_sxtb(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut extb = [false; 33];
+    extb[32] = true; // the zero register is "byte-extended"
+    let mut changed = false;
+    for i in 0..n {
+        match kinds[i] {
+            LineKind::Label | LineKind::Branch | LineKind::CondBranch
+            | LineKind::CmpBranch | LineKind::Call | LineKind::Ret => {
+                extb = [false; 33];
+                extb[32] = true;
+            }
+            LineKind::Move { dst, src, is_32bit } => {
+                if is_32bit {
+                    // w-mov zeroes bits 32-63, breaking byte-extension of negatives.
+                    if dst < 32 {
+                        extb[dst as usize] = false;
+                    }
+                } else if dst < 32 {
+                    extb[dst as usize] = extb[src as usize];
+                }
+            }
+            _ => {
+                let t = lines[i].trim().to_string();
+                // sxtb xD, wS
+                if let Some(rest) = t.strip_prefix("sxtb ") {
+                    if let Some((d, s)) = rest.split_once(", ") {
+                        let dst = parse_reg(d.trim());
+                        let src = parse_reg(s.trim());
+                        if dst != REG_NONE && src != REG_NONE && dst < 32 && src < 32 {
+                            if extb[src as usize] {
+                                if dst == src {
+                                    kinds[i] = LineKind::Nop;
+                                } else {
+                                    lines[i] = format!("    mov {}, {}", xreg_name(dst), xreg_name(src));
+                                    kinds[i] = LineKind::Move { dst, src, is_32bit: false };
+                                }
+                                changed = true;
+                            }
+                            // The sxtb result is byte-extended either way.
+                            extb[dst as usize] = true;
+                            continue;
+                        }
+                    }
+                }
+                // ldrsb xD/wD, [...] creates a byte-sign-extended value.
+                if let Some(rest) = t.strip_prefix("ldrsb ") {
+                    if let Some((d, _)) = rest.split_once(',') {
+                        let dst = parse_reg(d.trim());
+                        if dst != REG_NONE && dst < 32 {
+                            extb[dst as usize] = true;
+                        }
+                        continue;
+                    }
+                }
+                // Any other write clobbers the tracking.
+                if let Some(dst) = written_gp_register(&t, kinds[i]) {
+                    if dst < 32 {
+                        extb[dst as usize] = false;
+                    }
+                }
+            }
+        }
+    }
+    changed
+}
+
+// ── FP copy staging through x0 ───────────────────────────────────────────────
+//
+// FP copies between unassigned values stage through a GPR: `fmov x0, dA` /
+// `fmov dB, x0`. Each GP<->FP fmov costs multiple cycles; the pair is just
+// `fmov dB, dA`. Fires when the two are adjacent in a block and the GPR is
+// dead after the pair (its next mention is a write or a barrier).
+fn fold_fp_gpr_roundtrips(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_FP_ROUNDTRIP").is_ok() {
+        return false;
+    }
+    let mut changed = false;
+    for i in 0..n.saturating_sub(1) {
+        if kinds[i] == LineKind::Nop || lines[i].contains('\n') {
+            continue;
+        }
+        let t = lines[i].trim();
+        let Some(rest) = t.strip_prefix("fmov x") else { continue };
+        let Some((gpr_s, fps)) = rest.split_once(", ") else { continue };
+        let Some(fps) = fps.strip_prefix('d') else { continue };
+        let (Ok(gpr), Ok(fpa)) = (gpr_s.parse::<u8>(), fps.parse::<u8>()) else { continue };
+        if gpr > 30 {
+            continue;
+        }
+        // Next live line must be `fmov dB, x<gpr>`.
+        let Some(j) = ((i + 1)..n).find(|&k| kinds[k] != LineKind::Nop) else { continue };
+        if lines[j].contains('\n') {
+            continue;
+        }
+        let tj = lines[j].trim();
+        let Some(restj) = tj.strip_prefix("fmov d") else { continue };
+        let Some((fpb_s, gpr_s2)) = restj.split_once(", ") else { continue };
+        let Some(gpr_s2) = gpr_s2.strip_prefix('x') else { continue };
+        let (Ok(fpb), Ok(gpr2)) = (fpb_s.parse::<u8>(), gpr_s2.parse::<u8>()) else { continue };
+        if gpr2 != gpr {
+            continue;
+        }
+        // The GPR must be dead after line j: scan to the block end; the first
+        // mention (x or w form) must be a write.
+        let xn = xreg_name(gpr);
+        let wn = wreg_name(gpr);
+        let mut dead = true;
+        for k in (j + 1)..n {
+            match kinds[k] {
+                LineKind::Nop => continue,
+                LineKind::Label
+                | LineKind::Branch
+                | LineKind::CondBranch
+                | LineKind::CmpBranch
+                | LineKind::Call
+                | LineKind::Ret
+                | LineKind::Directive => break,
+                _ => {}
+            }
+            let mentions = lines[k]
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .any(|tok| tok == xn || tok == wn);
+            if mentions {
+                // A write (destination) ends the value's life; a read keeps it.
+                dead = instr_clobbers_reg(lines[k].trim_start(), gpr);
+                break;
+            }
+        }
+        if !dead {
+            continue;
+        }
+        lines[i] = format!("    fmov d{}, d{}", fpb, fpa);
+        kinds[i] = LineKind::Other;
+        kinds[j] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+// ── Zero-store via wzr/xzr ───────────────────────────────────────────────────
+//
+// Storing a literal zero goes through a materialization: `mov x0, #0` then
+// `strb w0, [x9]`. The zero register does it for free: `strb wzr, [x9]`.
+// The mov is left for dead-move elimination (it may have other uses).
+fn fold_zero_stores(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for i in 0..n {
+        let zr_reg = match kinds[i] {
+            LineKind::MoveImm { dst } | LineKind::MoveWide { dst } if dst <= 30 => {
+                let t = lines[i].trim();
+                // movn #0 is -1, not zero; symbol operands fail the int parse.
+                if t.starts_with("movn") || lines[i].contains('\n') {
+                    continue;
+                }
+                let zero = t
+                    .rsplit_once(", ")
+                    .and_then(|(_, imm)| imm.trim().strip_prefix('#'))
+                    .is_some_and(|v| v.parse::<i64>() == Ok(0));
+                if zero {
+                    dst
+                } else {
+                    continue;
+                }
+            }
+            _ => continue,
+        };
+        let (xname, wname) = (xreg_name(zr_reg), wreg_name(zr_reg));
+        // Rewrite the value operand of the next store that reads R, stopping
+        // at the first barrier, rewrite of R, or memory op.
+        for j in (i + 1)..n {
+            match kinds[j] {
+                LineKind::Nop => continue,
+                LineKind::Move { .. }
+                | LineKind::MoveImm { .. }
+                | LineKind::MoveWide { .. }
+                | LineKind::Alu
+                | LineKind::Compare => {
+                    if instr_clobbers_reg(lines[j].trim_start(), zr_reg) {
+                        break;
+                    }
+                    continue;
+                }
+                LineKind::StoreSp { .. } | LineKind::MemOther | LineKind::StorePairSp => {
+                    let t = lines[j].trim_start().to_string();
+                    if !(t.starts_with("str") || t.starts_with("stp")) {
+                        break; // a load: stop
+                    }
+                    if let Some((mnem, rest)) = t.split_once(' ') {
+                        if let Some((first, suffix)) = rest.split_once(',') {
+                            let first = first.trim();
+                            let zr = if first == xname {
+                                "xzr"
+                            } else if first == wname {
+                                "wzr"
+                            } else {
+                                break;
+                            };
+                            lines[j] = format!("    {} {},{}", mnem, zr, suffix);
+                            kinds[j] = classify_line(&lines[j]);
+                            changed = true;
+                        }
+                    }
+                    break;
+                }
+                _ => break,
+            }
+        }
+    }
+    changed
+}
+
 // ── Pass 4: Move chain optimization ──────────────────────────────────────────
 //
 // Pattern: mov A, B  ;  mov C, A → mov C, B
@@ -627,6 +2798,133 @@ fn eliminate_move_chains(lines: &mut [String], kinds: &mut [LineKind], n: usize)
     changed
 }
 
+// ── Overwritten-move elimination ─────────────────────────────────────────────
+//
+// The accumulator-staging emission leaves dead moves like `mov x0, x22` right
+// before `add x0, x1, x22` (the add overwrites x0 without reading it). Delete
+// any mov/MoveImm whose destination register is provably overwritten before it
+// is read. Same-block, forward scan; any control flow or non-pure-write
+// mention keeps the move.
+fn eliminate_overwritten_moves(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for i in 0..n {
+        let dst = match kinds[i] {
+            LineKind::Move { dst, .. } => dst,
+            LineKind::MoveImm { dst } | LineKind::MoveWide { dst } => dst,
+            _ => continue,
+        };
+        if dst >= 29 {
+            continue; // never touch sp/fp-adjacent registers
+        }
+        let xn = xreg_name(dst);
+        let wn = wreg_name(dst);
+        let mut dead = false;
+        let mut j = i + 1;
+        while j < n {
+            if kinds[j] == LineKind::Nop {
+                j += 1;
+                continue;
+            }
+            match kinds[j] {
+                LineKind::Label | LineKind::Branch | LineKind::CondBranch
+                | LineKind::CmpBranch | LineKind::Call | LineKind::Ret
+                | LineKind::Directive => break,
+                _ => {}
+            }
+            let t = &lines[j];
+            let mentions = t
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .any(|tok| tok == xn || tok == wn);
+            if !mentions {
+                j += 1;
+                continue;
+            }
+            // First mention decides: a pure overwrite (dest written, not read)
+            // makes the earlier move dead; anything else reads it.
+            dead = match kinds[j] {
+                LineKind::Move { dst: d2, src: s2, .. } => d2 == dst && s2 != dst,
+                LineKind::MoveImm { dst: d2 } | LineKind::MoveWide { dst: d2 } => d2 == dst,
+                LineKind::LoadSp { reg, .. } | LineKind::LoadswSp { reg, .. } => reg == dst,
+                LineKind::Alu => {
+                    // Three-operand ALU: first operand is the destination.
+                    // Dead only if dst is that dest and not among the sources.
+                    let t2 = t.trim();
+                    let ops = t2.split_once(' ').map(|x| x.1).unwrap_or("");
+                    let mut parts = ops.splitn(2, ',');
+                    let first = parts.next().unwrap_or("").trim();
+                    let rest = parts.next().unwrap_or("");
+                    let first_is_dst = first == xn || first == wn;
+                    let rest_reads = rest
+                        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                        .any(|tok| tok == xn || tok == wn);
+                    first_is_dst && !rest_reads
+                }
+                _ => false,
+            };
+            break;
+        }
+        if dead {
+            kinds[i] = LineKind::Nop;
+            changed = true;
+        }
+    }
+    changed
+}
+
+// ── Zero-extend move-chain folding ───────────────────────────────────────────
+//
+// `mov xA, xS ; mov wA, wA ; mov xD, xA` — the accumulator-path zero-extension
+// idiom (the 32-bit self-move clears the top half; it is NOT a no-op, so
+// eliminate_self_moves correctly keeps it). The chain computes xD = zext32(wS),
+// exactly `mov wD, wS`. Sound only if A is not read later in the block.
+fn fold_zext_move_chains(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for i in 0..n.saturating_sub(2) {
+        let LineKind::Move { dst: a, src: s, is_32bit: false } = kinds[i] else { continue };
+        let LineKind::Move { dst: a2, src: s2, is_32bit: true } = kinds[i + 1] else { continue };
+        if a2 != a || s2 != a {
+            continue; // middle must be mov wA, wA
+        }
+        let LineKind::Move { dst: d, src: s3, is_32bit: false } = kinds[i + 2] else { continue };
+        if s3 != a || d == a || s == a {
+            continue;
+        }
+        // A must be dead after the chain: no later READ before a boundary.
+        // A write-only line (e.g. `mov x0, #15`) ends the old value's life.
+        let (xa, wa) = (xreg_name(a), wreg_name(a));
+        let mut a_live = false;
+        for j in (i + 3)..n {
+            match kinds[j] {
+                LineKind::Label | LineKind::Branch | LineKind::CondBranch
+                | LineKind::CmpBranch | LineKind::Call | LineKind::Ret => break,
+                LineKind::Nop => continue,
+                _ => {}
+            }
+            let mentions = lines[j]
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .filter(|tok| *tok == xa || *tok == wa)
+                .count();
+            if mentions == 0 {
+                continue;
+            }
+            if gp_reg_write_only(&lines[j], a) {
+                break; // write-only: the chain's value in A is dead here
+            }
+            a_live = true;
+            break;
+        }
+        if a_live {
+            continue;
+        }
+        lines[i] = format!("    mov {}, {}", wreg_name(d), wreg_name(s));
+        kinds[i] = LineKind::Move { dst: d, src: s, is_32bit: true };
+        kinds[i + 1] = LineKind::Nop;
+        kinds[i +2] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
 /// Retarget a move-immediate instruction to a different destination register.
 /// E.g., `mov x0, #5` with new dest x14 → `mov x14, #5`
 fn retarget_move_imm(line: &str, new_dst: u8) -> Option<String> {
@@ -651,6 +2949,384 @@ fn retarget_move_imm(line: &str, new_dst: u8) -> Option<String> {
         }
     }
     None
+}
+
+// ── Shrink-wrap: defer callee-saves past a clean early return ───────────────
+//
+// Recursive early-exit functions like binary_trees' check save every
+// callee-saved register at entry, then the null-child path (half the calls)
+// returns immediately — paying 5 stp + 5 ldp for nothing:
+//
+//   check:
+//     stp x29, x30, [sp, #-96]!
+//     stp x19, x20, [sp, #16]   ... 5 saves ...
+//     mov x20, x0; ldr x0, [x0]; mov x19, x0; cmp x19, #0
+//     b.eq .LBB5                (early: return 1, with full restores)
+//     b .LBB6                   (continuation: calls check twice)
+//
+// When the entry region before the first conditional branch is short, the
+// early-exit block is a clean return (no calls), and the continuation has a
+// single predecessor, move the save/restore pairs onto the continuation
+// path. Entry-region uses of saved registers are remapped to free scratch
+// registers (x9-x15) and re-homed with movs after the deferred saves.
+fn shrink_wrap_early_returns(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_SHRINK_WRAP").is_ok() {
+        return false;
+    }
+    let mentions_reg = |text: &str, r: u8| {
+        text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|tok| tok == xreg_name(r) || tok == wreg_name(r))
+    };
+    let mut changed = false;
+    let mut i = 0;
+    while i < n {
+        // Prologue: stp x29, x30, [sp, #-N]! ... mov x29, sp
+        let is_prologue_stp = {
+            let t = lines[i].trim();
+            t.starts_with("stp x29, x30, [sp, #-") && t.ends_with("]!")
+        };
+        if !is_prologue_stp {
+            i += 1;
+            continue;
+        }
+        // Walk to `mov x29, sp`, skipping cfi directives.
+        let mut p = i + 1;
+        while p < n && (kinds[p] == LineKind::Directive || lines[p].trim().starts_with(".cfi_")) {
+            p += 1;
+        }
+        if p >= n || lines[p].trim() != "mov x29, sp" {
+            i += 1;
+            continue;
+        }
+        // Collect consecutive callee-saved GPR stores (skip cfi between).
+        let mut saves: Vec<usize> = Vec::new(); // line indices
+        let mut saved_regs: Vec<u8> = Vec::new();
+        let mut q = p + 1;
+        loop {
+            while q < n && kinds[q] == LineKind::Directive {
+                q += 1;
+            }
+            if q >= n {
+                break;
+            }
+            let t = lines[q].trim().to_string();
+            let mut regs_in_save: Vec<u8> = Vec::new();
+            if let Some(rest) = t.strip_prefix("stp ") {
+                if let Some((regs, addr)) = rest.split_once(", [sp, #") {
+                    if addr.ends_with(']') && !addr.contains("]!") {
+                        let mut it = regs.split(", ");
+                        if let (Some(a), Some(b)) = (it.next(), it.next()) {
+                            let (pa, pb) = (parse_reg(a.trim()), parse_reg(b.trim()));
+                            if (19..=28).contains(&pa) && (19..=28).contains(&pb) {
+                                regs_in_save = vec![pa, pb];
+                            }
+                        }
+                    }
+                }
+            } else if let Some(rest) = t.strip_prefix("str ") {
+                if let Some((reg, addr)) = rest.split_once(", [sp, #") {
+                    if addr.ends_with(']') {
+                        let pr = parse_reg(reg.trim());
+                        if (19..=28).contains(&pr) {
+                            regs_in_save = vec![pr];
+                        }
+                    }
+                }
+            }
+            if !regs_in_save.is_empty() {
+                saves.push(q);
+                saved_regs.extend(regs_in_save);
+                q += 1;
+            } else {
+                break;
+            }
+        }
+        if saves.len() < 2 {
+            i += 1;
+            continue; // nothing worth deferring
+        }
+        // Entry region: q .. first CondBranch e. No labels/branches/calls/ret.
+        let mut e = q;
+        let mut region_ok = true;
+        let mut entry_lines: Vec<usize> = Vec::new();
+        while e < n {
+            match kinds[e] {
+                LineKind::CondBranch => break,
+                LineKind::Nop | LineKind::Directive => {}
+                LineKind::Label | LineKind::Branch | LineKind::CmpBranch | LineKind::Call
+                | LineKind::Ret => {
+                    region_ok = false;
+                    break;
+                }
+                _ => {
+                    if lines[e].contains('\n') {
+                        region_ok = false;
+                        break;
+                    }
+                    entry_lines.push(e);
+                }
+            }
+            e += 1;
+        }
+        if !region_ok || e >= n || e == q {
+            i += 1;
+            continue;
+        }
+        let Some((_, early_lbl)) = cond_branch_parts(lines[e].trim_start()) else {
+            i += 1;
+            continue;
+        };
+        // After e: optional `.Lskip:` + `b .Lcont`, then the early block label.
+        let next_live = |from: usize| (from..n).find(|&j| kinds[j] != LineKind::Nop && kinds[j] != LineKind::Directive);
+        let Some(mut cont_lbl) = next_live(e + 1).map(|j| lines[j].trim().to_string()) else {
+            i += 1;
+            continue;
+        };
+        // Skip a trampoline (label + unconditional branch) to find both blocks.
+        let mut early_pos = None;
+        let mut cont_pos = None;
+        {
+            // If the line after e is a Label followed by an unconditional
+            // branch (the .Lskip trampoline), the branch target is the
+            // continuation block.
+            let mut fall = next_live(e + 1);
+            if let Some(jl) = fall {
+                if kinds[jl] == LineKind::Label {
+                    if let Some(jb) = next_live(jl + 1) {
+                        if kinds[jb] == LineKind::Branch {
+                            if let Some(t) = branch_target(lines[jb].trim_start()) {
+                                cont_lbl = t.to_string();
+                                fall = next_live(jb + 1);
+                            }
+                        }
+                    }
+                }
+            }
+            let _ = fall;
+            let early_with_colon = format!("{}:", early_lbl);
+            let cont_with_colon = format!("{}:", cont_lbl);
+            let mut j = e + 1;
+            while j < n {
+                if kinds[j] == LineKind::Label {
+                    let nm = lines[j].trim();
+                    if nm == early_with_colon {
+                        early_pos = Some(j);
+                    }
+                    if nm == cont_with_colon {
+                        cont_pos = Some(j);
+                    }
+                    if early_pos.is_some() && cont_pos.is_some() {
+                        break;
+                    }
+                }
+                // Stop at the next function.
+                let t = lines[j].trim();
+                if t.starts_with("stp x29, x30, [sp, #-") {
+                    break;
+                }
+                j += 1;
+            }
+        }
+        let (Some(ep), Some(cp)) = (early_pos, cont_pos) else {
+            i += 1;
+            continue;
+        };
+        if cp <= ep {
+            i += 1; // expect continuation after the early block textually
+            continue;
+        }
+        // Early block: [ep+1, cp) — must be a clean return: one ret at end,
+        // no calls, restores exactly the saved regs, no other saved-reg use.
+        let mut early_ok = true;
+        let mut early_restores: Vec<usize> = Vec::new();
+        let mut early_ret = None;
+        for j in ep + 1..cp {
+            if kinds[j] == LineKind::Nop || kinds[j] == LineKind::Directive {
+                continue;
+            }
+            let t = lines[j].trim();
+            match kinds[j] {
+                LineKind::Call | LineKind::Label | LineKind::Branch | LineKind::CondBranch
+                | LineKind::CmpBranch => {
+                    early_ok = false;
+                    break;
+                }
+                LineKind::Ret => {
+                    early_ret = Some(j);
+                }
+                _ => {
+                    let is_restore = (t.starts_with("ldp ") || t.starts_with("ldr "))
+                        && t.contains("[sp");
+                    if is_restore {
+                        // The frame teardown (ldp x29, x30, [sp], #N) stays;
+                        // only callee-saved register restores are deferred.
+                        if t.contains("x30") {
+                            continue;
+                        }
+                        // Must restore only saved regs.
+                        let mut regs_ok = true;
+                        for part in t.split(|c| [',', '[', ']'].contains(&c)) {
+                            let part = part.trim();
+                            if part.starts_with('x') || part.starts_with('w') || part.starts_with('d') {
+                                if let Some(rnum) = part.trim_start_matches(|c| c == 'x' || c == 'w' || c == 'd').parse::<u8>().ok() {
+                                    if (19..=28).contains(&rnum) && !saved_regs.contains(&rnum) {
+                                        regs_ok = false;
+                                    }
+                                }
+                            }
+                        }
+                        if !regs_ok {
+                            early_ok = false;
+                            break;
+                        }
+                        early_restores.push(j);
+                    } else {
+                        // Plain instruction: may not mention saved regs.
+                        if saved_regs.iter().any(|&r| mentions_reg(t, r)) {
+                            early_ok = false;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if !early_ok || early_ret.is_none() {
+            i += 1;
+            continue;
+        }
+        // Continuation: single predecessor (the trampoline from the entry
+        // region) and not the target of any backward branch.
+        let cont_name = cont_lbl.as_str();
+        let mut preds = 0;
+        let mut backward = false;
+        for j in q..n {
+            let t = lines[j].trim();
+            if t.starts_with("stp x29, x30, [sp, #-") && j > cp {
+                break; // next function
+            }
+            for sub in t.split('\n') {
+                if any_branch_target(sub.trim()) == Some(cont_name) {
+                    preds += 1;
+                    // backward if the branch is after the continuation label
+                    if j > cp {
+                        backward = true;
+                    }
+                }
+            }
+        }
+        if preds != 1 || backward {
+            i += 1;
+            continue;
+        }
+        // Remap entry-region uses of saved regs to scratch registers.
+        // Every saved reg mentioned must be written before it is read.
+        let mut used_scratches: Vec<u8> = Vec::new();
+        for r in 9..=15u8 {
+            let used = entry_lines.iter().any(|&j| mentions_reg(lines[j].trim(), r))
+                || mentions_reg(lines[e].trim_start(), r);
+            if !used {
+                used_scratches.push(r);
+            }
+        }
+        let mut remap: Vec<(u8, u8)> = Vec::new(); // (saved, scratch)
+        {
+            let mut first_is_write: FxHashMap<u8, bool> = FxHashMap::default();
+            for &j in &entry_lines {
+                let t = lines[j].trim();
+                for &r in &saved_regs {
+                    if mentions_reg(t, r) && !first_is_write.contains_key(&r) {
+                        first_is_write.insert(r, instr_clobbers_reg(t, r));
+                    }
+                }
+            }
+            let cond_t = lines[e].trim_start();
+            for &r in &saved_regs {
+                if mentions_reg(cond_t, r) && !first_is_write.contains_key(&r) {
+                    first_is_write.insert(r, false); // condbranch reads
+                }
+            }
+            let mut ok = true;
+            for (&r, &is_write) in &first_is_write {
+                if !is_write {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok || first_is_write.len() > used_scratches.len() {
+                i += 1;
+                continue;
+            }
+            let mut order: Vec<u8> = first_is_write.keys().copied().collect();
+            order.sort();
+            for (k, &r) in order.iter().enumerate() {
+                remap.push((r, used_scratches[k]));
+            }
+        }
+        // Apply the rewrite.
+        for &j in &saves {
+            kinds[j] = LineKind::Nop;
+        }
+        for &j in &early_restores {
+            kinds[j] = LineKind::Nop;
+        }
+        // Remap entry region + the conditional branch.
+        let remap_text = |text: &str, remap: &[(u8, u8)]| -> String {
+            let mut out = String::new();
+            let mut last = 0;
+            let bytes = text.as_bytes();
+            let mut idx = 0;
+            while idx < bytes.len() {
+                let c = bytes[idx] as char;
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    let start = idx;
+                    while idx < bytes.len() && (bytes[idx] as char).is_ascii_alphanumeric() || idx < bytes.len() && bytes[idx] == b'_' {
+                        idx += 1;
+                    }
+                    let tok = &text[start..idx];
+                    let mut replaced = None;
+                    for &(from, to) in remap {
+                        if tok == xreg_name(from) {
+                            replaced = Some(xreg_name(to));
+                            break;
+                        }
+                        if tok == wreg_name(from) {
+                            replaced = Some(wreg_name(to));
+                            break;
+                        }
+                    }
+                    if let Some(rep) = replaced {
+                        out.push_str(&text[last..start]);
+                        out.push_str(rep);
+                        last = idx;
+                    }
+                } else {
+                    idx += 1;
+                }
+            }
+            out.push_str(&text[last..]);
+            out
+        };
+        for &j in &entry_lines {
+            lines[j] = remap_text(&lines[j].clone(), &remap);
+            kinds[j] = classify_line(&lines[j]);
+        }
+        lines[e] = remap_text(&lines[e].clone(), &remap);
+        // Insert saves + re-home movs after the continuation label.
+        let mut insert = String::new();
+        for &j in &saves {
+            insert.push('\n');
+            insert.push_str(&lines[j]);
+        }
+        for &(from, to) in &remap {
+            insert.push('\n');
+            insert.push_str(&format!("    mov {}, {}", xreg_name(from), xreg_name(to)));
+        }
+        lines[cp] = format!("{}{}", lines[cp], insert);
+        kinds[cp] = LineKind::Other;
+        changed = true;
+        i = cp; // continue scanning after this function's continuation
+    }
+    changed
 }
 
 // ── Pass 5: Branch-over-branch fusion ────────────────────────────────────────
@@ -778,7 +3454,15 @@ fn propagate_register_copies(lines: &mut [String], kinds: &mut [LineKind], n: us
         // Don't propagate across control flow boundaries or into instructions
         // with multiple destination registers (like ldp which has two dest regs
         // after the mnemonic, but our replace_source_reg_in_instruction only
-        // treats the first operand as dest).
+        // treats the first operand as dest). Multi-line slots (e.g. the
+        // rotated loop latch produced by rotate_simple_loops) are composite
+        // sequences: an earlier embedded instruction may clobber src before a
+        // later embedded one reads dst, and a text-level rewrite cannot see
+        // that (it rewrote `ldr x0, [sp,#48]; cmp x23, x0` into
+        // `cmp x0, x0` past a `mov x23, x0` in sqlite's defragmentPage).
+        if lines[j].contains('\n') {
+            continue;
+        }
         match kinds[j] {
             LineKind::Label | LineKind::Branch | LineKind::Ret | LineKind::Directive
             | LineKind::LoadPairSp | LineKind::Call => continue,
@@ -834,9 +3518,7 @@ fn propagate_register_copies(lines: &mut [String], kinds: &mut [LineKind], n: us
 }
 
 // Shared peephole string utilities -- see backend/peephole_common.rs
-use crate::backend::peephole_common::replace_source_reg_in_instruction;
-#[cfg(test)]
-use crate::backend::peephole_common::replace_whole_word;
+use crate::backend::peephole_common::{replace_source_reg_in_instruction, replace_whole_word};
 
 // ── Global dead store elimination ────────────────────────────────────────────
 //
@@ -846,40 +3528,271 @@ use crate::backend::peephole_common::replace_whole_word;
 // to register moves, leaving the original stores dead.
 
 fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
-    // Safety check: if any instruction takes the address of sp (e.g., `add xN, sp, #off`),
-    // stack slots could be accessed through pointers, so we must not eliminate any stores.
-    // This is conservative but sound — it prevents miscompilation when arrays or structs
-    // are allocated on the stack and passed by pointer to callees.
+    // Process each function independently: the tracked state (derived bases,
+    // escapes, loop-variant sets, loaded ranges) is only meaningful within
+    // one stack frame, and a single escape in one function must not disable
+    // the pass for the rest of the module.
+    if std::env::var("CCC_NO_GDSE_FN_SCOPE").is_ok() {
+        return gdse_range(lines, kinds, 0, n);
+    }
+    let mut changed = false;
+    let mut start = 0usize;
     for i in 0..n {
-        if kinds[i] == LineKind::Nop {
+        if lines[i].trim().starts_with(".cfi_endproc") {
+            changed |= gdse_range(lines, kinds, start, i + 1);
+            start = i + 1;
+        }
+    }
+    if start < n {
+        changed |= gdse_range(lines, kinds, start, n);
+    }
+    changed
+}
+
+fn gdse_range(lines: &[String], kinds: &mut [LineKind], start: usize, end: usize) -> bool {
+    // Safety: stack slots can be accessed through sp-derived pointer registers
+    // (`add xN, sp, #off` etc.). Instead of bailing on any address-of-sp, track
+    // the derived bases: as long as every use of a base is an address use
+    // (`[xN]`, `[xN, #k]`), a copy/adjustment of another base, or a clobber
+    // that ends its lineage, no frame address ever leaves the function's
+    // visible text, so all slot loads are accounted for below. Any other use
+    // (stored as a value, call argument, comparison, inline asm, ...) is an
+    // escape and we bail.
+    //
+    // Base offsets are tracked in sp terms: `add xN, sp, #k` gives xN offset k,
+    // `mov xM, xN` copies it, `add/sub xN, xN, #k` adjusts it, and a write of
+    // any other kind ends the mapping. Calls clobber caller-saved bases and
+    // are escapes when a base sits in an argument register.
+
+    // Raw sp-relative offsets are only comparable when sp never moves
+    // mid-body (see sp_motion_only_at_edges): bail on the call-scratch
+    // push/pop idiom and any other mid-body sp motion.
+    if !sp_motion_only_at_edges(lines, kinds, start, end) {
+        return false;
+    }
+
+    // Collect candidate bases and check for escapes.
+    let mut base_off: FxHashMap<u8, i32> = FxHashMap::default();
+    let mut escaped = false;
+    for i in start..end {
+        if escaped {
+            break;
+        }
+        let t = lines[i].trim();
+        if kinds[i] == LineKind::Nop || t.is_empty() {
             continue;
         }
-        let trimmed = lines[i].trim();
-        // Check for address-of-sp patterns:
-        // - `add xN, sp, #offset` (common for array/struct address)
-        // - `mov xN, sp` (copying stack pointer)
-        // - `sub xN, sp, #N` (stack address computation)
-        if (trimmed.starts_with("add ") || trimmed.starts_with("sub ")) && trimmed.contains(", sp,") {
-            return false;
+        if kinds[i] == LineKind::Label || kinds[i] == LineKind::Directive {
+            continue;
         }
-        if trimmed.starts_with("mov ") && trimmed.contains(", sp") {
-            // Check it's actually "mov xN, sp" not "mov sp, xN"
-            if let Some(rest) = trimmed.strip_prefix("mov ") {
-                if let Some((_, src)) = rest.split_once(", ") {
-                    if src.trim() == "sp" {
-                        return false;
+        if kinds[i] == LineKind::Call {
+            // A base in an argument register at a call site escapes.
+            for b in 0..=8u8 {
+                if base_off.contains_key(&b) {
+                    escaped = true;
+                    break;
+                }
+            }
+            // Calls clobber caller-saved registers: end those lineages.
+            base_off.retain(|&r, _| r >= 19);
+            continue;
+        }
+
+        // Base creation from sp (`add xN, sp, #k` / `sub xN, sp, #k` /
+        // `mov xN, sp`): these lines mention no existing base, so handle
+        // them before the mention scan.
+        let mut created = false;
+        if let Some(rest) = t.strip_prefix("add ").or_else(|| t.strip_prefix("sub ")) {
+            let neg = t.starts_with("sub ");
+            if let Some((dst_s, srcs)) = rest.split_once(", ") {
+                if let Some((src_s, imm_s)) = srcs.split_once(", ") {
+                    if src_s.trim() == "sp" {
+                        if let Some(imm) = imm_s.trim().strip_prefix('#').and_then(|v| v.parse::<i32>().ok()) {
+                            let dst = parse_reg(dst_s.trim());
+                            if dst < 29 {
+                                base_off.insert(dst, if neg { -imm } else { imm });
+                            }
+                            created = true;
+                        }
+                    }
+                }
+            }
+        } else if let Some(rest) = t.strip_prefix("mov ") {
+            if let Some((dst_s, src_s)) = rest.split_once(", ") {
+                if src_s.trim() == "sp" {
+                    let dst = parse_reg(dst_s.trim());
+                    if dst < 29 {
+                        base_off.insert(dst, 0);
+                    }
+                    created = true;
+                }
+            }
+        }
+        if created {
+            continue;
+        }
+
+        // Mentions of currently tracked bases in this line (x or w form).
+        let mut mentioned = Vec::new();
+        for &b in base_off.keys() {
+            let xn = xreg_name(b);
+            let wn = wreg_name(b);
+            if t.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .any(|tok| tok == xn || tok == wn)
+            {
+                mentioned.push(b);
+            }
+        }
+        for b in mentioned {
+            let xn = xreg_name(b);
+            // Address use as `[xN]` / `[xN, #k]`: allowed. Writeback forms
+            // (`!` or `], #`) rewrite the register — end the lineage.
+            let addr_form = format!("[{}", xn);
+            if t.contains(&addr_form) {
+                if t.contains("!") || t.contains("],") {
+                    base_off.remove(&b);
+                }
+                continue;
+            }
+            // Base-creating or base-preserving forms.
+            if let Some(rest) = t.strip_prefix("mov ") {
+                if let Some((dst_s, src_s)) = rest.split_once(", ") {
+                    let (dst_s, src_s) = (dst_s.trim(), src_s.trim());
+                    if dst_s == xn {
+                        // mov xN, xM: re-based if xM is a base, clobbered otherwise.
+                        let src = parse_reg(src_s);
+                        match base_off.get(&src).copied() {
+                            Some(off) => base_off.insert(b, off),
+                            None => base_off.remove(&b),
+                        };
+                    } else if src_s == xn {
+                        // mov xM, xN: xM joins the lineage.
+                        let dst = parse_reg(dst_s);
+                        if dst < 29 {
+                            let off = base_off[&b];
+                            base_off.insert(dst, off);
+                        }
+                    }
+                    continue;
+                }
+            }
+            if let Some(rest) = t.strip_prefix("add ").or_else(|| t.strip_prefix("sub ")) {
+                let neg = t.starts_with("sub ");
+                if let Some((dst_s, srcs)) = rest.split_once(", ") {
+                    if let Some((src_s, imm_s)) = srcs.split_once(", ") {
+                        if let Some(imm) = imm_s.trim().strip_prefix('#').and_then(|v| v.parse::<i32>().ok()) {
+                            let dst = parse_reg(dst_s.trim());
+                            let src = parse_reg(src_s.trim());
+                            let signed = if neg { -imm } else { imm };
+                            if dst == b && src == b {
+                                base_off.insert(b, base_off[&b] + signed);
+                                continue;
+                            }
+                            if let Some(&off) = base_off.get(&src) {
+                                if dst < 29 {
+                                    base_off.insert(dst, off + signed);
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            // A write of the base by a load or ALU op ends the lineage (allowed).
+            if gp_reg_written_broad(&lines[i], b) {
+                base_off.remove(&b);
+                continue;
+            }
+            // Anything else is a genuine use of the pointer value: escape.
+            escaped = true;
+            break;
+        }
+    }
+    if escaped {
+        return false;
+    }
+
+    // Loop-variant base registers: a backward branch means the text between
+    // the label and the branch executes many times, so a register written in
+    // that region takes a different value on every iteration. The linear scan
+    // below sees only one of those values, so resolving a load through such a
+    // register to a single frame range is unsound — reads from later
+    // iterations go unaccounted and the stores they cover get deleted (this
+    // deleted the init stores of `long a[N] = {...}` read via a
+    // marching-pointer loop). Loads through loop-variant bases are treated as
+    // reading the whole frame, and stores through them are never deleted.
+    const WHOLE_FRAME: (i32, i32) = (-(1 << 29), 1 << 30);
+    let mut loop_variant: FxHashSet<u8> = FxHashSet::default();
+    {
+        let mut label_pos: FxHashMap<&str, usize> = FxHashMap::default();
+        for i in start..end {
+            if kinds[i] == LineKind::Label {
+                label_pos.insert(lines[i].trim().trim_end_matches(':'), i);
+            }
+        }
+        // Prefix-sum the in-loop depth from backward branches.
+        let mut delta = vec![0i32; end + 1];
+        for j in start..end {
+            let t = lines[j].trim();
+            if !(t.starts_with("b ") || t.starts_with("b.") || t.starts_with("cb") || t.starts_with("tb")) {
+                continue;
+            }
+            let Some(target) = t
+                .split(|c: char| c.is_whitespace() || c == ',')
+                .filter(|s| !s.is_empty())
+                .last()
+            else {
+                continue;
+            };
+            if let Some(&i) = label_pos.get(target) {
+                if i < j {
+                    delta[i] += 1;
+                    delta[j + 1] -= 1;
+                }
+            }
+        }
+        let mut depth = 0i32;
+        for i in start..end {
+            depth += delta[i];
+            if depth > 0 {
+                for b in 0..29u8 {
+                    if gp_reg_written_broad(&lines[i], b) {
+                        loop_variant.insert(b);
                     }
                 }
             }
         }
     }
 
-    // Phase 1: Collect all (offset, size) byte ranges that are loaded from.
-    // We must use byte-range overlap (not exact offset match) because a wide
-    // store (e.g. `str x` at offset 16, 8 bytes) can be partially read by a
-    // narrower load at a different offset (e.g. `ldr w` at offset 20, 4 bytes).
+    // Phase 1: collect all loaded byte ranges, resolving base-relative forms.
     let mut loaded_ranges: Vec<(i32, i32)> = Vec::new(); // (offset, size)
-    for i in 0..n {
+    let mut base_off: FxHashMap<u8, i32> = FxHashMap::default();
+
+    for i in start..end {
+        track_sp_bases(&lines[i], kinds[i], &mut base_off);
+        // FP loads/stores and base forms.
+        if let Some((is_store, _reg, addr, width)) = parse_fp_mem(&lines[i]) {
+            if !is_store {
+                let off = match addr {
+                    FpAddr::Sp(off) => Some(off),
+                    FpAddr::Base(b, k) => {
+                        if loop_variant.contains(&b) {
+                            // Loop-variant base: may read any frame slot.
+                            loaded_ranges.push(WHOLE_FRAME);
+                            None
+                        } else {
+                            base_off.get(&b).map(|&o| o + k)
+                        }
+                    }
+                };
+                if let Some(off) = off {
+                    loaded_ranges.push((off, fp_access_width(width)));
+                } else {
+                    // Unknown-base load: may read anything (frame addresses did
+                    // not escape, so it cannot read our frame — no action).
+                }
+            }
+        }
         match kinds[i] {
             LineKind::LoadSp { offset, is_word, .. } => {
                 let size = if is_word { 4 } else { 8 };
@@ -912,17 +3825,62 @@ fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: us
                         if let Some(off) = extract_sp_offset(trimmed) {
                             loaded_ranges.push((off, sz));
                         }
+                    } else if trimmed.starts_with("ldr ") || trimmed.starts_with("ldp ") || trimmed.starts_with("ldur ")
+                        || trimmed.starts_with("ldrsw ") || trimmed.starts_with("ldrsb ")
+                        || trimmed.starts_with("ldrsh ") || trimmed.starts_with("ldrb ")
+                        || trimmed.starts_with("ldrh ") || trimmed.starts_with("ldurs")
+                    {
+                        // Load through a tracked base register.
+                        if let Some(bracket) = trimmed.find("[x") {
+                            let inner = &trimmed[bracket..];
+                            if let Some((b, k)) = parse_base_addr(inner) {
+                                if loop_variant.contains(&b) {
+                                    // Loop-variant base: may read any frame slot.
+                                    loaded_ranges.push(WHOLE_FRAME);
+                                } else if let Some(&o) = base_off.get(&b) {
+                                    loaded_ranges.push((o + k, sz));
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
     }
 
-    // Phase 2: Remove stores whose byte range does not overlap any load range
+    // Phase 2: remove stores whose byte range does not overlap any load range.
+    // Covers GP sp stores and FP sp/base-form stores alike.
     let mut changed = false;
-    for i in 0..n {
-        if let LineKind::StoreSp { offset, is_word, .. } = kinds[i] {
-            let store_size = if is_word { 4 } else { 8 };
+    let mut base_off: FxHashMap<u8, i32> = FxHashMap::default();
+    for i in start..end {
+        track_sp_bases(&lines[i], kinds[i], &mut base_off);
+        let range: Option<(i32, i32)> = match kinds[i] {
+            LineKind::StoreSp { offset, is_word, .. } => {
+                Some((offset, if is_word { 4 } else { 8 }))
+            }
+            _ => {
+                match parse_fp_mem(&lines[i]) {
+                    Some((true, _reg, addr, width)) => {
+                        let off = match addr {
+                            FpAddr::Sp(off) => Some(off),
+                            FpAddr::Base(b, k) => {
+                                if loop_variant.contains(&b) {
+                                    // Loop-variant base: the store hits a
+                                    // different slot each iteration — the
+                                    // single recorded range proves nothing.
+                                    None
+                                } else {
+                                    base_off.get(&b).map(|&o| o + k)
+                                }
+                            }
+                        };
+                        off.map(|o| (o, fp_access_width(width)))
+                    }
+                    _ => None,
+                }
+            }
+        };
+        if let Some((offset, store_size)) = range {
             let overlaps_any_load = loaded_ranges.iter().any(|&(load_off, load_sz)| {
                 // Two ranges [a, a+as) and [b, b+bs) overlap iff a < b+bs && b < a+as
                 offset < load_off + load_sz && load_off < offset + store_size
@@ -935,6 +3893,207 @@ fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: us
     }
     changed
 }
+
+/// Parse `[xN]`, `[xN, #k]` (no writeback) into (base register, offset).
+fn parse_base_addr(inner_bracketed: &str) -> Option<(u8, i32)> {
+    let inner = inner_bracketed.strip_prefix('[')?;
+    let inner = inner.split_once(']').map(|(h, _)| h).unwrap_or(inner);
+    let (base, off) = match inner.split_once(", ") {
+        Some((b, o)) => (b.trim(), o.trim().strip_prefix('#')?.parse::<i32>().ok()?),
+        None => (inner.trim(), 0),
+    };
+    let b = parse_reg(base);
+    (b < 29).then_some((b, off))
+}
+
+/// Cumulative sp adjustment contributed by one line, in bytes. Returns
+/// Some(delta) for recognized forms — pre-index `[sp, #k]!` and post-index
+/// `[sp], #k` memory ops move sp by k, `add/sub sp, sp, #k` adjusts it
+/// directly — and Some(0) for everything that leaves sp alone. Returns None
+/// for an unrecognized write of sp (the caller must bail: its offset model
+/// is invalidated).
+fn sp_stack_motion(line: &str) -> Option<i32> {
+    let t = line.trim();
+    if let Some(p) = t.find("[sp") {
+        let rest = &t[p..];
+        // post-index: [sp], #k  (access uses the pre-adjustment sp)
+        if let Some(imm) = rest.strip_prefix("[sp], #") {
+            return imm.trim().parse::<i32>().ok().map(Some).unwrap_or(None);
+        }
+        // [sp, #k]! pre-index, or plain [sp, #k]
+        if let Some(inner) = rest.strip_prefix("[sp, #") {
+            let end = inner.find(']')?;
+            let off: i32 = inner[..end].parse().ok()?;
+            if inner[end..].starts_with("]!") {
+                return Some(off);
+            }
+            return Some(0);
+        }
+        return Some(0); // bare [sp]
+    }
+    for (op, neg) in [("add ", false), ("sub ", true)] {
+        if let Some(rest) = t.strip_prefix(op) {
+            if let Some((dst, srcs)) = rest.split_once(", ") {
+                if dst.trim() == "sp" {
+                    if let Some((src, imm)) = srcs.split_once(", ") {
+                        if src.trim() == "sp" {
+                            let v = imm.trim().strip_prefix('#')?.parse::<i32>().ok()?;
+                            return Some(if neg { -v } else { v });
+                        }
+                    }
+                    return None; // add/sub sp, <other>: unrecognized
+                }
+            }
+        }
+    }
+    if t.starts_with("mov sp,") {
+        return None;
+    }
+    Some(0)
+}
+
+/// gdse models every sp-relative access by its raw textual offset. That is
+/// only comparable when sp does not move between the accesses — the
+/// call-scratch idiom (`str x0, [sp, #-16]!; ...; ldr xN, [sp, #32]`) reads
+/// the slot stored at `[sp, #16]` before the push, and raw offsets 32 vs 16
+/// look disjoint, so the live store gets deleted (sqlite computeCellSize
+/// corrupted its apCell[N] argument exactly like this). Linear tracking of
+/// sp motion is unsound with multiple epilogues, so instead we bail on any
+/// function whose sp moves mid-body: motion is allowed only in the leading
+/// prologue block (before the first control-flow line) or in a contiguous
+/// motion run immediately followed by `ret` (an epilogue).
+fn sp_motion_only_at_edges(lines: &[String], kinds: &[LineKind], start: usize, end: usize) -> bool {
+    let mut motion = vec![false; end];
+    for (i, m) in motion.iter_mut().enumerate().take(end).skip(start) {
+        match sp_stack_motion(&lines[i]) {
+            Some(0) => {}
+            Some(_) => *m = true,
+            None => return false, // unrecognized sp write
+        }
+    }
+    // Leading prologue run: from the range start, skip the function label,
+    // then consume only motion lines (plus interspersed directives/nops and
+    // the `mov xN, sp` frame setup). The first line of real work ends it —
+    // a motion after that point is mid-body unless an epilogue run (below)
+    // covers it.
+    let mut i = start;
+    while i < end && matches!(kinds[i], LineKind::Label | LineKind::Directive | LineKind::Nop) {
+        i += 1;
+    }
+    while i < end {
+        let t = lines[i].trim();
+        let fp_setup = t.starts_with("mov ") && t.ends_with(", sp");
+        if !motion[i] && !fp_setup && !matches!(kinds[i], LineKind::Directive | LineKind::Nop) {
+            break;
+        }
+        i += 1;
+    }
+    // Any motion at or after i must be a contiguous run followed by `ret`.
+    while i < end {
+        if !motion[i] {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < end && (motion[j] || matches!(kinds[j], LineKind::Nop | LineKind::Directive)) {
+            j += 1;
+        }
+        if j < end && kinds[j] == LineKind::Ret {
+            i = j + 1;
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+/// Maintain the sp-derived base-register map for one line of text:
+/// `add/sub xN, sp, #k` creates, `mov` copies or ends a lineage, `add/sub`
+/// on a base adjusts or derives, calls end caller-saved lineages, and any
+/// other write of a tracked register ends its lineage.
+fn track_sp_bases(line: &str, kind: LineKind, base_off: &mut FxHashMap<u8, i32>) {
+    // Peephole deletions retain their original text and mark only the parsed
+    // kind as Nop.  Interpreting that stale text would let a deleted clobber
+    // erase a newer lineage (for example, a retargeted `add x23, sp, #16`
+    // followed by the now-deleted `mov x23, x0`).
+    if kind == LineKind::Nop {
+        return;
+    }
+    let t = line.trim();
+    if let Some(rest) = t.strip_prefix("add ").or_else(|| t.strip_prefix("sub ")) {
+        let neg = t.starts_with("sub ");
+        if let Some((dst_s, srcs)) = rest.split_once(", ") {
+            if let Some((src_s, imm_s)) = srcs.split_once(", ") {
+                let dst = parse_reg(dst_s.trim());
+                let src = parse_reg(src_s.trim());
+                let imm = imm_s.trim().strip_prefix('#').and_then(|v| v.parse::<i32>().ok());
+                if let Some(imm) = imm {
+                    let signed = if neg { -imm } else { imm };
+                    if src_s.trim() == "sp" && dst < 29 {
+                        base_off.insert(dst, signed);
+                        return;
+                    }
+                    if let Some(&off) = base_off.get(&src) {
+                        // Derivation/adjustment of a tracked base: the source
+                        // is only READ (its lineage continues) and the
+                        // destination joins the lineage. Must return here:
+                        // falling through to the write-scan would mis-flag the
+                        // source operand as clobbered and delete the freshly
+                        // inserted destination (two-step sp derivations like
+                        // `add x23, x0, #8` never survived, so loads through
+                        // them went unrecorded and live stores were deleted —
+                        // void_pointer_arith).
+                        if dst < 29 {
+                            base_off.insert(dst, off + signed);
+                        }
+                        return;
+                    }
+                    // Non-base source: the write ends any lineage of dst.
+                    base_off.remove(&dst);
+                    return;
+                }
+            }
+        }
+    } else if let Some(rest) = t.strip_prefix("mov ") {
+        if let Some((dst_s, src_s)) = rest.split_once(", ") {
+            let (dst_s, src_s) = (dst_s.trim(), src_s.trim());
+            let dst = parse_reg(dst_s);
+            if src_s == "sp" {
+                if dst < 29 {
+                    base_off.insert(dst, 0);
+                }
+                return;
+            }
+            let src = parse_reg(src_s);
+            if let Some(&off) = base_off.get(&src) {
+                // mov xM, xN: xM joins the lineage; xN is only read.
+                if dst < 29 {
+                    base_off.insert(dst, off);
+                }
+            } else if dst < 29 {
+                // mov xN, <non-base>: clobbered, lineage ends.
+                base_off.remove(&dst);
+            }
+            // Same early-return requirement as the add/sub branch above.
+            return;
+        }
+    }
+    // Calls clobber caller-saved registers: end those lineages.
+    if kind == LineKind::Call {
+        base_off.retain(|&r, _| r >= 19);
+        return;
+    }
+    let mut dead = Vec::new();
+    for &b in base_off.keys() {
+        if gp_reg_written_broad(line, b) || written_gp_register(line, kind) == Some(b) {
+            dead.push(b);
+        }
+    }
+    for b in dead {
+        base_off.remove(&b);
+    }
+}
+
 
 /// Extract the numeric offset from an instruction containing `[sp, #N]` or `[sp]`.
 fn extract_sp_offset(line: &str) -> Option<i32> {
@@ -953,6 +4112,660 @@ fn extract_sp_offset(line: &str) -> Option<i32> {
     }
     None
 }
+
+/// Loop rotation: convert header-tested loops into bottom-tested loops.
+///
+/// ```text
+/// .Lhdr:                      .Lhdr:                 (guard, runs once)
+///     cmp a, b                    cmp a, b
+///     b.cc .Lbody                 b.cc .Lbody
+/// .Lskip:                       .Lskip:
+///     b .Lexit                    b .Lexit
+/// .Lbody:            →          .Lbody:
+///     <body>                      <body>
+///     b .Lhdr                     cmp a, b           (duplicated test)
+///                                 b.cc .Lbody        (one branch per iteration)
+///                                 b .Lskip           (taken once, on exit)
+/// ```
+///
+/// Saves one unconditional branch per iteration. Sound because every register
+/// the header test reads is live throughout the loop (it is read again next
+/// iteration), so it is never clobbered by unrelated assignments, and loop
+/// phis have already been updated to the next iteration's value at the latch
+/// (backedge phi copies are emitted at the end of the latch, before the
+/// backedge branch this pass replaces).
+fn rotate_simple_loops(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for i in 0..n {
+        if kinds[i] != LineKind::Branch {
+            continue;
+        }
+        let Some(header_target) = branch_target(lines[i].trim_start()) else {
+            continue;
+        };
+        // Find the header label earlier in the text (a backward branch).
+        let header_label = format!("{}:", header_target);
+        let mut header_pos = None;
+        for l in 0..i {
+            if kinds[l] == LineKind::Label && lines[l].trim() == header_label {
+                header_pos = Some(l);
+                break;
+            }
+        }
+        let Some(h) = header_pos else { continue; };
+
+        // Single backedge only: this must be the one and only `b .Lhdr`.
+        let backedge_count = (0..n)
+            .filter(|&j| kinds[j] == LineKind::Branch
+                && branch_target(lines[j].trim_start()) == Some(header_target))
+            .count();
+        if backedge_count != 1 {
+            continue;
+        }
+
+        // No calls, returns, or indirect branches inside the loop.
+        let mut bad = false;
+        for j in h..=i {
+            match kinds[j] {
+                LineKind::Ret | LineKind::Call | LineKind::CmpBranch => {
+                    bad = true;
+                    break;
+                }
+                _ => {
+                    let t = lines[j].trim_start();
+                    if t.starts_with("br ") || t.starts_with("blr ") {
+                        bad = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if bad {
+            continue;
+        }
+
+        // Collect the header setup: pure, flag-preserving instructions after
+        // the label, ending in a Compare, followed by a conditional branch.
+        let mut setup: Vec<usize> = Vec::new();
+        let mut pos = h + 1;
+        let mut cj = None;
+        while pos < i {
+            if kinds[pos] == LineKind::Nop {
+                pos += 1;
+                continue;
+            }
+            match kinds[pos] {
+                LineKind::CondBranch => {
+                    cj = Some(pos);
+                    break;
+                }
+                LineKind::Compare
+                | LineKind::Move { .. }
+                | LineKind::MoveImm { .. }
+                | LineKind::MoveWide { .. }
+                | LineKind::Sxtw { .. }
+                | LineKind::LoadSp { .. }
+                | LineKind::LoadswSp { .. }
+                | LineKind::LoadPairSp { .. } => {
+                    setup.push(pos);
+                    if setup.len() > 3 {
+                        break;
+                    }
+                    pos += 1;
+                }
+                _ => break,
+            }
+        }
+        let Some(cj_pos) = cj else { continue };
+        if setup.is_empty() || setup.len() > 3 {
+            continue;
+        }
+        // The compare must be the last setup instruction: it sets the flags
+        // the conditional branch consumes (moves/loads don't touch flags).
+        if kinds[*setup.last().unwrap()] != LineKind::Compare {
+            continue;
+        }
+
+        // The conditional branch gives the loop-back condition and body target.
+        let Some((cc, body_target)) = cond_branch_parts(lines[cj_pos].trim_start()) else {
+            continue;
+        };
+        let cc = cc.to_string();
+        let body_target = body_target.to_string();
+        // The body target must be a label inside the loop, after the cond branch.
+        let body_label = format!("{}:", body_target);
+        let body_found = ((cj_pos + 1)..=i).any(|l| {
+            kinds[l] == LineKind::Label && lines[l].trim() == body_label
+        });
+        if !body_found {
+            continue;
+        }
+
+        // The exit target is the first label after the cond branch: the
+        // not-taken path of the header guard (typically the .Lskip trampoline
+        // or the exit block itself).
+        let mut exit_target = None;
+        for l in (cj_pos + 1)..n {
+            if kinds[l] == LineKind::Nop {
+                continue;
+            }
+            if kinds[l] == LineKind::Label {
+                exit_target = label_name(lines[l].trim()).map(|name| (l, name.to_string()));
+            }
+            break;
+        }
+        let Some((skip_pos, exit_lbl)) = exit_target else { continue };
+        if exit_lbl == body_target || exit_lbl == header_target {
+            continue;
+        }
+
+        // Canonical codegen loops use a one-branch skip trampoline between
+        // the guard and the body:
+        //
+        //   b.cc body; skip: b exit; body: ...; b header; exit:
+        //
+        // Invert the guard to branch directly to `exit`, delete the
+        // trampoline, and let the rotated latch fall through to `exit`. This
+        // removes both unconditional exit branches. Require the skip label to
+        // have no explicit incoming edges and every relevant label to be in
+        // the canonical adjacent position.
+        let next_live = |mut pos: usize| -> Option<usize> {
+            while pos < n && kinds[pos] == LineKind::Nop {
+                pos += 1;
+            }
+            (pos < n).then_some(pos)
+        };
+        let trampoline = next_live(skip_pos + 1);
+        let body_pos = trampoline.and_then(|p| next_live(p + 1));
+        let after_backedge = next_live(i + 1);
+        let explicit_skip_refs = (0..n)
+            .filter(|&p| {
+                let target = match kinds[p] {
+                    LineKind::Branch => branch_target(&lines[p]),
+                    LineKind::CondBranch => cond_branch_parts(&lines[p]).map(|(_, t)| t),
+                    LineKind::CmpBranch => lines[p]
+                        .trim()
+                        .rsplit(',')
+                        .next()
+                        .map(str::trim)
+                        .filter(|t| t.starts_with('.')),
+                    _ => None,
+                };
+                target == Some(exit_lbl.as_str())
+            })
+            .count();
+        let compact_exit = trampoline
+            .filter(|&p| kinds[p] == LineKind::Branch)
+            .and_then(|p| branch_target(&lines[p]).map(|target| (p, target.to_string())))
+            .and_then(|(p, real_exit)| {
+                let bp = body_pos?;
+                let ap = after_backedge?;
+                let body_ok = kinds[bp] == LineKind::Label
+                    && label_name(&lines[bp]) == Some(body_target.as_str());
+                let fallthrough_ok = kinds[ap] == LineKind::Label
+                    && label_name(&lines[ap]) == Some(real_exit.as_str());
+                (body_ok && fallthrough_ok && explicit_skip_refs == 0)
+                    .then_some((p, real_exit))
+            });
+        if let Some((trampoline_pos, real_exit)) = compact_exit {
+            let Some(inv_cc) = invert_condition(&cc) else {
+                continue;
+            };
+            if estimate_branch_distance(lines, kinds, cj_pos, &real_exit)
+                .is_some_and(|d| d >= COND_BRANCH_SAFE_DISTANCE)
+            {
+                continue;
+            }
+            lines[cj_pos] = format!("    b.{} {}", inv_cc, real_exit);
+            kinds[cj_pos] = LineKind::CondBranch;
+            kinds[trampoline_pos] = LineKind::Nop;
+
+            let mut repl = String::new();
+            for &s in &setup {
+                repl.push_str(&lines[s]);
+                repl.push('\n');
+            }
+            repl.push_str(&format!("    b.{} {}", cc, body_target));
+            lines[i] = repl;
+            kinds[i] = LineKind::Other;
+            changed = true;
+            continue;
+        }
+
+        // Build the rotated latch: setup copy + cond branch to body + exit.
+        let mut repl = String::new();
+        for &s in &setup {
+            repl.push_str(&lines[s]);
+            repl.push('\n');
+        }
+        repl.push_str(&format!("    b.{} {}", cc, body_target));
+        repl.push('\n');
+        repl.push_str(&format!("    b {}", exit_lbl));
+        lines[i] = repl;
+        // The slot now holds a multi-line sequence; keep branch passes from
+        // re-examining it (its embedded branches are final).
+        kinds[i] = LineKind::Other;
+        changed = true;
+    }
+    changed
+}
+
+// ── Loop-carried store sinking ───────────────────────────────────────────────
+//
+// The slot-home discipline gives every SSA value a mandatory stack slot, so a
+// loop-carried value is stored to its slot once per iteration even when
+// nothing in the loop ever loads the slot back (the value stays live in a
+// register; the slot is only read after the loop).  Sink such a store to the
+// loop's fall-through exit:
+//
+//     .Lbody:                       .Lbody:
+//       ...                           ...
+//       str x0, [sp, #24]   -->       ...            (store removed)
+//       ...                           ...
+//       b.le .Lbody                   b.le .Lbody
+//       b .Lexit                      str x0, [sp, #24]  (stored once)
+//                                     b .Lexit
+//
+// Soundness conditions (all checked below): the slot is not otherwise
+// referenced inside the loop, this is the only store to it, every path from
+// the loop head to the fall-through exit executes the store (no labels or
+// exiting branches between the head and the store, no labels between the
+// store and the backedge), the only exit is the fall-through past the
+// backedge, and the stored register is not rewritten between the store and
+// the backedge.  Then the register holds the last-stored value at the exit,
+// so storing it there once produces the same slot contents as the original.
+
+/// Register number of a scalar register operand (`w0`/`x19`/`d24`/`s3` →
+/// 0/19/24/3).  The class is ignored: a match on the number alone is a
+/// conservative clobber indication.
+fn reg_operand_num(op: &str) -> Option<u8> {
+    let op = op.trim();
+    let rest = op.strip_prefix(|c| matches!(c, 'w' | 'x' | 'd' | 's' | 'q' | 'b' | 'h'))?;
+    rest.parse::<u8>().ok().filter(|&n| n <= 30)
+}
+
+/// Does this instruction write a register with the given number?
+/// Conservative: the first operand (and the second for `ldp`) counts as a
+/// destination for everything that is not a store, compare, or branch.
+fn instr_clobbers_reg(trimmed: &str, num: u8) -> bool {
+    let mut it = trimmed.splitn(2, char::is_whitespace);
+    let mnem = it.next().unwrap_or("");
+    let ops = it.next().unwrap_or("");
+    if ops.is_empty() {
+        return false; // labels, directives, ret, bare branches
+    }
+    // Stores and comparisons have no register destination.
+    if mnem.starts_with("st")
+        || mnem.starts_with("cmp")
+        || mnem.starts_with("cmn")
+        || mnem.starts_with("tst")
+        || mnem.starts_with("fcmp")
+    {
+        return false;
+    }
+    // Branches.
+    if mnem == "b"
+        || mnem.starts_with("b.")
+        || mnem == "bl"
+        || mnem == "blr"
+        || mnem == "br"
+        || mnem == "cbz"
+        || mnem == "cbnz"
+        || mnem == "tbz"
+        || mnem == "tbnz"
+    {
+        return false;
+    }
+    let mut operands = ops.split(", ");
+    if let Some(first) = operands.next() {
+        if reg_operand_num(first) == Some(num) {
+            return true;
+        }
+    }
+    if mnem == "ldp" {
+        if let Some(second) = operands.next() {
+            if reg_operand_num(second) == Some(num) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Parse `str <reg>, [sp, #off]` for scalar regs (w/x/s/d) → (reg_num, offset).
+fn parse_sp_store_any(trimmed: &str) -> Option<(u8, i32)> {
+    let rest = trimmed.strip_prefix("str ")?;
+    let (reg_str, addr) = rest.split_once(", ")?;
+    let num = reg_operand_num(reg_str)?;
+    let off = parse_sp_offset(addr.trim())?;
+    Some((num, off))
+}
+
+/// Byte size of a scalar `str` register operand (w/s=4, x/d=8).
+fn store_reg_size(trimmed: &str) -> Option<u32> {
+    let rest = trimmed.strip_prefix("str ")?;
+    let (reg_str, _) = rest.split_once(", ")?;
+    let r = reg_str.trim();
+    if r.starts_with('w') || r.starts_with('s') {
+        Some(4)
+    } else if r.starts_with('x') || r.starts_with('d') {
+        Some(8)
+    } else {
+        None
+    }
+}
+
+// ── Overwritten store elimination ────────────────────────────────────────────
+//
+// Local dead-store peephole: `str R, [sp, #off]` followed by another store to
+// the same slot with no intervening read (and no label, branch, call, or
+// unknown memory op between). The first store is dead. This is the store
+// analog of eliminate_overwritten_moves and catches cases the global DSE
+// misses when it bails on a whole function due to one escaped frame pointer.
+fn eliminate_overwritten_stores(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_STORE_DSE").is_ok() {
+        return false;
+    }
+    let mut changed = false;
+    for i in 0..n {
+        let LineKind::StoreSp { offset: off_i, is_word: word_i, .. } = kinds[i] else {
+            continue;
+        };
+        let size_i = if word_i { 4u32 } else { 8 };
+        let mut j = i + 1;
+        let mut steps = 0;
+        while j < n && steps < 40 {
+            steps += 1;
+            if lines[j].contains('\n') {
+                break; // multi-line slot may hide memory ops
+            }
+            match kinds[j] {
+                LineKind::Nop => {
+                    j += 1;
+                    continue;
+                }
+                LineKind::StoreSp { offset: off_j, is_word: word_j, .. } => {
+                    let size_j = if word_j { 4u32 } else { 8 };
+                    if off_j == off_i && size_j >= size_i {
+                        // Fully overwritten with no intervening read.
+                        kinds[i] = LineKind::Nop;
+                        changed = true;
+                    }
+                    if off_j < off_i + size_i as i32 && off_i < off_j + size_j as i32 {
+                        break; // overlapping store: stop either way
+                    }
+                    j += 1;
+                    continue;
+                }
+                LineKind::LoadSp { offset: off_j, is_word: word_j, .. } => {
+                    let size_j = if word_j { 4u32 } else { 8 };
+                    if off_j < off_i + size_i as i32 && off_i < off_j + size_j as i32 {
+                        break; // reads our slot (or overlaps it)
+                    }
+                    j += 1;
+                    continue;
+                }
+                LineKind::LoadswSp { offset: off_j, .. } => {
+                    if off_j < off_i + size_i as i32 && off_i < off_j + 4 {
+                        break;
+                    }
+                    j += 1;
+                    continue;
+                }
+                // Straight-line, non-memory instructions are transparent.
+                LineKind::Move { .. }
+                | LineKind::MoveImm { .. }
+                | LineKind::MoveWide { .. }
+                | LineKind::Sxtw { .. }
+                | LineKind::Compare
+                | LineKind::Alu => {
+                    j += 1;
+                    continue;
+                }
+                // Labels, branches, calls, pair/unknown memory ops, anything
+                // else: stop. `Other` covers unknown instructions that might
+                // touch memory, so it stops the scan too.
+                _ => break,
+            }
+        }
+    }
+    changed
+}
+
+/// Branch target label of a (sub-)line, for plain/conditional/compare branches.
+fn any_branch_target(trimmed: &str) -> Option<&str> {
+    if let Some(rest) = trimmed.strip_prefix("b ") {
+        let t = rest.trim();
+        if t.starts_with('.') {
+            return Some(t);
+        }
+        return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix("b.") {
+        if let Some((_, t)) = rest.split_once(' ') {
+            let t = t.trim();
+            if t.starts_with('.') {
+                return Some(t);
+            }
+        }
+        return None;
+    }
+    for p in ["cbz ", "cbnz ", "tbz ", "tbnz "] {
+        if trimmed.starts_with(p) {
+            if let Some((_, t)) = trimmed.rsplit_once(", ") {
+                let t = t.trim();
+                if t.starts_with('.') {
+                    return Some(t);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn sink_loop_carried_stores(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_STORE_SINK").is_ok() {
+        return false;
+    }
+    // Flatten to virtual sub-lines: rotation leaves multi-line slots whose
+    // embedded latch branches this pass must still see.
+    let mut v: Vec<(usize, usize, String)> = Vec::new(); // (slot, sub_idx, text)
+    for i in 0..n {
+        if kinds[i] == LineKind::Nop {
+            continue;
+        }
+        for (si, sub) in lines[i].split('\n').enumerate() {
+            let t = sub.trim();
+            if !t.is_empty() {
+                v.push((i, si, t.to_string()));
+            }
+        }
+    }
+    let nv = v.len();
+    // Label name -> virtual index.
+    let mut labels: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (vi, (_, _, t)) in v.iter().enumerate() {
+        if let Some(name) = t.strip_suffix(':') {
+            labels.insert(name, vi);
+        }
+    }
+    // Find loop regions: a conditional backward branch ends a bottom-tested
+    // loop whose exit is the fall-through past the branch.
+    let mut regions: Vec<(usize, usize)> = Vec::new(); // (head vi, backedge vi)
+    for vj in 0..nv {
+        let t = &v[vj].2;
+        let conditional = t.starts_with("b.")
+            || t.starts_with("cbz ")
+            || t.starts_with("cbnz ")
+            || t.starts_with("tbz ")
+            || t.starts_with("tbnz ");
+        if !conditional {
+            continue;
+        }
+        let Some(target) = any_branch_target(t) else { continue };
+        let Some(&vi) = labels.get(target) else { continue };
+        if vi < vj {
+            regions.push((vi, vj));
+        }
+    }
+    // Largest regions first: sink each store as far out as possible.
+    regions.sort_by_key(|&(h, j)| std::cmp::Reverse(j - h));
+
+    let mut sunk_slot: Vec<bool> = vec![false; n];
+    // (store slot, store text, backedge slot, backedge sub_idx)
+    let mut edits: Vec<(usize, String, usize, usize)> = Vec::new();
+
+    for &(h, j) in &regions {
+        // Region-level hazards: calls, returns, or branches to unknown labels.
+        let mut region_bad = false;
+        for p in h..=j {
+            let t = &v[p].2;
+            if t.starts_with("bl ") || t.starts_with("blr ") || t == "ret" {
+                region_bad = true;
+                break;
+            }
+            if let Some(tgt) = any_branch_target(t) {
+                if !labels.contains_key(tgt) {
+                    region_bad = true;
+                    break;
+                }
+            }
+        }
+        if region_bad {
+            continue;
+        }
+        // The backedge slot must contain no other backward branch: splicing
+        // would shift the second branch's sub-index.
+        let bslot = v[j].0;
+        let mut other_backedge = false;
+        for p in h..j {
+            if v[p].0 != bslot {
+                continue;
+            }
+            if let Some(tgt) = any_branch_target(&v[p].2) {
+                if let Some(&tp) = labels.get(tgt) {
+                    if tp < p {
+                        other_backedge = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if other_backedge {
+            continue;
+        }
+        // Exit branches: any branch in the region targeting outside it.
+        // (The backedge at j targets the head, which is inside.)
+        let mut exits: Vec<usize> = Vec::new();
+        for p in h..j {
+            if let Some(tgt) = any_branch_target(&v[p].2) {
+                let tp = labels[tgt];
+                if tp < h || tp > j {
+                    exits.push(p);
+                }
+            }
+        }
+        // Candidate stores.
+        for k in (h + 1)..j {
+            let (slot, _, ref text) = v[k];
+            if sunk_slot[slot] || lines[slot].contains('\n') {
+                continue; // already sunk, or not a standalone line
+            }
+            if !matches!(kinds[slot], LineKind::StoreSp { .. } | LineKind::MemOther) {
+                continue;
+            }
+            let Some((num, off)) = parse_sp_store_any(text) else { continue };
+            let debug = std::env::var("CCC_SINK_DEBUG").is_ok();
+            let slot_ref = format!("[sp, #{}]", off);
+            let mut bad = false;
+            // (a) Nothing else in the region references this slot.
+            for p in h..=j {
+                if p == k {
+                    continue;
+                }
+                let t = &v[p].2;
+                if t.contains(&slot_ref) {
+                    bad = true;
+                    break;
+                }
+                // Pair ops cover a range: stp/ldp at base M spans M..M+16.
+                if t.starts_with("stp ") || t.starts_with("ldp ") {
+                    if let Some(base) = extract_sp_offset(t) {
+                        if base <= off && off < base + 16 {
+                            bad = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if bad && debug {
+                eprintln!("sink bail: {} (slot re-referenced in region)", text);
+            }
+            // (b) No exiting branch anywhere (v1: fall-through exit only).
+            if !bad && !exits.is_empty() {
+                bad = true;
+                if debug {
+                    eprintln!("sink bail: {} ({} exit branches)", text, exits.len());
+                }
+            }
+            // (c) No labels between the store and the backedge (no way to
+            // reach the exit without passing the store), and none before the
+            // store either except the head (every path to the exit passes k).
+            if !bad {
+                for p in (h + 1)..j {
+                    if p == k {
+                        continue;
+                    }
+                    if v[p].2.ends_with(':') {
+                        bad = true;
+                        if debug {
+                            eprintln!("sink bail: {} (label {} in region)", text, v[p].2);
+                        }
+                        break;
+                    }
+                }
+            }
+            // (d) The stored register survives to the backedge.
+            if !bad {
+                for p in (k + 1)..=j {
+                    if instr_clobbers_reg(&v[p].2, num) {
+                        bad = true;
+                        if debug {
+                            eprintln!("sink bail: {} (clobbered by {})", text, v[p].2);
+                        }
+                        break;
+                    }
+                }
+            }
+            if bad {
+                continue;
+            }
+            sunk_slot[slot] = true;
+            edits.push((slot, format!("    {}", text), v[j].0, v[j].1));
+            if debug {
+                eprintln!("sink ok: {}", text);
+            }
+        }
+    }
+
+    if edits.is_empty() {
+        return false;
+    }
+    for (slot, _, _, _) in &edits {
+        kinds[*slot] = LineKind::Nop;
+    }
+    // Splice each sunk store into the backedge slot, right after the branch.
+    // Insertions land after the backedge sub-line, so it keeps its original
+    // sub-index no matter how many stores are spliced in.
+    for (_, text, bj, bsub) in &edits {
+        let mut subs: Vec<&str> = lines[*bj].split('\n').collect();
+        subs.insert(bsub + 1, text.as_str());
+        lines[*bj] = subs.join("\n");
+        kinds[*bj] = LineKind::Other;
+    }
+    true
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -1207,17 +5020,1211 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_dead_call_staging_move_removed_after_copy_prop() {
+        let input = "    mov x9, x24\n    mov x0, x24\n    bl strlen\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.contains("mov x9, x24"));
+        assert!(result.contains("mov x0, x24"));
+    }
+
+    #[test]
+    fn test_used_call_staging_move_preserved() {
+        let input = "    mov x9, x24\n    add x24, x24, #8\n    ldr x0, [x9]\n    bl consume\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("mov x9, x24"));
+    }
+
+    #[test]
+    fn test_vector_address_alias_propagation() {
+        let input = "    mov x4, x5\n    ldr q2, [x4]\n    fmla v2.2d, v1.2d, v15.2d\n    str q2, [x4]\n    add x5, x5, #16\n    b .Lloop\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.contains("mov x4, x5"));
+        assert!(result.contains("ldr q2, [x5]"));
+        assert!(result.contains("str q2, [x5]"));
+    }
+
+    #[test]
+    fn test_destructive_pointer_update_fold() {
+        let input = "    mov x0, x6\n    add x0, x6, #16\n    mov x8, x0\n    add w24, w24, #1\n    mov x6, x8\n    b .Lloop\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("add x6, x6, #16"));
+        assert!(!result.contains("mov x8, x0"));
+        assert!(!result.contains("mov x6, x8"));
+    }
+
     // ── Dead store elimination tests ─────────────────────────────────
 
     #[test]
     fn test_dse_with_address_taken() {
-        // When sp address is taken, no stores should be eliminated
+        // An sp-derived address that is only materialized but never used does
+        // NOT escape — the store is still dead and may be eliminated.
         let input = "\
     str w0, [sp, #16]\n\
     add x1, sp, #16\n\
     ret\n";
         let result = peephole_optimize(input.to_string());
-        // Store must be preserved because address of stack slot is taken
-        assert!(result.contains("str w0, [sp, #16]"));
+        assert!(!result.contains("str w0, [sp, #16]"),
+            "non-escaping address-of-sp allows elimination:\n{}", result);
     }
+
+    #[test]
+    fn test_dse_with_escaping_address() {
+        // The derived base is stored into memory here: the address escapes,
+        // so no store elimination may happen at all.
+        let input = "\
+    str w0, [sp, #16]\n\
+    add x1, sp, #16\n\
+    str x1, [x9]\n\
+    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("str w0, [sp, #16]"),
+            "escaping address must preserve stores:\n{}", result);
+    }
+
+    #[test]
+    fn test_dse_dead_fp_store_via_base() {
+        // FP field store through an sp-derived base whose slot is never
+        // loaded: dead, eliminated.
+        let input = "\
+f:
+    add x23, sp, #112
+    fmul d28, d27, d17
+    str d28, [x23]
+    fadd d0, d1, d1
+    ret
+g:
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.contains("str d28, [x23]"),
+            "dead FP store via base eliminated:\n{}", result);
+    }
+
+    #[test]
+    fn test_dse_live_fp_store_via_base_kept() {
+        // The slot-forward pass converts the load to an fmov first, which
+        // makes the store dead.  FP copy propagation then folds that fmov
+        // into the sole consumer, so the whole round-trip dissolves.
+        let input = "\
+f:
+    add x23, sp, #112
+    fmul d28, d27, d17
+    str d28, [x23]
+    ldr d0, [sp, #112]
+    fadd d0, d0, d0
+    ret
+g:
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("fadd d0, d28, d28"), "load forwarded and propagated:\n{}", result);
+        assert!(!result.contains("ldr d0"), "load removed:\n{}", result);
+        assert!(!result.contains("str d28"), "store then dead:\n{}", result);
+    }
+
+    // ── Address-alias soundness ────────────────────────────────────────
+
+    #[test]
+    fn test_address_alias_mov_survives_cross_block_use() {
+        // The mov's register is used as an address in a LATER block (after a
+        // call): deleting the initializer must not happen even though the
+        // in-window use is a pure address alias.
+        let input = "\
+f:
+    adrp x0, tbl
+    add x0, x0, :lo12:tbl
+    mov x23, x0
+    ldr x4, [x23, x28, lsl #3]
+    mov x19, x4
+    bl strcmp
+.LBB9:
+    ldr x19, [x23, x27, lsl #3]
+    str x22, [x23, x27, lsl #3]
+    ret
+g:
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("mov x23, x0"), "defining mov must survive:\n{}", result);
+        assert!(result.contains("[x23, x27, lsl #3]"),
+            "cross-block use must not be rewritten:\n{}", result);
+    }
+
+    #[test]
+    fn test_address_alias_folded_when_provably_dead() {
+        // The intended optimization: a short-lived address alias whose
+        // register is overwritten (without being read) after the uses.
+        let input = "\
+f:
+    mov x9, x26
+    ldr x4, [x9]
+    str x4, [x9, #8]
+    mov x9, x5
+    ret
+g:
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.contains("mov x9, x26"), "dead alias mov removed:\n{}", result);
+        assert!(result.contains("ldr x4, [x26]"), "use rewritten:\n{}", result);
+        assert!(result.contains("str x4, [x26, #8]"), "use rewritten:\n{}", result);
+    }
+
+    // ── FP spill slot forwarding ─────────────────────────────────────────
+
+    #[test]
+    fn test_fp_slot_forward_basic() {
+        let input = "\
+f:
+    fsub d0, d12, d21
+    str d0, [sp, #224]
+    fmul d3, d0, d0
+    ldr d1, [sp, #224]
+    fadd d4, d1, d3
+    ret
+g:
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("fmov d1, d0"), "reload forwarded:\n{}", result);
+        assert!(!result.contains("ldr d1, [sp, #224]"));
+    }
+
+    #[test]
+    fn test_fp_slot_forward_same_reg_deletes() {
+        let input = "\
+f:
+    str d7, [sp, #64]
+    ldr d7, [sp, #64]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.contains("ldr d7, [sp, #64]"), "redundant reload deleted:\n{}", result);
+    }
+
+    #[test]
+    fn test_fp_slot_forward_blocked_by_source_clobber() {
+        // d0 is overwritten between the store and the load: no forwarding.
+        let input = "\
+f:
+    str d0, [sp, #224]
+    fmul d0, d1, d2
+    ldr d1, [sp, #224]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("ldr d1, [sp, #224]"), "clobbered source must not forward:\n{}", result);
+    }
+
+    #[test]
+    fn test_fp_slot_forward_blocked_by_unknown_store() {
+        // A store through an untracked base may alias the slot: no forwarding.
+        let input = "\
+f:
+    str d0, [sp, #224]
+    str d5, [x9]
+    ldr d1, [sp, #224]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("ldr d1, [sp, #224]"), "unknown-base store must block:\n{}", result);
+    }
+
+    #[test]
+    fn test_fp_slot_forward_via_materialized_base() {
+        // Stores through an sp-derived base register are tracked.
+        let input = "\
+f:
+    add x23, sp, #112
+    fmul d28, d27, d17
+    str d28, [x23]
+    fadd d4, d1, d1
+    ldr d6, [sp, #112]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("fmov d6, d28"), "base-tracked forward:\n{}", result);
+    }
+
+    #[test]
+    fn test_fp_slot_forward_gp_store_overlap_blocks() {
+        // A GP word store into the upper half of the double slot must
+        // invalidate the double's forward entry.
+        let input = "\
+f:
+    str d0, [sp, #224]
+    str w1, [sp, #228]
+    ldr d1, [sp, #224]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("ldr d1, [sp, #224]"), "overlapping GP store must block:\n{}", result);
+    }
+
+    #[test]
+    fn test_fp_slot_forward_blocked_by_intervening_reload_of_source() {
+        // The reload of d0 from a different slot clobbers the tracked source
+        // of slot #232's entry: forwarding the second load as `fmov d1, d0`
+        // would read the wrong value.
+        let input = "\
+f:
+    str d0, [sp, #232]
+    ldr d0, [sp, #224]
+    ldr d1, [sp, #232]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.contains("fmov d1, d0"),
+            "reload of source must block forward:\n{}", result);
+    }
+
+    // ── Accumulator producer retargeting ────────────────────────────────
+
+    #[test]
+    fn test_accumulator_add_retargeted_to_home() {
+        let input = "\
+f:
+    add x0, x1, x2
+    mov x20, x0
+    mov x0, #7
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("add x20, x1, x2"), "producer retargeted:\n{}", result);
+        assert!(!result.contains("mov x20, x0"), "copy removed:\n{}", result);
+    }
+
+    #[test]
+    fn test_accumulator_load_with_same_base_retargeted() {
+        let input = "\
+f:
+    ldr x0, [x0]
+    mov x21, x0
+    mov x0, #9
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("ldr x21, [x0]"), "load retargeted:\n{}", result);
+        assert!(!result.contains("mov x21, x0"), "copy removed:\n{}", result);
+    }
+
+    #[test]
+    fn test_accumulator_constant_sequence_retargeted_together() {
+        let input = "\
+f:
+    movz x0, #38528
+    movk x0, #152, lsl #16
+    mov x13, x0
+    mov x0, #1
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("movz x13, #38528"), "initializer retargeted:\n{}", result);
+        assert!(result.contains("movk x13, #152, lsl #16"), "update retargeted:\n{}", result);
+        assert!(!result.contains("mov x13, x0"), "copy removed:\n{}", result);
+    }
+
+    #[test]
+    fn test_accumulator_retarget_kept_when_x0_read_later() {
+        let input = "\
+f:
+    add x0, x1, x2
+    mov x20, x0
+    str x0, [x3]
+    mov x0, #7
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("add x0, x1, x2"));
+        assert!(result.contains("mov x20, x0"), "later accumulator read must keep copy:\n{}", result);
+    }
+
+    #[test]
+    fn test_accumulator_retarget_kept_across_control_flow() {
+        let input = "\
+f:
+    add x0, x1, x2
+    mov x20, x0
+    b .Ldone
+.Ldone:
+    mov x0, #7
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("mov x20, x0"), "branch must block retargeting:\n{}", result);
+    }
+
+    #[test]
+    fn test_accumulator_retarget_kept_before_movk_read_modify_write() {
+        let input = "\
+f:
+    add x0, x1, x2
+    mov x20, x0
+    str x20, [x3]
+    movk x0, #1
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("add x0, x1, x2"));
+        assert!(result.contains("mov x20, x0"), "movk reads old x0 bits:\n{}", result);
+    }
+
+    #[test]
+    fn test_accumulator_retarget_kept_across_inst_directive() {
+        let input = "\
+f:
+    add x0, x1, x2
+    mov x20, x0
+    .inst 0xd503201f
+    mov x0, #7
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("mov x20, x0"), "opaque instruction must be a boundary:\n{}", result);
+    }
+
+    #[test]
+    fn test_fp_accumulator_load_retargeted_to_home() {
+        let input = "\
+f:
+    ldr d0, [x0]
+    fmov d18, d0
+    fmov d0, xzr
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("ldr d18, [x0]"), "FP load retargeted:\n{}", result);
+        assert!(!result.contains("fmov d18, d0"), "copy removed:\n{}", result);
+    }
+
+    #[test]
+    fn test_fp_accumulator_retarget_kept_when_d0_read_later() {
+        let input = "\
+f:
+    fneg d0, d1
+    fmov d18, d0
+    fadd d2, d0, d3
+    fmov d0, xzr
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("fmov d18, d0"), "later FP read must keep copy:\n{}", result);
+    }
+
+    #[test]
+    fn test_fp_accumulator_retarget_kept_before_fmla_accumulate() {
+        let input = "\
+f:
+    fadd d0, d1, d2
+    fmov d18, d0
+    str d18, [x1]
+    fmla d0, d5, d6
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("fadd d0, d1, d2"));
+        assert!(result.contains("fmov d18, d0"), "fmla reads old d0:\n{}", result);
+    }
+
+    // ── Scalar FP copy propagation ──────────────────────────────────────
+
+    #[test]
+    fn test_single_use_fp_copies_feed_binop() {
+        let input = "\
+f:
+    fmov d24, d11
+    fmov d25, d14
+    fsub d28, d24, d25
+    fmov d24, d17
+    fmov d25, d18
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("fsub d28, d11, d14"), "sources propagated:\n{}", result);
+        assert!(!result.contains("fmov d24, d11"), "first copy removed:\n{}", result);
+        assert!(!result.contains("fmov d25, d14"), "second copy removed:\n{}", result);
+    }
+
+    #[test]
+    fn test_single_use_fp_copy_read_modify_write() {
+        let input = "\
+f:
+    fmov d24, d11
+    fadd d24, d24, d12
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("fadd d24, d11, d12"), "source propagated:\n{}", result);
+        assert!(!result.contains("fmov d24, d11"), "copy removed:\n{}", result);
+    }
+
+    #[test]
+    fn test_single_use_fp_copy_kept_when_source_clobbered() {
+        let input = "\
+f:
+    fmov d24, d11
+    fmul d11, d12, d13
+    fsub d28, d24, d14
+    fmov d24, d17
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("fmov d24, d11"), "source clobber must block:\n{}", result);
+        assert!(result.contains("fsub d28, d24, d14"));
+    }
+
+    #[test]
+    fn test_single_use_fp_copy_kept_for_second_read() {
+        let input = "\
+f:
+    fmov d24, d11
+    fadd d28, d24, d12
+    fmul d29, d24, d13
+    fmov d24, d17
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("fmov d24, d11"), "second read must block:\n{}", result);
+        assert!(result.contains("fadd d28, d24, d12"));
+    }
+
+    #[test]
+    fn test_single_use_fp_copy_kept_for_implicit_fmla_read() {
+        let input = "\
+f:
+    fmov d24, d11
+    fadd d28, d24, d12
+    fmla d24, d1, d2
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("fmov d24, d11"), "fmla is a second implicit read:\n{}", result);
+        assert!(result.contains("fadd d28, d24, d12"));
+    }
+
+    #[test]
+    fn test_single_use_fp_copy_kept_across_control_flow() {
+        let input = "\
+f:
+    fmov d24, d11
+    b.eq .Lconsume
+.Lconsume:
+    fsub d28, d24, d14
+    fmov d24, d17
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("fmov d24, d11"), "control flow must block:\n{}", result);
+    }
+
+    #[test]
+    fn test_single_use_fp_copy_kept_for_width_alias() {
+        let input = "\
+f:
+    fmov d24, d11
+    fadd s28, s24, s12
+    fmov d24, d17
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("fmov d24, d11"), "width alias must block:\n{}", result);
+    }
+
+    // ── FP field pair fusion (ldp/stp) ───────────────────────────────────
+
+    #[test]
+    fn test_fp_pair_loads_fused() {
+        let input = "\
+f:
+    ldr d22, [x7]
+    ldr d23, [x26]
+    fsub d27, d22, d23
+    ldr d28, [x7, #8]
+    fsub d30, d28, d29
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("ldp d22, d28, [x7]"), "loads fused:\n{}", result);
+        assert!(!result.contains("ldr d28, [x7, #8]"));
+    }
+
+    #[test]
+    fn test_fp_pair_stores_fused() {
+        let input = "\
+f:
+    str d10, [x8]
+    str d22, [x8, #8]
+    ldr d1, [x8]
+    ldr d2, [x8, #8]
+    fadd d0, d1, d2
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("stp d10, d22, [x8]"), "stores fused:\n{}", result);
+    }
+
+    #[test]
+    fn test_fp_pair_loads_blocked_by_store() {
+        // A store between the loads may alias the second load's address.
+        let input = "\
+f:
+    ldr d22, [x7]
+    str d0, [x9]
+    ldr d28, [x7, #8]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("ldr d28, [x7, #8]"), "store must block fusion:\n{}", result);
+        assert!(!result.contains("ldp"));
+    }
+
+    #[test]
+    fn test_fp_pair_stores_blocked_by_load() {
+        // A load between the stores may read the second store's address.
+        let input = "\
+f:
+    str d10, [x7]
+    ldr d0, [x9]
+    str d22, [x7, #8]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("str d22, [x7, #8]"), "load must block store fusion:\n{}", result);
+    }
+
+    #[test]
+    fn test_fp_pair_reversed_offsets() {
+        let input = "\
+f:
+    ldr d28, [x7, #8]
+    ldr d22, [x7]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("ldp d22, d28, [x7]"), "reversed pair normalized:\n{}", result);
+    }
+
+    // ── Repeated slot load elimination ───────────────────────────────────
+
+    #[test]
+    fn test_repeated_slot_load_same_reg_deleted() {
+        let input = "\
+f:
+    ldr x9, [sp, #392]
+    ldr d28, [x9, #80]
+    fmul d29, d28, d8
+    ldr x9, [sp, #392]
+    ldr d30, [x9, #56]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert_eq!(result.matches("ldr x9, [sp, #392]").count(), 1,
+            "second load deleted:\n{}", result);
+    }
+
+    #[test]
+    fn test_repeated_slot_load_different_reg_mov() {
+        // The repeat load becomes a mov, and copy-propagation then folds the
+        // mov into the consumer — the second slot load disappears entirely.
+        let input = "\
+f:
+    ldr x9, [sp, #392]
+    ldr d28, [x9, #80]
+    ldr x10, [sp, #392]
+    ldr d30, [x10, #56]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.contains("ldr x10, [sp, #392]"), "repeat load gone:\n{}", result);
+        assert!(result.contains("ldr d30, [x9, #56]"), "consumer uses x9:\n{}", result);
+    }
+
+    #[test]
+    fn test_repeated_slot_load_blocked_by_intervening_store() {
+        // A store through an unknown base may write the frame slot.
+        let input = "\
+f:
+    ldr x9, [sp, #392]
+    str d0, [x26]
+    ldr x9, [sp, #392]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert_eq!(result.matches("ldr x9, [sp, #392]").count(), 2,
+            "unknown-base store must block:\n{}", result);
+    }
+
+    #[test]
+    fn test_repeated_slot_load_blocked_by_reg_clobber() {
+        let input = "\
+f:
+    ldr x9, [sp, #392]
+    add x9, x9, #8
+    ldr x9, [sp, #392]
+    ret
+";
+        // x9 was overwritten by the add: the second load must stay.
+        let result = peephole_optimize(input.to_string());
+        assert_eq!(result.matches("ldr x9, [sp, #392]").count(), 2,
+            "clobbered register must block:\n{}", result);
+    }
+
+
+
+    #[test]
+    fn test_fp_pair_latch_stores_no_overlap() {
+    // Consecutive latch spill stores fuse pairwise; an already-paired line
+    // must not be re-paired into an overlapping stp.
+    let input = "\
+f:
+    add x19, x26, #56
+    str d10, [sp, #344]
+    str d22, [sp, #352]
+    str d30, [sp, #360]
+    str d19, [sp, #368]
+    str d27, [sp, #376]
+    mov x26, x19
+    ldr d0, [sp, #344]
+    ldr d1, [sp, #352]
+    ldr d2, [sp, #360]
+    ldr d3, [sp, #368]
+    ldr d4, [sp, #376]
+    ret
+";
+    let result = peephole_optimize(input.to_string());
+    assert!(result.contains("stp d10, d22, [sp, #344]"), "first pair:\n{}", result);
+    assert!(result.contains("stp d30, d19, [sp, #360]"), "second pair:\n{}", result);
+    assert!(!result.contains("stp d22"), "no overlapping re-fusion:\n{}", result);
+}
+
+    // ── Zext move-chain folding ──────────────────────────────────────────
+
+    #[test]
+    fn test_zext_move_chain_folded() {
+        let input = "\
+f:
+    mov x0, x24
+    mov w0, w0
+    mov x26, x0
+    mul w4, w26, w25
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("mov w26, w24"), "chain folded:\n{}", result);
+        assert!(!result.contains("mov w0, w0"));
+    }
+
+    #[test]
+    fn test_zext_move_chain_blocked_when_accumulator_live() {
+        let input = "\
+f:
+    mov x0, x24
+    mov w0, w0
+    mov x26, x0
+    mul w4, w26, w25
+    add w5, w0, #1
+    ret
+";
+        // x0 is read after the chain: folding would lose the zext value.
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("mov w0, w0"), "live accumulator blocks fold:\n{}", result);
+    }
+
+    #[test]
+    fn test_sink_loop_carried_store() {
+        // Bottom-tested loop: the slot is never read inside, the value stays
+        // live in x20; the store can be sunk to the fall-through exit.
+        let input = "\
+f:
+    mov x20, #0
+    movz x21, #100
+    b .Lguard
+.Lbody:
+    sxtw x22, w20
+    add x0, x22, x20
+    str x0, [sp, #24]
+    mov x20, x0
+    cmp w20, w21
+    b.le .Lbody
+    b .Lexit
+.Lguard:
+    cmp w20, w21
+    b.le .Lbody
+    b .Lexit
+.Lexit:
+    ldr x0, [sp, #24]
+    ret
+";
+        let result = {
+            let mut lines: Vec<String> = input.lines().map(String::from).collect();
+            let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+            let n = lines.len();
+            let changed = sink_loop_carried_stores(&mut lines, &mut kinds, n);
+            let out = lines
+                .iter()
+                .zip(kinds.iter())
+                .filter(|(_, k)| **k != LineKind::Nop)
+                .map(|(l, _)| l.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(changed, "store should be sunk:\n{}", out);
+            out
+        };
+        // Exactly one store remains, on the exit path after the backedge.
+        assert_eq!(result.matches("str x0, [sp, #24]").count(), 1, "\n{}", result);
+        let be = result.find("b.le .Lbody").unwrap();
+        let st = result.find("str x0, [sp, #24]").unwrap();
+        assert!(st > be, "store after backedge:\n{}", result);
+    }
+
+    #[test]
+    fn test_sink_blocked_when_slot_read_in_loop() {
+        let input = "\
+f:
+    mov x20, #0
+.Lbody:
+    ldr x0, [sp, #24]
+    add x0, x0, x20
+    str x0, [sp, #24]
+    mov x20, x0
+    cmp w20, w21
+    b.le .Lbody
+    ldr x0, [sp, #24]
+    ret
+";
+        let mut lines: Vec<String> = input.lines().map(String::from).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let n = lines.len();
+        assert!(!sink_loop_carried_stores(&mut lines, &mut kinds, n));
+    }
+
+    #[test]
+    fn test_sink_blocked_by_mid_loop_exit() {
+        let input = "\
+f:
+    mov x20, #0
+.Lbody:
+    cmp w20, w22
+    b.gt .Lexit
+    add x0, x20, #1
+    str x0, [sp, #24]
+    mov x20, x0
+    cmp w20, w21
+    b.le .Lbody
+.Lexit:
+    ldr x0, [sp, #24]
+    ret
+";
+        let mut lines: Vec<String> = input.lines().map(String::from).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let n = lines.len();
+        assert!(!sink_loop_carried_stores(&mut lines, &mut kinds, n));
+    }
+
+    #[test]
+    fn test_csinc_fold_blocked_by_mid_window_use() {
+        // sqlite btreeHeapPull: the increment result w22 feeds the csel AND
+        // the intervening address computation. Folding to csinc would delete
+        // the add and leave the lsl/ldr reading a stale register.
+        let input = "\
+f:
+    add w22, w19, #1
+    lsl x13, x22, #2
+    ldr w0, [x26, x22, lsl #2]
+    cmp w1, w0
+    csel w20, w22, w19, hi
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("add w22, w19, #1"),
+            "add with mid-window uses must survive:\n{}", result);
+        assert!(result.contains("csel w20, w22, w19, hi"),
+            "csel must not fold:\n{}", result);
+    }
+
+    #[test]
+    fn test_csinc_fold_still_fires_when_add_single_use() {
+        let input = "\
+f:
+    add w22, w19, #1
+    cmp w1, w0
+    csel w20, w22, w19, hi
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("csinc w20, w19, w19, ls"),
+            "single-use increment still folds:\n{}", result);
+        assert!(!result.contains("add w22, w19, #1"),
+            "folded add deleted:\n{}", result);
+    }
+
+    #[test]
+    fn test_gdse_store_alive_across_call_scratch_push() {
+        // sqlite computeCellSize: the slot stored at [sp, #16] is read after
+        // the call-scratch push as [sp, #32] — same memory. Mid-body sp
+        // motion invalidates raw-offset aliasing, so gdse must bail on the
+        // whole function rather than delete the live store.
+        let input = "\
+f:
+    stp x29, x30, [sp, #-128]!
+    mov x29, sp
+    ldr x0, [x19, #8]
+    str x0, [sp, #16]
+    ldr x0, [x19, #16]
+    str x0, [sp, #24]
+    str x0, [sp, #-16]!
+    mov x0, x19
+    ldr x1, [sp, #32]
+    ldr x17, [sp, #0]
+    blr x17
+    add sp, sp, #16
+    ldp x29, x30, [sp], #128
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("str x0, [sp, #16]"),
+            "pre-push store read post-push at +16 must survive:\n{}", result);
+        assert!(result.contains("str x0, [sp, #24]"),
+            "gdse bails on the whole function:\n{}", result);
+    }
+
+    #[test]
+    fn test_gdse_still_fires_without_midbody_sp_motion() {
+        // No mid-body sp motion (only prologue push + epilogue pop): the
+        // never-loaded slot store stays dead and is eliminated.
+        let input = "\
+f:
+    stp x29, x30, [sp, #-128]!
+    mov x29, sp
+    ldr x0, [x19, #8]
+    str x0, [sp, #16]
+    str x0, [sp, #24]
+    ldr x1, [sp, #16]
+    add x0, x1, x1
+    ldp x29, x30, [sp], #128
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.contains("str x0, [sp, #24]"),
+            "dead store still eliminated:\n{}", result);
+        assert!(result.contains("str x0, [sp, #16]"),
+            "loaded store kept:\n{}", result);
+    }
+
+    #[test]
+    fn test_gdse_keeps_store_loaded_through_adjusted_same_register_sp_base() {
+        // Accumulator retargeting turns `add x0, sp, #16; mov x23, x0`
+        // into `add x23, sp, #16`.  The following in-place adjustment must
+        // preserve x23's sp lineage so GDSE sees the load of [sp, #24].
+        let input = "\
+.section .rodata
+.Lstr0:
+    .byte 37, 100, 10, 0
+.section .text
+.globl f
+.type f, %function
+f:
+    .cfi_startproc
+    stp x29, x30, [sp, #-96]!
+    mov x29, sp
+    stp x19, x20, [sp, #40]
+    stp x21, x22, [sp, #56]
+    stp x23, x24, [sp, #72]
+    str x25, [sp, #88]
+    mov x0, #1
+    str w0, [sp, #16]
+    mov x0, #2
+    str w0, [sp, #20]
+    mov x0, #3
+    str w0, [sp, #24]
+    mov x0, #4
+    str w0, [sp, #28]
+    mov x0, #5
+    str w0, [sp, #32]
+    add x0, sp, #16
+    mov x23, x0
+    add x23, x23, #8
+    adrp x0, .Lstr0
+    add x0, x0, :lo12:.Lstr0
+    mov x24, x0
+    mov x9, x23
+    ldrsw x0, [x9]
+    mov x25, x0
+    mov x0, x24
+    mov x1, x25
+    bl printf
+    ldp x19, x20, [sp, #40]
+    ldp x21, x22, [sp, #56]
+    ldp x23, x24, [sp, #72]
+    ldr x25, [sp, #88]
+    ldp x29, x30, [sp], #96
+    ret
+    .cfi_endproc
+.size f, .-f
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("str w0, [sp, #24]"),
+            "store read through adjusted sp base must survive:\n{}", result);
+    }
+
+    #[test]
+    fn test_copy_prop_not_into_rotated_latch() {
+        // sqlite defragmentPage: rotate_simple_loops duplicates the header
+        // test into a multi-line latch slot right after `mov x23, x0`.
+        // propagate_register_copies must not rewrite the embedded
+        // `cmp x23, x0` to `cmp x0, x0` — the slot's own first instruction
+        // (`ldr x0, [sp, #48]`) clobbers x0 before the compare reads it.
+        let input = "\
+f:
+    mov x23, x0
+.Lhdr:
+    ldr x0, [sp, #48]
+    cmp x23, x0
+    b.lo .Lbody
+.Lskip:
+    b .Lexit
+.Lbody:
+    add x0, x23, #2
+    str x0, [sp, #56]
+    mov x23, x0
+    b .Lhdr
+.Lexit:
+    ldr x0, [sp, #56]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("cmp x23, x0"),
+            "loop variable in the duplicated latch test must survive:\n{}", result);
+        assert!(!result.contains("cmp x0, x0"),
+            "no stale copy propagation into the latch:\n{}", result);
+    }
+
+    #[test]
+    fn test_loop_rotation_folds_skip_trampoline() {
+        let input = "\
+f:
+.Lhdr:
+    cmp w4, w5
+    b.lt .Lbody
+.Lskip:
+    b .Lexit
+.Lbody:
+    add w4, w4, #1
+    b .Lhdr
+.Lexit:
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("b.ge .Lexit"), "guard branches directly to exit:\n{}", result);
+        assert!(result.contains("b.lt .Lbody"), "bottom test retained:\n{}", result);
+        assert!(!result.contains("b .Lexit"), "skip trampoline removed:\n{}", result);
+        assert!(!result.contains("b .Lskip"), "rotated latch falls through:\n{}", result);
+    }
+}
+/// Fold an increment-feeding-csel into a single csinc:
+///   add wA, wB, #1            add wA, wB, #1
+///   ...                       ...
+///   csel wD, wA, wB, cc   OR  csel wD, wB, wA, cc
+/// becomes `csinc wD, wB, wB, !cc` / `csinc wD, wB, wB, cc` and the add is
+/// deleted. Fires on if-converted `if (x) count++` loops (sieve's prime
+/// count loop) where the select's separate increment occupies an extra
+/// dispatch slot in a branch-throughput-bound loop.
+///
+/// Soundness: the add's dest A must have no other mentions anywhere in the
+/// function text (w- and x-names alias the same register) — neither after
+/// the csel nor between the add and the csel (e.g. an address computation
+/// consuming A early, as in sqlite's btreeHeapPull) — B must not be
+/// rewritten between the add and the csel, and the scan stays within one
+/// basic block (any label/branch/call stops it). csel and csinc read flags
+/// identically and neither writes flags; the deleted add is the
+/// flag-neutral form (not `adds`).
+fn fold_csel_increment(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    fn mentions(line: &str, reg: u8) -> bool {
+        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|tok| tok == xreg_name(reg) || tok == wreg_name(reg))
+    }
+    fn canonical_cond(cc: &str) -> Option<&'static str> {
+        Some(match cc {
+            "eq" => "eq",
+            "ne" => "ne",
+            "lt" => "lt",
+            "ge" => "ge",
+            "gt" => "gt",
+            "le" => "le",
+            "hi" => "hi",
+            "ls" => "ls",
+            "hs" | "cs" => "hs",
+            "lo" | "cc" => "lo",
+            "mi" => "mi",
+            "pl" => "pl",
+            "vs" => "vs",
+            "vc" => "vc",
+            _ => return None,
+        })
+    }
+    let mut changed = false;
+    for i in 0..n {
+        if kinds[i] != LineKind::Alu {
+            continue;
+        }
+        let t = lines[i].trim().to_string();
+        let Some(rest) = t.strip_prefix("add ") else { continue };
+        let mut parts = rest.split(", ");
+        let (Some(a_str), Some(b_str), Some(imm)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if parts.next().is_some() || imm.trim() != "#1" {
+            continue;
+        }
+        let a_str = a_str.trim();
+        let b_str = b_str.trim();
+        let is_32 = a_str.starts_with('w');
+        let prefix = if is_32 { 'w' } else { 'x' };
+        if !a_str.starts_with(prefix) || !b_str.starts_with(prefix) {
+            continue;
+        }
+        let a = parse_reg(a_str);
+        let b = parse_reg(b_str);
+        if a == REG_NONE || b == REG_NONE || a >= 29 || b >= 29 {
+            continue;
+        }
+        // Find the consuming csel in the same basic block.
+        let mut found: Option<(usize, u8, &'static str)> = None;
+        let mut j = i + 1;
+        while j < n {
+            match kinds[j] {
+                LineKind::Nop | LineKind::Directive => {}
+                LineKind::Label
+                | LineKind::Branch
+                | LineKind::CondBranch
+                | LineKind::CmpBranch
+                | LineKind::Ret
+                | LineKind::Call => break,
+                _ => {
+                    // B must survive unchanged from the add to the csel.
+                    if gp_reg_written_broad(&lines[j], b) {
+                        break;
+                    }
+                    let tj = lines[j].trim();
+                    if let Some(rest) = tj.strip_prefix("csel ") {
+                        let mut p = rest.split(", ");
+                        if let (Some(d_s), Some(x_s), Some(y_s), Some(cc_s)) =
+                            (p.next(), p.next(), p.next(), p.next())
+                        {
+                            let d = parse_reg(d_s.trim());
+                            let x = parse_reg(x_s.trim());
+                            let y = parse_reg(y_s.trim());
+                            let cc_s = cc_s.trim();
+                            let width_ok = d_s.trim().starts_with(prefix)
+                                && x_s.trim().starts_with(prefix)
+                                && y_s.trim().starts_with(prefix);
+                            if width_ok && d != REG_NONE {
+                                if x == a && y == b {
+                                    // True arm is B+1: csinc D, B, B, !cc
+                                    if let Some(inv) = invert_condition(cc_s) {
+                                        found = Some((j, d, inv));
+                                    }
+                                    break;
+                                } else if x == b && y == a {
+                                    // False arm is B+1: csinc D, B, B, cc
+                                    if let Some(cc) = canonical_cond(cc_s) {
+                                        found = Some((j, d, cc));
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    // A must be used ONLY by the consuming csel: any other
+                    // mention of A between the add and the csel (an address
+                    // computation, a store, another use) reads the add's
+                    // result, so deleting the add would leave that use
+                    // observing a stale value.  Likewise a rewrite of A
+                    // severs the add/csel pair.  Abort the fold.
+                    if mentions(&lines[j], a) {
+                        break;
+                    }
+                }
+            }
+            j += 1;
+        }
+        let Some((cj, d, cc)) = found else { continue };
+        // Prove A dead after the csel: scan to the end of the function's
+        // text; the next mention of A must be a write that does not read it
+        // (mov/load-dest), or the function must end first. Mirrors the
+        // discipline of propagate_address_aliases.
+        let mut dead = false;
+        let mut k = cj + 1;
+        while k < n {
+            let lk = lines[k].trim_end();
+            // Column-0 identifier label: end of the function's text.
+            if lk.ends_with(':') && lk.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+                dead = true;
+                break;
+            }
+            match kinds[k] {
+                LineKind::Nop | LineKind::Directive | LineKind::Label | LineKind::Ret => {}
+                LineKind::Call => break,
+                _ => {
+                    if mentions(&lines[k], a) {
+                        let trusted_write = match kinds[k] {
+                            LineKind::Move { dst, .. }
+                            | LineKind::MoveImm { dst }
+                            | LineKind::MoveWide { dst }
+                            | LineKind::LoadSp { reg: dst, .. }
+                            | LineKind::LoadswSp { reg: dst, .. } => dst == a,
+                            LineKind::LoadPairSp => {
+                                // `ldp xA, xB, [...]` writes both dests,
+                                // reads neither.
+                                let tk = lines[k].trim();
+                                match tk.split_once(' ') {
+                                    Some((_, rest)) => rest
+                                        .split(',')
+                                        .take(2)
+                                        .any(|op| {
+                                            let op = op.trim();
+                                            op == xreg_name(a) || op == wreg_name(a)
+                                        }),
+                                    None => false,
+                                }
+                            }
+                            LineKind::Alu => {
+                                // `op wA, ...` with A only as the first operand
+                                let tk = lines[k].trim();
+                                match tk.split_once(',') {
+                                    Some((first, rest)) => {
+                                        let dest_is_a = first
+                                            .split_whitespace()
+                                            .last()
+                                            .is_some_and(|t| t == xreg_name(a) || t == wreg_name(a));
+                                        dest_is_a && !mentions(rest, a)
+                                    }
+                                    None => false,
+                                }
+                            }
+                            _ => false,
+                        };
+                        if trusted_write {
+                            dead = true;
+                        }
+                        break;
+                    }
+                }
+            }
+            k += 1;
+        }
+        if k == n {
+            dead = true;
+        }
+        if !dead {
+            continue;
+        }
+        lines[cj] = format!("    csinc {}{}, {}{}, {}{}, {}", prefix, d, prefix, b, prefix, b, cc);
+        kinds[cj] = LineKind::Alu;
+        kinds[i] = LineKind::Nop;
+        changed = true;
+    }
+    changed
 }

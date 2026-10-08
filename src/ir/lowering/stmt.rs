@@ -1091,7 +1091,7 @@ impl Lowerer {
             Stmt::Expr(Some(expr)) => {
                 // For expression statements, use the expression's span for better precision
                 self.func_mut().current_span = expr.span();
-                self.lower_expr(expr);
+                self.lower_expr_discarded(expr);
             }
             Stmt::Expr(None) => {}
             Stmt::Compound(compound) => self.lower_compound_stmt(compound),

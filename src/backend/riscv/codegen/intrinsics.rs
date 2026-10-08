@@ -280,7 +280,16 @@ impl RiscvCodegen {
             | IntrinsicOp::Pshuflw128 | IntrinsicOp::Pshufhw128
             | IntrinsicOp::Pinsrd128 | IntrinsicOp::Pextrd128
             | IntrinsicOp::Pinsrb128 | IntrinsicOp::Pextrb128
-            | IntrinsicOp::Pinsrq128 | IntrinsicOp::Pextrq128 => {
+            | IntrinsicOp::Pinsrq128 | IntrinsicOp::Pextrq128
+            | IntrinsicOp::FmaF64x2 | IntrinsicOp::FmaF64x2Hoisted | IntrinsicOp::FmaF64x4
+            | IntrinsicOp::FmaF64x4Hoisted | IntrinsicOp::BroadcastLoadF64 | IntrinsicOp::FmaF64x4SIB
+            | IntrinsicOp::LoadF64x4 | IntrinsicOp::LoadF64x2
+            | IntrinsicOp::LoadI32x8 | IntrinsicOp::LoadI32x4
+            | IntrinsicOp::AddF64x4 | IntrinsicOp::AddF64x2
+            | IntrinsicOp::MulF64x4 | IntrinsicOp::MulF64x2
+            | IntrinsicOp::AddI32x8 | IntrinsicOp::AddI32x4
+            | IntrinsicOp::HorizontalAddF64x4 | IntrinsicOp::HorizontalAddF64x2
+            | IntrinsicOp::HorizontalAddI32x8 | IntrinsicOp::HorizontalAddI32x4 => {
                 // x86-only: zero dest if present
                 if let Some(dptr) = dest_ptr {
                     if let Some(slot) = self.state.get_slot(dptr.0) {
@@ -288,6 +297,27 @@ impl RiscvCodegen {
                         self.emit_store_to_s0("zero", slot.0 + 8, "sd");
                     }
                 }
+            }
+
+            // Register-based vector intrinsics (x86-specific, not implemented for RISC-V)
+            IntrinsicOp::VecLoadF64x4 | IntrinsicOp::VecLoadF64x2 | IntrinsicOp::VecLoadI32x8 | IntrinsicOp::VecLoadI32x4 |
+            IntrinsicOp::VecAddF64x4 | IntrinsicOp::VecAddF64x2 | IntrinsicOp::VecMulF64x4 | IntrinsicOp::VecMulF64x2 |
+            IntrinsicOp::VecAddI32x8 | IntrinsicOp::VecAddI32x4 |
+            IntrinsicOp::VecHorizontalAddF64x4 | IntrinsicOp::VecHorizontalAddF64x2 |
+            IntrinsicOp::VecHorizontalAddI32x8 | IntrinsicOp::VecHorizontalAddI32x4 |
+            IntrinsicOp::VecZeroF64x4 | IntrinsicOp::VecZeroF64x2 | IntrinsicOp::VecZeroI32x8 | IntrinsicOp::VecZeroI32x4 |
+            IntrinsicOp::VecLoadWidenI32ToI64x2 | IntrinsicOp::VecAddI64x2 |
+            IntrinsicOp::VecMulI64x2 | IntrinsicOp::VecHorizontalAddI64x2 |
+            IntrinsicOp::VecZeroI64x2 |
+            IntrinsicOp::VecMulI32x4 | IntrinsicOp::VecBroadcastI32x4 |
+            IntrinsicOp::VecStoreI32x4 |
+            IntrinsicOp::VecSadalpI32x4 |
+            IntrinsicOp::VecSmlalLoI32x4 | IntrinsicOp::VecSmlalHiI32x4 |
+            IntrinsicOp::VecSmaxZeroI32x4 |
+            IntrinsicOp::VecSmaxI32x4 | IntrinsicOp::VecHorizontalMaxI32x4 => {
+                // These are x86-64/AArch64-specific register-based vector operations
+                // RISC-V would use RVV (RISC-V Vector extension) differently
+                unimplemented!("Register-based vector intrinsics not implemented for RISC-V");
             }
         }
     }

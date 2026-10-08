@@ -839,6 +839,10 @@ impl InstructionEncoder {
             "vsubpd" => self.encode_avx_3op(ops, 0x5C, true),
             "vmulpd" => self.encode_avx_3op(ops, 0x59, true),
             "vdivpd" => self.encode_avx_3op(ops, 0x5E, true),
+            // FMA3 (0F38 map, W=1 for F64, pp=66)
+            "vfmadd132pd" => self.encode_avx_3op_38_w1(ops, 0x98, true),
+            "vfmadd213pd" => self.encode_avx_3op_38_w1(ops, 0xA8, true),
+            "vfmadd231pd" => self.encode_avx_3op_38_w1(ops, 0xB8, true),
             "vaddps" => self.encode_avx_3op_np(ops, 0x58),
             "vsubps" => self.encode_avx_3op_np(ops, 0x5C),
             "vmulps" => self.encode_avx_3op_np(ops, 0x59),

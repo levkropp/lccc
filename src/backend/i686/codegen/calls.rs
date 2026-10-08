@@ -160,6 +160,9 @@ impl I686Codegen {
     }
 
     pub(super) fn emit_call_store_result_impl(&mut self, dest: &Value, return_type: IrType) {
+        if return_type == IrType::Void {
+            return;
+        }
         if return_type == IrType::I64 || return_type == IrType::U64 {
             if let Some(slot) = self.state.get_slot(dest.0) {
                 let sr0 = self.slot_ref(slot);

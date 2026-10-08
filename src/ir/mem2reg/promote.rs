@@ -76,7 +76,7 @@ struct AllocaInfo {
 /// Promote allocas in a single function to SSA form.
 /// If `promote_params` is true, parameter allocas in the entry block are also
 /// eligible for promotion.
-fn promote_function(func: &mut IrFunction, promote_params: bool) {
+pub fn promote_function(func: &mut IrFunction, promote_params: bool) {
     if func.blocks.is_empty() {
         return;
     }
@@ -522,7 +522,23 @@ fn rename_block(
     // the goto targets, instead of the end-of-block def-stack tops.
     let mut new_instructions = Vec::with_capacity(func.blocks[block_idx].instructions.len());
     let mut new_spans = Vec::new();
-    let has_spans = !func.blocks[block_idx].source_spans.is_empty();
+    let mut has_spans = !func.blocks[block_idx].source_spans.is_empty();
+    if has_spans && func.blocks[block_idx].source_spans.len() != func.blocks[block_idx].instructions.len() {
+        // Debug-info spans are best-effort; a desync must never crash the
+        // compile (sqlite3.c hit this). Drop the block's spans instead.
+        if std::env::var("CCC_DEBUG_SPANS").is_ok() {
+            eprintln!(
+                "[SPANS] {}: block {} (label {}) has {} insts but {} spans",
+                func.name,
+                block_idx,
+                func.blocks[block_idx].label.0,
+                func.blocks[block_idx].instructions.len(),
+                func.blocks[block_idx].source_spans.len()
+            );
+        }
+        func.blocks[block_idx].source_spans.clear();
+        has_spans = false;
+    }
     if has_spans {
         new_spans.reserve(func.blocks[block_idx].source_spans.len());
     }

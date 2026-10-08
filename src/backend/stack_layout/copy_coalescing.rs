@@ -14,7 +14,7 @@ use crate::ir::reexports::{
 };
 use crate::common::types::IrType;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::backend::regalloc::PhysReg;
+use crate::backend::regalloc::{detect_phi_coalesce_groups, PhysReg};
 use crate::backend::liveness::{
     for_each_operand_in_instruction, for_each_value_use_in_instruction,
     for_each_operand_in_terminator,
@@ -26,13 +26,20 @@ use crate::backend::liveness::{
 /// Safety: only coalesces when the Copy is the SOLE use of the source value,
 /// guaranteeing the source is dead after the Copy (avoids the "lost copy"
 /// problem in phi parallel copy groups).
+/// Returns `(copy_alias, phi_web_aliases)` where phi_web_aliases contains value IDs
+/// that were coalesced via phi-web analysis and need force-overwrite in resolve_copy_aliases.
+/// The third element, `loop_phi_aliases`, contains phi-web aliases certified by
+/// `detect_phi_coalesce_groups` (loop-backedge copies); those skip the generic
+/// def/last-use interference check in resolve_copy_aliases because the detector
+/// already proved the phi dest is dead after the backedge source's definition.
 pub(super) fn build_copy_alias_map(
     func: &IrFunction,
     def_block: &FxHashMap<u32, usize>,
     multi_def_values: &FxHashSet<u32>,
     reg_assigned: &FxHashMap<u32, PhysReg>,
     use_blocks_map: &FxHashMap<u32, Vec<usize>>,
-) -> FxHashMap<u32, u32> {
+    cached_liveness: &Option<crate::backend::liveness::LivenessResult>,
+) -> (FxHashMap<u32, u32>, FxHashSet<u32>, FxHashSet<u32>) {
     // Count uses of each value across all instructions.
     let mut use_count: FxHashMap<u32, u32> = FxHashMap::default();
     for block in &func.blocks {
@@ -53,35 +60,371 @@ pub(super) fn build_copy_alias_map(
         });
     }
 
+    // Build last-use instruction point map (NOT using LiveInterval.end which
+    // includes live-through extensions from backward dataflow). We compute actual
+    // last-instruction-use points by scanning all instructions directly.
+    // This correctly identifies values whose last explicit use IS the Copy instruction.
+    let mut last_use_instr: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut copy_program_points: FxHashMap<(usize, usize), u32> = FxHashMap::default();
+    if cached_liveness.is_some() {
+        let mut pp: u32 = 0;
+        for (blk_idx, block) in func.blocks.iter().enumerate() {
+            for (inst_idx, inst) in block.instructions.iter().enumerate() {
+                // Record program point for Copy instructions.
+                if matches!(inst, Instruction::Copy { .. }) {
+                    copy_program_points.insert((blk_idx, inst_idx), pp);
+                }
+                // Track last-use for all operands (reads of values).
+                for_each_operand_in_instruction(inst, |op| {
+                    if let Operand::Value(v) = op {
+                        last_use_instr.insert(v.0, pp);
+                    }
+                });
+                for_each_value_use_in_instruction(inst, |v| {
+                    last_use_instr.insert(v.0, pp);
+                });
+                pp += 1;
+            }
+            // Terminators also use operands.
+            for_each_operand_in_terminator(&block.terminator, |op| {
+                if let Operand::Value(v) = op {
+                    last_use_instr.insert(v.0, pp);
+                }
+            });
+            pp += 1;
+        }
+    }
+
     // Collect Copy instructions eligible for aliasing.
     let mut raw_aliases: Vec<(u32, u32)> = Vec::new();
-    for block in &func.blocks {
-        for inst in &block.instructions {
+    for (blk_idx, block) in func.blocks.iter().enumerate() {
+        for (inst_idx, inst) in block.instructions.iter().enumerate() {
             if let Instruction::Copy { dest, src: Operand::Value(src_val) } = inst {
                 let d = dest.0;
                 let s = src_val.0;
-                // Exclude multi-def values and register-assigned values.
-                if multi_def_values.contains(&d) || multi_def_values.contains(&s) {
+                // Never alias a multi-defined source (the aliased value must be
+                // single-def; multi-def values have complex liveness that makes
+                // slot sharing unsafe).
+                if multi_def_values.contains(&s) {
                     continue;
                 }
                 if reg_assigned.contains_key(&d) || reg_assigned.contains_key(&s) {
                     continue;
                 }
-                // Only coalesce if Copy is the sole use of the source.
-                if use_count.get(&s).copied().unwrap_or(0) != 1 {
-                    continue;
-                }
-                // Only coalesce if dest's uses are in the same block as source's definition.
-                // Cross-block aliasing is unsafe: the root's liveness interval doesn't
-                // account for the alias's uses in other blocks.
-                if let Some(&src_def_blk) = def_block.get(&s) {
-                    if let Some(dest_use_blocks) = use_blocks_map.get(&d) {
-                        if dest_use_blocks.iter().any(|&b| b != src_def_blk) {
-                            continue;
-                        }
+                // Coalesce if Copy is the sole use of the source, OR if the
+                // source's live interval ends at/before this Copy (src is dead after).
+                let sole_use = use_count.get(&s).copied().unwrap_or(0) == 1;
+                if !sole_use {
+                    // Block-local dead-after-copy check: is src unused after this
+                    // Copy within this block, AND not used in any other block?
+                    // (The global last_use_instr doesn't work because phi sources
+                    // may have Copies in multiple predecessor blocks.)
+                    let src_use_blocks = use_blocks_map.get(&s);
+                    let src_only_in_this_block = src_use_blocks
+                        .map(|blks| blks.iter().all(|&b| b == blk_idx))
+                        .unwrap_or(true);
+                    if !src_only_in_this_block {
+                        continue;
+                    }
+                    // Check: is src used AFTER this Copy instruction in this block?
+                    let mut used_after = false;
+                    for later_inst in &block.instructions[inst_idx + 1..] {
+                        let mut found = false;
+                        for_each_operand_in_instruction(later_inst, |op| {
+                            if let Operand::Value(v) = op {
+                                if v.0 == s { found = true; }
+                            }
+                        });
+                        for_each_value_use_in_instruction(later_inst, |v| {
+                            if v.0 == s { found = true; }
+                        });
+                        if found { used_after = true; break; }
+                    }
+                    // Also check the terminator.
+                    if !used_after {
+                        for_each_operand_in_terminator(&block.terminator, |op| {
+                            if let Operand::Value(v) = op {
+                                if v.0 == s { used_after = true; }
+                            }
+                        });
+                    }
+                    if used_after {
+                        continue;
                     }
                 }
+
+                let src_def_blk = def_block.get(&s).copied();
+                let src_in_copy_block = src_def_blk == Some(blk_idx);
+                let dest_cross_block = use_blocks_map.get(&d)
+                    .map(|blks| blks.iter().any(|&b| b != blk_idx))
+                    .unwrap_or(false);
+
+                if src_in_copy_block && dest_cross_block {
+                    // Phi-copy pattern: src is defined and killed in this block
+                    // (sole use = this copy), but dest is used in other blocks.
+                    //
+                    // dest may be multi-defined (phi elimination creates one Copy
+                    // per predecessor that defines the phi dest). That's fine here
+                    // because dest is the slot OWNER (root), not the aliased value.
+                    // All definitions of dest write to the same slot, making the
+                    // backedge copy a same-slot no-op.
+                    //
+                    // Reversed aliasing (src → dest) is safe: src gets dest's slot,
+                    // which is already live across all of dest's uses. After aliasing,
+                    // the copy becomes a same-slot no-op (skipped by generate_copy).
+                    // This eliminates the double-slot pattern that arises from phi
+                    // elimination in loops with spilled variables.
+                    raw_aliases.push((s, d)); // src uses dest's (wider-live) slot
+                    continue;
+                }
+
+                // Standard same-block coalescing: dest uses src's slot.
+                // Dest must not be multi-defined (would make slot-sharing unsafe
+                // for the standard direction), and dest's uses must all be in the
+                // same block as source's definition.
+                if multi_def_values.contains(&d) {
+                    continue;
+                }
+                if dest_cross_block {
+                    continue;
+                }
                 raw_aliases.push((d, s));
+            }
+        }
+    }
+
+    // ── Phi-web coalescing ──────────────────────────────────────────────────
+    //
+    // Force phi web members to share the same stack slot. For Copy(dest, src)
+    // where dest is multi-def (phi dest), coalesce src→dest if src is NOT live
+    // at any program point where dest is written by a DIFFERENT Copy.
+    //
+    // Uses liveness intervals for precise interference: src interferes with a
+    // Copy(dest, src') at program point P' if src.start <= P' <= src.end.
+    // This correctly handles switch statements (case arms are mutually exclusive
+    // so their intervals don't overlap) and loop patterns.
+    let mut phi_web_aliases: FxHashSet<u32> = FxHashSet::default();
+    if !std::env::var("CCC_NO_PHI_WEB_COALESCE").is_ok() {
+        // Phase 1: Collect all Copy(dest, src) pairs with program points.
+        // Program points match liveness.rs numbering (1 per instruction + 1 per terminator).
+        let mut phi_copies: FxHashMap<u32, Vec<(u32, usize, u32)>> = FxHashMap::default(); // dest → [(src, blk, pp)]
+        let mut dest_copy_points: FxHashMap<u32, Vec<u32>> = FxHashMap::default(); // dest → [program_points]
+        let already_aliased: FxHashSet<u32> = raw_aliases.iter().map(|&(a, _)| a).collect();
+        {
+            let mut pp: u32 = 0;
+            for (blk_idx, block) in func.blocks.iter().enumerate() {
+                for inst in &block.instructions {
+                    if let Instruction::Copy { dest, src: Operand::Value(src_val) } = inst {
+                        let d = dest.0;
+                        let s = src_val.0;
+                        if multi_def_values.contains(&d)
+                            && !reg_assigned.contains_key(&s)
+                            && !already_aliased.contains(&s)
+                        {
+                            phi_copies.entry(d).or_default().push((s, blk_idx, pp));
+                            dest_copy_points.entry(d).or_default().push(pp);
+                        }
+                    }
+                    pp += 1;
+                }
+                pp += 1; // terminator
+            }
+        }
+
+        // Phase 2: Build interval map from liveness data.
+        let interval_map: FxHashMap<u32, (u32, u32)> = cached_liveness
+            .as_ref()
+            .map(|lr| lr.intervals.iter().map(|iv| (iv.value_id, (iv.start, iv.end))).collect())
+            .unwrap_or_default();
+
+        // Phase 3: For each phi web, check interference using liveness intervals.
+        for (dest_id, sources) in &phi_copies {
+            if sources.len() < 2 { continue; }
+            if reg_assigned.contains_key(dest_id) { continue; }
+
+            // All program points where dest is written by any Copy.
+            let all_copy_points = match dest_copy_points.get(dest_id) {
+                Some(pts) => pts,
+                None => continue,
+            };
+
+            for &(src_id, _src_blk, src_copy_pp) in sources {
+                // Get src's liveness interval.
+                let src_interval = interval_map.get(&src_id);
+
+                // Interference check: is src live at any program point where dest
+                // is written by a DIFFERENT Copy?
+                //
+                // For single-def sources: use_blocks check is sufficient —
+                // if src has no uses in dest's other def blocks, no interference.
+                //
+                // For multi-def sources: the use_blocks check is too conservative
+                // because multi-def values have definitions (not just uses) spread
+                // across blocks. Instead, check: does src's definition set overlap
+                // with dest's OTHER def blocks? If src is DEFINED in a block where
+                // dest has a DIFFERENT Copy, the two values co-exist there.
+                // But if src is defined there BY THE SAME Copy pattern (it's also
+                // a phi dest being written), the write order is deterministic
+                // and they won't conflict.
+                //
+                // Simple safe heuristic: src doesn't interfere if ALL of src's
+                // use blocks are either (a) the Copy's block, or (b) blocks where
+                // src is defined (def_block or multi-def blocks for src).
+                // Collect dest's other def blocks (blocks with Copy(dest, X) where X ≠ src).
+                let other_def_blks: Vec<usize> = sources.iter()
+                    .filter(|&&(_, _, pp)| pp != src_copy_pp)
+                    .map(|&(_, blk, _)| blk)
+                    .collect();
+
+                // Check: does src have uses in dest's other def blocks that are
+                // NOT themselves Copy(dest, src) instructions?
+                //
+                // Key insight: use_blocks_map counts Copy(dest, src) as a "use of src"
+                // in the Copy's block. But if src and dest share a slot, that Copy
+                // becomes a no-op — so it's not real interference. We must exclude
+                // uses that come from Copy instructions writing to dest.
+                //
+                // Build set of blocks where src has NON-COPY uses (actual computation
+                // that reads src for purposes other than feeding this phi).
+                let src_non_copy_use_blks: Vec<usize> = {
+                    let mut non_copy_blks = Vec::new();
+                    for (blk_idx, block) in func.blocks.iter().enumerate() {
+                        let mut has_non_copy_use = false;
+                        for inst in &block.instructions {
+                            // Skip Copy instructions that write to dest (these are
+                            // the phi copies we're trying to coalesce).
+                            if let Instruction::Copy { dest: copy_dest, src: Operand::Value(copy_src) } = inst {
+                                if copy_dest.0 == *dest_id && copy_src.0 == src_id {
+                                    continue; // This is the phi Copy — not real interference
+                                }
+                            }
+                            // Check if this instruction uses src as an operand.
+                            let mut uses_src = false;
+                            for_each_operand_in_instruction(inst, |op| {
+                                if let Operand::Value(v) = op {
+                                    if v.0 == src_id { uses_src = true; }
+                                }
+                            });
+                            for_each_value_use_in_instruction(inst, |v| {
+                                if v.0 == src_id { uses_src = true; }
+                            });
+                            if uses_src { has_non_copy_use = true; break; }
+                        }
+                        if !has_non_copy_use {
+                            // Also check terminator.
+                            for_each_operand_in_terminator(&block.terminator, |op| {
+                                if let Operand::Value(v) = op {
+                                    if v.0 == src_id { has_non_copy_use = true; }
+                                }
+                            });
+                        }
+                        if has_non_copy_use {
+                            non_copy_blks.push(blk_idx);
+                        }
+                    }
+                    non_copy_blks
+                };
+
+                let interferes = src_non_copy_use_blks.iter().any(|use_blk| {
+                    other_def_blks.contains(use_blk)
+                });
+
+                if !interferes {
+                    raw_aliases.push((src_id, *dest_id));
+                    phi_web_aliases.insert(src_id);
+                }
+            }
+        }
+    }
+
+    // ── Loop-backedge phi slot coalescing ─────────────────────────────────
+    //
+    // The phi-web phase above only fires for dests with 2+ Value sources, so a
+    // loop-carried variable with a constant initializer (const-init Copy plus
+    // one backedge Copy) is never coalesced: its backedge Copy `v_old <- v_new`
+    // survives as a ldr+str slot-to-slot copy per iteration for every spilled
+    // loop-carried value (e.g. 10 such pairs per iteration in arith_loop).
+    //
+    // detect_phi_coalesce_groups proves the phi dest is not used after the
+    // backedge source is defined, which is precisely the condition that makes
+    // slot sharing sound: v_new may write the shared slot as early as its own
+    // definition, and any later read of the slot (next iteration, or after the
+    // loop) is meant to observe the updated value. Both values must be
+    // stack-homed (register-assigned values are handled by register coalescing)
+    // and the source must be an integer/pointer-typed def (i128/f128/vector
+    // slots are 16/32 bytes and FP copies use different load/store paths).
+    let mut loop_phi_aliases: FxHashSet<u32> = FxHashSet::default();
+    if std::env::var("CCC_NO_LOOP_PHI_SLOT").is_err() {
+        if let Some(liveness) = cached_liveness {
+            // Type of each single-def source, for the integer/pointer check.
+            let mut def_ty_ok: FxHashMap<u32, bool> = FxHashMap::default();
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    let (d, ok) = match inst {
+                        Instruction::BinOp { dest, ty, .. }
+                        | Instruction::UnaryOp { dest, ty, .. }
+                        | Instruction::Load { dest, ty, .. }
+                        | Instruction::Select { dest, ty, .. } => {
+                            (dest.0, !ty.is_float() && !ty.is_128bit() && !ty.is_long_double())
+                        }
+                        Instruction::Cmp { dest, .. }
+                        | Instruction::GetElementPtr { dest, .. } => (dest.0, true),
+                        Instruction::Cast { dest, to_ty, from_ty, .. } => (
+                            dest.0,
+                            !to_ty.is_float()
+                                && !to_ty.is_128bit()
+                                && !from_ty.is_float()
+                                && !from_ty.is_128bit(),
+                        ),
+                        _ => continue,
+                    };
+                    def_ty_ok.insert(d, ok);
+                }
+            }
+            let already_aliased: FxHashSet<u32> =
+                raw_aliases.iter().map(|&(a, _)| a).collect();
+            // Only one NEW slot alias per phi dest: two backedge sources sharing
+            // the dest's slot could see each other's writes (unlike register
+            // coalescing, there is no per-source interval conflict check here).
+            let mut claimed_dests: FxHashSet<u32> = FxHashSet::default();
+            for (phi_dest, backedge_src) in detect_phi_coalesce_groups(func, liveness, false) {
+                if std::env::var("CCC_DEBUG_LOOP_PHI").is_ok() {
+                    eprintln!(
+                        "[LOOP_PHI] func={} pair dest=v{} src=v{} dest_reg={} src_reg={} aliased={} ty_ok={}",
+                        func.name,
+                        phi_dest,
+                        backedge_src,
+                        reg_assigned.contains_key(&phi_dest),
+                        reg_assigned.contains_key(&backedge_src),
+                        already_aliased.contains(&backedge_src),
+                        def_ty_ok.get(&backedge_src).copied().unwrap_or(false)
+                    );
+                }
+                if reg_assigned.contains_key(&phi_dest) || reg_assigned.contains_key(&backedge_src) {
+                    continue;
+                }
+                if already_aliased.contains(&backedge_src) {
+                    // Already aliased by an earlier phase, but the generic
+                    // interference check at resolve time conservatively rejects
+                    // it (the phi dest is used again on later iterations).
+                    // The detector's proof is stronger, so certify the bypass —
+                    // but only for integer/pointer sources (i128/f128/vector
+                    // values have 16/32-byte slots and must never share an
+                    // 8-byte slot).
+                    if def_ty_ok.get(&backedge_src).copied().unwrap_or(false) {
+                        loop_phi_aliases.insert(backedge_src);
+                    }
+                    continue;
+                }
+                if !def_ty_ok.get(&backedge_src).copied().unwrap_or(false) {
+                    continue;
+                }
+                if !claimed_dests.insert(phi_dest) {
+                    continue; // a source already claims this dest's slot
+                }
+                raw_aliases.push((backedge_src, phi_dest));
+                phi_web_aliases.insert(backedge_src); // force-overwrite at resolve
+                loop_phi_aliases.insert(backedge_src); // skip generic interference check
             }
         }
     }
@@ -131,8 +474,11 @@ pub(super) fn build_copy_alias_map(
     if !asm_output_ptrs.is_empty() {
         copy_alias.retain(|dest_id, _| !asm_output_ptrs.contains(dest_id));
     }
+    // A filtered-out alias must not survive in the certified sets.
+    loop_phi_aliases.retain(|v| copy_alias.contains_key(v));
+    phi_web_aliases.retain(|v| copy_alias.contains_key(v));
 
-    copy_alias
+    (copy_alias, phi_web_aliases, loop_phi_aliases)
 }
 
 /// Identify values that can skip stack slot allocation because they are
@@ -207,7 +553,9 @@ pub(super) fn compute_immediately_consumed(func: &IrFunction, lhs_first_binop: b
             // Skip if value is a copy-alias root (other values share its slot).
             if copy_alias_roots.contains(&dest.0) { continue; }
             // Must have exactly one Operand use.
-            if operand_use_count.get(&dest.0).copied().unwrap_or(0) != 1 { continue; }
+            let use_cnt = operand_use_count.get(&dest.0).copied().unwrap_or(0);
+            if use_cnt != 1 { continue; }
+            if use_cnt != 1 { continue; }
 
             // Check if the single use is in the immediately next instruction
             // or in the block terminator (if this is the last instruction).
